@@ -520,8 +520,70 @@ static void draw_ui(const char *cwd, const Entry *ent, size_t n, size_t sel,
     doupdate();
 }
 
+static void draw_transfer_progress(const char *op, off_t done, off_t total) {
+    if (!stdscr || isendwin())
+        return;
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+    if (rows <= 0 || cols < 24)
+        return;
+
+    int bar_w = cols - 34;
+    if (bar_w < 10)
+        bar_w = 10;
+    if (bar_w > 50)
+        bar_w = 50;
+
+    double ratio = 0.0;
+    if (total > 0)
+        ratio = (double)done / (double)total;
+    if (ratio < 0.0)
+        ratio = 0.0;
+    if (ratio > 1.0)
+        ratio = 1.0;
+
+    int fill = (int)(ratio * (double)bar_w + 0.5);
+    int pct = (int)(ratio * 100.0 + 0.5);
+
+    if (!op)
+        op = "Copy";
+    if (move(rows - 1, 0) == ERR)
+        return;
+    if (clrtoeol() == ERR)
+        return;
+    if (printw("%s [", op) == ERR)
+        return;
+    for (int i = 0; i < bar_w; i++)
+        if (addch(i < fill ? '#' : '-') == ERR)
+            return;
+    if (total > 0) {
+        if (printw("] %3d%% %lld/%lld KiB", pct, (long long)(done / 1024),
+                   (long long)(total / 1024)) == ERR)
+            return;
+    } else {
+        if (printw("] %lld KiB", (long long)(done / 1024)) == ERR)
+            return;
+    }
+    refresh();
+}
+
+static void clear_transfer_progress(void) {
+    if (!stdscr || isendwin())
+        return;
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+    (void)cols;
+    if (rows <= 0)
+        return;
+    if (move(rows - 1, 0) == ERR)
+        return;
+    if (clrtoeol() == ERR)
+        return;
+    refresh();
+}
+
 /* Stream copy for regular files. Removes partial dst on failure. */
-static int copy_file_bin(const char *src, const char *dst) {
+static int copy_file_bin(const char *src, const char *dst, const char *op) {
     FILE *in = fopen(src, "rb");
     if (!in)
         return -1;
@@ -532,26 +594,119 @@ static int copy_file_bin(const char *src, const char *dst) {
     }
     char buf[65536];
     size_t nr;
+    off_t copied = 0;
+    off_t total = -1;
+    struct stat st;
+    if (stat(src, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0)
+        total = st.st_size;
+    draw_transfer_progress(op, 0, total);
     while ((nr = fread(buf, 1, sizeof buf, in)) > 0) {
         if (fwrite(buf, 1, nr, out) != nr) {
             fclose(in);
             fclose(out);
             unlink(dst);
+            clear_transfer_progress();
             return -1;
         }
+        copied += (off_t)nr;
+        draw_transfer_progress(op, copied, total);
     }
     if (ferror(in)) {
         fclose(in);
         fclose(out);
         unlink(dst);
+        clear_transfer_progress();
         return -1;
     }
     fclose(in);
     if (fclose(out) != 0) {
         unlink(dst);
+        clear_transfer_progress();
         return -1;
     }
+    clear_transfer_progress();
     return 0;
+}
+
+static int copy_path(const char *src, const char *dst, const char *op);
+static int remove_tree(const char *path);
+
+static int copy_dir_recursive(const char *src, const char *dst, const char *op) {
+    struct stat st;
+    if (stat(src, &st) != 0 || !S_ISDIR(st.st_mode))
+        return -1;
+    if (mkdir(dst, st.st_mode & 0777) != 0)
+        return -1;
+
+    DIR *d = opendir(src);
+    if (!d) {
+        rmdir(dst);
+        return -1;
+    }
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue;
+
+        char src_child[PATH_MAX];
+        char dst_child[PATH_MAX];
+        if (snprintf(src_child, sizeof src_child, "%s/%s", src, ent->d_name) >=
+                (int)sizeof src_child ||
+            snprintf(dst_child, sizeof dst_child, "%s/%s", dst, ent->d_name) >=
+                (int)sizeof dst_child) {
+            closedir(d);
+            remove_tree(dst);
+            return -1;
+        }
+        if (copy_path(src_child, dst_child, op) != 0) {
+            closedir(d);
+            remove_tree(dst);
+            return -1;
+        }
+    }
+    closedir(d);
+    return 0;
+}
+
+static int copy_path(const char *src, const char *dst, const char *op) {
+    struct stat st;
+    if (stat(src, &st) != 0)
+        return -1;
+    if (S_ISREG(st.st_mode))
+        return copy_file_bin(src, dst, op);
+    if (S_ISDIR(st.st_mode))
+        return copy_dir_recursive(src, dst, op);
+    return -1;
+}
+
+static int remove_tree(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0)
+        return -1;
+    if (S_ISDIR(st.st_mode)) {
+        DIR *d = opendir(path);
+        if (!d)
+            return -1;
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+                continue;
+            char child[PATH_MAX];
+            if (snprintf(child, sizeof child, "%s/%s", path, ent->d_name) >=
+                (int)sizeof child) {
+                closedir(d);
+                return -1;
+            }
+            if (remove_tree(child) != 0) {
+                closedir(d);
+                return -1;
+            }
+        }
+        closedir(d);
+        return rmdir(path);
+    }
+    return unlink(path);
 }
 
 /*
@@ -563,9 +718,9 @@ static int move_file(const char *src, const char *dst) {
         return 0;
     if (errno != EXDEV)
         return -1;
-    if (copy_file_bin(src, dst) != 0)
+    if (copy_path(src, dst, "Move") != 0)
         return -1;
-    if (unlink(src) != 0)
+    if (remove_tree(src) != 0)
         return -1;
     return 0;
 }
@@ -1310,7 +1465,7 @@ int main(int argc, char **argv) {
                 sel = 0;
         } else if (ch == 'c' || ch == 'C') {
             const Entry *e = &entries[sel];
-            if (e->is_dir) {
+            if (strcmp(e->name, "[..]") == 0) {
                 beep();
                 continue;
             }
@@ -1321,7 +1476,8 @@ int main(int argc, char **argv) {
                 beep();
                 continue;
             }
-            if (stat(src, &st) != 0 || !S_ISREG(st.st_mode)) {
+            if (stat(src, &st) != 0 ||
+                (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))) {
                 beep();
                 continue;
             }
@@ -1338,11 +1494,11 @@ int main(int argc, char **argv) {
                 beep();
                 continue;
             }
-            if (copy_file_bin(src, dstpath) != 0)
+            if (copy_path(src, dstpath, "Copy") != 0)
                 beep();
         } else if (ch == 'm' || ch == 'M') {
             const Entry *e = &entries[sel];
-            if (e->is_dir) {
+            if (strcmp(e->name, "[..]") == 0) {
                 beep();
                 continue;
             }
@@ -1353,7 +1509,8 @@ int main(int argc, char **argv) {
                 beep();
                 continue;
             }
-            if (stat(src, &st) != 0 || !S_ISREG(st.st_mode)) {
+            if (stat(src, &st) != 0 ||
+                (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))) {
                 beep();
                 continue;
             }
@@ -1424,7 +1581,7 @@ int main(int argc, char **argv) {
             run_editor_on_path(path);
         } else if (ch == 'd' || ch == 'D') {
             const Entry *e = &entries[sel];
-            if (e->is_dir) {
+            if (strcmp(e->name, "[..]") == 0) {
                 beep();
                 continue;
             }
@@ -1435,13 +1592,14 @@ int main(int argc, char **argv) {
                 beep();
                 continue;
             }
-            if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+            if (stat(path, &st) != 0 ||
+                (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))) {
                 beep();
                 continue;
             }
             if (!dialog_confirm_delete(e->name))
                 continue;
-            if (unlink(path) != 0) {
+            if (remove_tree(path) != 0) {
                 beep();
                 continue;
             }
