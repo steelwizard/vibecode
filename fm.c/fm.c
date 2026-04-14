@@ -2,7 +2,8 @@
  * fm.c — tiny ncurses directory browser
  *
  * What it does:
- *   - Lists subdirectories and regular files in the current directory.
+ *   - Lists subdirectories and regular files in the selected directory
+ *     (defaults to current directory, or argv[1] when provided).
  *   - First row can be "[..]" to go to the parent (hidden when cwd is "/").
  *   - Arrow keys move the highlight; PgUp/PgDn move by one screen of names;
  *     Enter opens a directory; c copies or m moves the selected file
@@ -1170,7 +1171,27 @@ static void run_editor_on_path(const char *path) {
     refresh();
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc > 2) {
+        fprintf(stderr, "Usage: %s [path]\n", argv[0]);
+        return 1;
+    }
+    if (argc == 2) {
+        struct stat st;
+        if (stat(argv[1], &st) != 0) {
+            perror(argv[1]);
+            return 1;
+        }
+        if (!S_ISDIR(st.st_mode)) {
+            fprintf(stderr, "%s: not a directory\n", argv[1]);
+            return 1;
+        }
+        if (chdir(argv[1]) != 0) {
+            perror(argv[1]);
+            return 1;
+        }
+    }
+
     char cwd[PATH_MAX];
     if (!getcwd(cwd, sizeof cwd)) {
         perror("getcwd");
