@@ -1,10 +1,10 @@
-Start testing: Apr 15 15:35 Mitteleuropäische Sommerzeit
+Start testing: Apr 15 17:38 Mitteleuropäische Sommerzeit
 ----------------------------------------------------------
-1/1 Testing: linked_list_test
-1/1 Test: linked_list_test
+1/2 Testing: linked_list_test
+1/2 Test: linked_list_test
 Command: "A:/repos/vibecode/algdat/build/Release/linked_list_test.exe"
 Directory: A:/repos/vibecode/algdat/build
-"linked_list_test" start time: Apr 15 15:35 Mitteleuropäische Sommerzeit
+"linked_list_test" start time: Apr 15 17:38 Mitteleuropäische Sommerzeit
 Output:
 ----------------------------------------------------------
 All LinkedList tests passed.
@@ -12,8 +12,24 @@ All LinkedList tests passed.
 Test time =   0.01 sec
 ----------------------------------------------------------
 Test Passed.
-"linked_list_test" end time: Apr 15 15:35 Mitteleuropäische Sommerzeit
+"linked_list_test" end time: Apr 15 17:38 Mitteleuropäische Sommerzeit
 "linked_list_test" time elapsed: 00:00:00
 ----------------------------------------------------------
 
-End testing: Apr 15 15:35 Mitteleuropäische Sommerzeit
+Unable to find executable: A:/repos/vibecode/algdat/build/Release/bst_test.exe
+2/2 Testing: bst_test
+2/2 Test: bst_test
+Command: ""
+Directory: A:/repos/vibecode/algdat/build
+"bst_test" start time: 
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"bst_test" end time: Apr 15 17:38 Mitteleuropäische Sommerzeit
+"bst_test" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Apr 15 17:38 Mitteleuropäische Sommerzeit

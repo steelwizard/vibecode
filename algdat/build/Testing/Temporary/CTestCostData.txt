@@ -1,2 +1,4 @@
-linked_list_test 3 0.00218497
+linked_list_test 5 0.0013884
+bst_test 0 0
 ---
+bst_test
