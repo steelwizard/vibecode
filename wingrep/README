@@ -1,0 +1,14 @@
+Simple grep-like tool for Windows, implemented in C.
+
+Build:
+1. Open PowerShell in this directory.
+2. Run:
+   cmake -S . -B build
+   cmake --build build --config Release
+
+Usage:
+wingrep.exe [-i] [-n] <pattern> [path]
+
+Examples:
+wingrep.exe window A:\repos\vibecode
+wingrep.exe -i todo .

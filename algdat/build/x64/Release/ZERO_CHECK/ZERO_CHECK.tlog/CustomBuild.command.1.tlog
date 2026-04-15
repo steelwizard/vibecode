@@ -1,0 +1,10 @@
+^A:\REPOS\VIBECODE\ALGDAT\BUILD\CMAKEFILES\7779B956A09A3769D64CE997371B4600\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SA:/repos/vibecode/algdat -BA:/repos/vibecode/algdat/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file A:/repos/vibecode/algdat/build/algdat_linked_list.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

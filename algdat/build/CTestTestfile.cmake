@@ -1,0 +1,21 @@
+# CMake generated Testfile for 
+# Source directory: A:/repos/vibecode/algdat
+# Build directory: A:/repos/vibecode/algdat/build
+# 
+# This file includes the relevant testing commands required for 
+# testing this directory and lists subdirectories to be tested as well.
+if(CTEST_CONFIGURATION_TYPE MATCHES "^([Dd][Ee][Bb][Uu][Gg])$")
+  add_test(linked_list_test "A:/repos/vibecode/algdat/build/Debug/linked_list_test.exe")
+  set_tests_properties(linked_list_test PROPERTIES  _BACKTRACE_TRIPLES "A:/repos/vibecode/algdat/CMakeLists.txt;15;add_test;A:/repos/vibecode/algdat/CMakeLists.txt;0;")
+elseif(CTEST_CONFIGURATION_TYPE MATCHES "^([Rr][Ee][Ll][Ee][Aa][Ss][Ee])$")
+  add_test(linked_list_test "A:/repos/vibecode/algdat/build/Release/linked_list_test.exe")
+  set_tests_properties(linked_list_test PROPERTIES  _BACKTRACE_TRIPLES "A:/repos/vibecode/algdat/CMakeLists.txt;15;add_test;A:/repos/vibecode/algdat/CMakeLists.txt;0;")
+elseif(CTEST_CONFIGURATION_TYPE MATCHES "^([Mm][Ii][Nn][Ss][Ii][Zz][Ee][Rr][Ee][Ll])$")
+  add_test(linked_list_test "A:/repos/vibecode/algdat/build/MinSizeRel/linked_list_test.exe")
+  set_tests_properties(linked_list_test PROPERTIES  _BACKTRACE_TRIPLES "A:/repos/vibecode/algdat/CMakeLists.txt;15;add_test;A:/repos/vibecode/algdat/CMakeLists.txt;0;")
+elseif(CTEST_CONFIGURATION_TYPE MATCHES "^([Rr][Ee][Ll][Ww][Ii][Tt][Hh][Dd][Ee][Bb][Ii][Nn][Ff][Oo])$")
+  add_test(linked_list_test "A:/repos/vibecode/algdat/build/RelWithDebInfo/linked_list_test.exe")
+  set_tests_properties(linked_list_test PROPERTIES  _BACKTRACE_TRIPLES "A:/repos/vibecode/algdat/CMakeLists.txt;15;add_test;A:/repos/vibecode/algdat/CMakeLists.txt;0;")
+else()
+  add_test(linked_list_test NOT_AVAILABLE)
+endif()

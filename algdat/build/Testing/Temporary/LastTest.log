@@ -1,0 +1,19 @@
+Start testing: Apr 15 15:35 Mitteleuropäische Sommerzeit
+----------------------------------------------------------
+1/1 Testing: linked_list_test
+1/1 Test: linked_list_test
+Command: "A:/repos/vibecode/algdat/build/Release/linked_list_test.exe"
+Directory: A:/repos/vibecode/algdat/build
+"linked_list_test" start time: Apr 15 15:35 Mitteleuropäische Sommerzeit
+Output:
+----------------------------------------------------------
+All LinkedList tests passed.
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"linked_list_test" end time: Apr 15 15:35 Mitteleuropäische Sommerzeit
+"linked_list_test" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Apr 15 15:35 Mitteleuropäische Sommerzeit

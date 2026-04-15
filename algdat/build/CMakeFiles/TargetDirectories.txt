@@ -1,0 +1,5 @@
+A:/repos/vibecode/algdat/build/CMakeFiles/linked_list.dir
+A:/repos/vibecode/algdat/build/CMakeFiles/linked_list_test.dir
+A:/repos/vibecode/algdat/build/CMakeFiles/RUN_TESTS.dir
+A:/repos/vibecode/algdat/build/CMakeFiles/ALL_BUILD.dir
+A:/repos/vibecode/algdat/build/CMakeFiles/ZERO_CHECK.dir

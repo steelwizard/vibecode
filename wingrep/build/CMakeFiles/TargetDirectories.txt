@@ -1,0 +1,3 @@
+A:/repos/vibecode/wingrep/build/CMakeFiles/wingrep.dir
+A:/repos/vibecode/wingrep/build/CMakeFiles/ALL_BUILD.dir
+A:/repos/vibecode/wingrep/build/CMakeFiles/ZERO_CHECK.dir
