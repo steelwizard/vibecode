@@ -1,0 +1,3 @@
+A:/repos/vibecode/fancydir/build/CMakeFiles/fancydir.dir
+A:/repos/vibecode/fancydir/build/CMakeFiles/ALL_BUILD.dir
+A:/repos/vibecode/fancydir/build/CMakeFiles/ZERO_CHECK.dir

@@ -1,0 +1,10 @@
+^A:\REPOS\VIBECODE\FANCYDIR\BUILD\CMAKEFILES\2526F88A81C3BE3BDC73B42EE2D03EE7\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SA:/repos/vibecode/fancydir -BA:/repos/vibecode/fancydir/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file A:/repos/vibecode/fancydir/build/fancydir.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

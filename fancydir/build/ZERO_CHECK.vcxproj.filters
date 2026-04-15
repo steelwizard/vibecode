@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="A:\repos\vibecode\fancydir\build\CMakeFiles\2526f88a81c3be3bdc73b42ee2d03ee7\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{D30FFFE2-372C-3DE7-89F9-5F8E2CD76108}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>
