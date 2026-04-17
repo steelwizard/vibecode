@@ -1,0 +1,10 @@
+^A:\REPOS\VIBECODE\W32FM\BUILD\CMAKEFILES\60B9063A231173E174BA2E65F297244E\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SA:/repos/vibecode/w32fm -BA:/repos/vibecode/w32fm/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file A:/repos/vibecode/w32fm/build/w32fm.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
