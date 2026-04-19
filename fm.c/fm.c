@@ -10,7 +10,8 @@
  *     (destination picker then filename dialog); d deletes the selected
  *     regular file after a confirmation dialog; v views a regular file in a
  *     full-screen buffer; e opens a regular file in $VISUAL or $EDITOR (else
- *     vi); n creates an empty file (filename dialog); q or F10 quits.
+ *     vi); n creates an empty file (filename dialog); k creates a new
+ *     subdirectory (filename dialog); q or F10 quits.
  *
  * Layout (ncurses):
  *   - stdscr: outer frame + background (blue when cwd is writable, red if
@@ -1380,7 +1381,7 @@ int main(int argc, char **argv) {
     for (;;) {
         draw_ui(cwd, entries, n, sel, rows, cols, cwd_writable(cwd),
                 " Browser ",
-                "Up/Dn Pg  Enter dir  c copy  m move  d del  v view  e edit  n new  q/F10 quit");
+                "Up/Dn Pg  Enter dir  c copy  m move  d del  v view  e edit  n new  k mkdir  q/F10 quit");
         /*
          * draw_ui already pushed updates with doupdate(); refresh() syncs
          * stdscr in case any drawing path touched it without doupdate.
@@ -1418,6 +1419,42 @@ int main(int argc, char **argv) {
             }
             if (close(fd) != 0) {
                 unlink(path);
+                beep();
+                continue;
+            }
+            free_entries(entries, n);
+            entries = NULL;
+            n = 0;
+            if (collect_entries(cwd, &entries, &n) != 0) {
+                endwin();
+                perror(cwd);
+                return 1;
+            }
+            sel = 0;
+            for (size_t i = 0; i < n; i++) {
+                if (strcmp(entries[i].name, newname) == 0) {
+                    sel = i;
+                    break;
+                }
+            }
+            continue;
+        }
+        if (ch == 'k' || ch == 'K') {
+            if (!cwd_writable(cwd)) {
+                beep();
+                continue;
+            }
+            char newname[NAME_MAX];
+            if (dialog_filename("New directory", "", newname, sizeof newname) !=
+                0)
+                continue;
+            char path[PATH_MAX];
+            if (snprintf(path, sizeof path, "%s/%s", cwd, newname) >=
+                (int)sizeof path) {
+                beep();
+                continue;
+            }
+            if (mkdir(path, 0755) != 0) {
                 beep();
                 continue;
             }
