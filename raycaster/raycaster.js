@@ -277,12 +277,25 @@ function update(dt) {
     exitDoorOpen = true;
   }
 
-  if (exitDoorOpen && exitDoor) {
-    const distToDoor = Math.hypot(player.x - exitDoor.x, player.y - exitDoor.y);
-    if (distToDoor <= 0.7) {
+  if (exitDoorOpen && canUseExitDoor()) {
       advanceToNextLevel();
-    }
   }
+}
+
+function canUseExitDoor() {
+  if (!exitDoor) {
+    return false;
+  }
+  const doorMX = Math.floor(exitDoor.x);
+  const doorMY = Math.floor(exitDoor.y);
+  const playerMX = Math.floor(player.x);
+  const playerMY = Math.floor(player.y);
+  const manhattan = Math.abs(playerMX - doorMX) + Math.abs(playerMY - doorMY);
+  if (manhattan !== 1) {
+    return false;
+  }
+  const distToDoor = Math.hypot(player.x - exitDoor.x, player.y - exitDoor.y);
+  return distToDoor <= 1.25;
 }
 
 function doorStatusText() {
@@ -303,7 +316,9 @@ function isDoorCell(mx, my) {
   return getTileAt(mx, my) === 5;
 }
 
-function isItemSpawnOpen(mx, my) {
+function isItemSpawnOpen(x, y) {
+  const mx = Math.floor(x);
+  const my = Math.floor(y);
   return !isBlockingTileAt(mx, my) && !isDoorCell(mx, my);
 }
 
