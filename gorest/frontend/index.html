@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>gorest — todos</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="page">
+    <header class="header">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div>
+          <h1>gorest</h1>
+          <p class="tagline">In-memory todos · API on port 9080</p>
+        </div>
+      </div>
+      <div class="status" id="api-status" data-state="pending" role="status">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span class="status-text">Checking API…</span>
+      </div>
+    </header>
+
+    <main class="main">
+      <section class="panel compose" aria-labelledby="compose-title">
+        <h2 id="compose-title" class="sr-only">New todo</h2>
+        <form id="todo-form" class="todo-form" autocomplete="off">
+          <label class="field">
+            <span class="field-label">Title</span>
+            <input
+              id="todo-title"
+              name="title"
+              type="text"
+              placeholder="What needs doing?"
+              maxlength="500"
+              required
+            />
+          </label>
+          <button type="submit" class="btn primary" id="submit-btn">Add todo</button>
+        </form>
+      </section>
+
+      <p class="banner error" id="error-banner" hidden></p>
+
+      <section class="panel list-panel" aria-labelledby="list-title">
+        <div class="list-head">
+          <h2 id="list-title">Todos</h2>
+          <span class="count" id="todo-count" aria-live="polite"></span>
+        </div>
+        <ul class="todo-list" id="todo-list"></ul>
+        <p class="empty" id="empty-state">No todos yet. Add one above.</p>
+      </section>
+    </main>
+  </div>
+  <script src="/app.js" defer></script>
+</body>
+</html>
