@@ -530,7 +530,7 @@ static const char *fs_type_name(vfs_fs_type_t t) {
     switch (t) {
     case VFS_FS_FAT32: return "FAT32";
     case VFS_FS_EXFAT: return "exFAT";
-    default:           return "—";
+    default:           return "-";
     }
 }
 
@@ -683,14 +683,14 @@ void vfs_print_drive_table(void) {
         if (total > 0) {
             console_write_size(total);
         } else {
-            console_write("—");
+            console_write("-");
         }
         console_write("  ");
 
         if (dv->free_bytes > 0) {
             console_write_size(dv->free_bytes);
         } else {
-            console_write("—");
+            console_write("-");
         }
         console_write("  ");
 
@@ -700,7 +700,7 @@ void vfs_print_drive_table(void) {
             console_write_dec(pct);
             console_write("%");
         } else {
-            console_write("—");
+            console_write("-");
         }
         console_write("   ");
         console_putchar((char)('0' + i));

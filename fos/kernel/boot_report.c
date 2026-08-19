@@ -32,7 +32,7 @@ void boot_print_ata_disks(void) {
         if (d->sector_count > 0) {
             console_write_size(d->sector_count * BLOCK_SECTOR_SIZE);
         } else {
-            console_write("—");
+            console_write("-");
         }
         console_write("    ");
         if (d->model[0]) {

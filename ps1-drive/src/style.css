@@ -1,0 +1,206 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: #0c0b10;
+  color: #c4c2ce;
+  font-family: 'Courier New', Courier, ui-monospace, monospace;
+  overflow: hidden;
+}
+
+.game-wrap {
+  position: relative;
+  min-height: 100dvh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(ellipse 120% 80% at 50% 20%, #1a1a2e 0%, #0c0b10 55%);
+}
+
+/* Size is set in JS to letterbox the fixed aspect ratio; do not use width/height: auto or it shrinks to the bitmap. */
+.game-wrap canvas {
+  display: block;
+  max-width: 100vw;
+  max-height: 100dvh;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  box-shadow: 0 0 0 3px #2a2338, 0 12px 40px rgba(0, 0, 0, 0.55);
+}
+
+.hud {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 1;
+  padding: 10px 14px 12px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px 16px;
+  pointer-events: none;
+  text-shadow: 0 0 1px #000, 0 1px 2px rgba(0, 0, 0, 0.9);
+  font-size: 14px;
+  line-height: 1.2;
+  letter-spacing: 0.04em;
+}
+
+.hud-line {
+  margin: 0;
+}
+
+.hud-mph {
+  opacity: 0.55;
+  font-weight: normal;
+  font-size: 11px;
+  margin-left: 4px;
+}
+
+.hud-go {
+  width: 100%;
+  text-align: center;
+  color: #ff6b5a;
+  font-size: 18px;
+  letter-spacing: 0.12em;
+  margin: 4px 0 0;
+}
+
+.hud-go.hidden,
+.hidden {
+  display: none !important;
+}
+
+.hud-help {
+  width: 100%;
+  text-align: center;
+  margin: 6px 0 0;
+  font-size: 10px;
+  opacity: 0.45;
+  font-weight: normal;
+}
+
+#hudSpeed,
+#hudMeters {
+  color: #fff;
+}
+
+.hud-line--level {
+  width: 100%;
+  text-align: center;
+  margin: 2px 0 0;
+}
+
+.hud-level-name {
+  font-size: 13px;
+  letter-spacing: 0.2em;
+  color: #a8a0c0;
+  text-transform: uppercase;
+}
+
+/* Level pick: pointer-events re-enabled for buttons (parent .hud is none) */
+.level-pick {
+  width: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px 8px;
+  margin: 2px 0 0;
+  padding: 0 8px 4px;
+  pointer-events: auto;
+}
+
+.level-pill {
+  pointer-events: auto;
+  font-family: inherit;
+  min-width: 2rem;
+  padding: 4px 8px 5px;
+  font-size: 12px;
+  line-height: 1;
+  color: #c4c0d8;
+  background: #1a1824;
+  border: 1px solid #3a3550;
+  border-radius: 2px;
+  cursor: pointer;
+  box-shadow: 0 1px 0 #0004 inset;
+  transition: background 0.1s, border-color 0.1s, color 0.1s;
+}
+
+.level-pill:hover,
+.level-pill:focus-visible {
+  color: #fff;
+  background: #2a2540;
+  border-color: #5a50a0;
+  outline: none;
+}
+
+.level-pill.is-active {
+  color: #120810;
+  background: #9a86c0;
+  border-color: #b0a0d8;
+  font-weight: bold;
+  box-shadow: 0 0 8px rgba(160, 130, 220, 0.35);
+}
+
+@media (max-width: 500px) {
+  .level-pick {
+    padding-bottom: 2px;
+  }
+}
+
+/* Bottom speed meter (0–100% = internal max speed) */
+.speed-gauge {
+  position: absolute;
+  z-index: 1;
+  left: 50%;
+  bottom: 10px;
+  transform: translateX(-50%);
+  width: min(360px, 86vw);
+  pointer-events: none;
+  text-shadow: 0 0 1px #000, 0 1px 2px rgba(0, 0, 0, 0.85);
+}
+
+.speed-gauge__label {
+  font-size: 11px;
+  letter-spacing: 0.2em;
+  margin-bottom: 4px;
+  text-align: center;
+  color: #8a8698;
+}
+
+.speed-gauge__track {
+  height: 12px;
+  background: #121018;
+  border: 2px solid #2e2838;
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.55);
+  border-radius: 1px;
+  overflow: hidden;
+}
+
+.speed-gauge__fill {
+  width: 0%;
+  height: 100%;
+  min-width: 0;
+  background: linear-gradient(90deg, #3a7a3a, #8ca808 50%, #c85828);
+  background-size: 100% 100%;
+  box-shadow: 0 0 8px rgba(120, 200, 80, 0.2);
+}
+
+.speed-gauge__ticks {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 3px;
+  font-size: 9px;
+  color: #5c5a6a;
+  letter-spacing: 0.02em;
+}
+
+@media (max-width: 500px) {
+  .hud-help {
+    display: none;
+  }
+}

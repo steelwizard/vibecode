@@ -32,7 +32,8 @@ KERNEL_ASM = kernel/entry.asm
 KERNEL_C   = kernel/kernel.c kernel/shell.c kernel/vfs.c kernel/block.c \
              kernel/partition.c kernel/fat32.c kernel/exfat.c \
              kernel/console.c kernel/keyboard.c kernel/string.c \
-             kernel/cpu.c kernel/boot_report.c kernel/exec.c kernel/fos_api.c
+             kernel/cpu.c kernel/boot_report.c kernel/exec.c kernel/fos_api.c \
+             kernel/config.c
 
 SHELL_ASM  = shell/entry.asm
 SHELL_C    = kernel/shell.c kernel/vfs.c kernel/block.c \

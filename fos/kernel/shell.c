@@ -148,7 +148,7 @@ static void cmd_help(void) {
 }
 
 static void cmd_ver(void) {
-    console_write_line("FOS v0.3 — Flash Operating System");
+    console_write_line("FOS v0.3 - Flash Operating System");
     console_write_line("FOSCOM .COM programs, pipes, redirect");
 }
 

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PS1 Drive</title>
+  </head>
+  <body>
+    <div id="app" class="game-wrap">
+      <div class="hud" aria-hidden="true">
+        <p class="hud-line">SPD <b id="hudSpeed">0</b> <span class="hud-mph">X100</span></p>
+        <p class="hud-line">M <b id="hudMeters">0</b></p>
+        <p class="hud-line hud-line--level">
+          <span class="hud-level-name" id="hudLevelName">Highway</span>
+        </p>
+        <div class="level-pick" role="group" aria-label="Select level">
+          <button type="button" class="level-pill" data-level="0" title="Highway (1)">1</button>
+          <button type="button" class="level-pill" data-level="1" title="Coast (2)">2</button>
+          <button type="button" class="level-pill" data-level="2" title="Desert (3)">3</button>
+          <button type="button" class="level-pill" data-level="3" title="Night (4)">4</button>
+          <button type="button" class="level-pill" data-level="4" title="Alpine (5)">5</button>
+        </div>
+        <p class="hud-help">A/D or &larr; &rarr; steer &middot; W/S gas / brake &middot; R restart &middot; 1&ndash;5 level &middot; L next</p>
+        <p id="hudGameover" class="hud-go hidden">CRASH &mdash; R / ENTER</p>
+      </div>
+      <div class="speed-gauge" aria-label="Speed">
+        <div class="speed-gauge__label">SPEED</div>
+        <div class="speed-gauge__track" role="img" aria-hidden="true">
+          <div class="speed-gauge__fill" id="hudSpeedMeter"></div>
+        </div>
+        <div class="speed-gauge__ticks" aria-hidden="true">
+          <span>0</span><span>25</span><span>50</span><span>75</span><span>100</span>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

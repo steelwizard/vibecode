@@ -10,12 +10,13 @@
 #include "cpu.h"
 #include "boot_report.h"
 #include "fos_api.h"
+#include "config.h"
 
 void kmain(void) {
     console_init();
     console_clear_color(15, 1);
 
-    boot_line("FOS — Flash Operating System");
+    boot_line("FOS - Flash Operating System");
     boot_line("============================");
     boot_line("");
 
@@ -31,6 +32,13 @@ void kmain(void) {
 
     boot_line("[boot] Probing disks and mounting volumes...");
     vfs_init();
+    config_init(0);
+    {
+        const char *layout = config_get("keyboard", "layout");
+        if (layout && layout[0]) {
+            keyboard_set_layout(layout);
+        }
+    }
     boot_line("");
 
     console_set_color(15, 1);
@@ -39,7 +47,7 @@ void kmain(void) {
     boot_print_drive_table();
     boot_line("");
 
-    boot_line("[boot] System ready — starting shell.");
+    boot_line("[boot] System ready - starting shell.");
     boot_line("");
 
     console_set_color(15, 0);

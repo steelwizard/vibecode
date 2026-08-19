@@ -9,7 +9,7 @@
 %define KERNEL_STAGE_ADDR  0x9000
 %define KERNEL_RUNTIME     0x100000
 %define KERNEL_LBA         9
-%define KERNEL_MAX_SECTORS 64
+%define KERNEL_MAX_SECTORS 128
 
 %define PML4_ADDR 0x5000
 %define PDPT_ADDR 0x6000

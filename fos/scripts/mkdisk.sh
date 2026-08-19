@@ -46,6 +46,7 @@ if [ -n "$ECHO" ] && [ -f "$ECHO" ]; then
     add_one ECHO.COM "$ECHO"
 fi
 add_one README.TXT /tmp/fos_readme.txt
+add_one SYSTEM.INI "$SCRIPT_DIR/../system.ini"
 rm -f /tmp/fos_readme.txt
 
 echo "Built $IMG — drive 0: FAT32 (LBA $PART_START, ${PART_SECTORS} sectors)"

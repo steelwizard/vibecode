@@ -21,3 +21,5 @@ void keyboard_init(void);
 int  keyboard_has_key(void);
 char keyboard_read(void);
 key_event_t keyboard_read_event(void);
+void keyboard_set_layout(const char *name);
+const char *keyboard_get_layout(void);

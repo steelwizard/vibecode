@@ -158,7 +158,8 @@ func main() {
 		writeJSON(w, http.StatusCreated, store.create(req.Title))
 	})
 
-	apiMux.HandleFunc("PATCH /todos/{id}", func(w http.ResponseWriter, r *http.Request) {
+	apiMux.HandleFunc("PATCH /todos/{id}", func(w http.ResponseWriter,
+												r *http.Request) {
 		defer r.Body.Close()
 
 		id, err := strconv.Atoi(r.PathValue("id"))
@@ -193,7 +194,8 @@ func main() {
 		writeJSON(w, http.StatusOK, updated)
 	})
 
-	apiMux.HandleFunc("DELETE /todos/{id}", func(w http.ResponseWriter, r *http.Request) {
+	apiMux.HandleFunc("DELETE /todos/{id}", func(w http.ResponseWriter,
+												r *http.Request) bool {
 		id, err := strconv.Atoi(r.PathValue("id"))
 		if err != nil || id < 1 {
 			writeJSON(w, http.StatusBadRequest, map[string]string{
