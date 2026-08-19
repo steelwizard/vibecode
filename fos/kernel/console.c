@@ -105,10 +105,10 @@ void console_backspace(void) {
     if (cursor_x > 0) {
         cursor_x--;
         putchar_at(' ', cursor_x, cursor_y);
+        serial_putchar('\b');
+        serial_putchar(' ');
+        serial_putchar('\b');
     }
-    serial_putchar('\b');
-    serial_putchar(' ');
-    serial_putchar('\b');
 }
 
 void console_begin_capture(char *buf, size_t cap) {

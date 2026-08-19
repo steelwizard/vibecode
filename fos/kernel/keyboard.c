@@ -1,5 +1,8 @@
 /*
  * keyboard.c — Input from PS/2 keyboard and/or COM1 serial.
+ *
+ * PS/2 uses scancode set 2 with controller translation to set 1 so our
+ * lookup table stays simple. Shift and Caps Lock are tracked for typing.
  */
 
 #include "keyboard.h"
@@ -20,6 +23,7 @@ static inline void outb(uint16_t port, uint8_t value) {
     __asm__ volatile("outb %0, %1" : : "a"(value), "Nd"(port));
 }
 
+/* Scancode set 1 (what we receive after controller translation). */
 static char scancode_to_ascii[128] = {
     0,  27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
     '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
@@ -32,7 +36,8 @@ static char scancode_to_ascii[128] = {
 };
 
 static int ps2_extended;
-
+static int shift_count;
+static int caps_lock;
 static int serial_esc_state;
 
 static void ps2_wait_write(void) {
@@ -74,13 +79,65 @@ static char serial_read_char(void) {
     return (char)inb(COM1_DATA);
 }
 
-static void ps2_init_controller(void) {
-    ps2_write_cmd(0xAD);
-    ps2_write_cmd(0xA7);
-
+static void ps2_flush_output(void) {
     while (inb(PS2_STATUS) & 0x01) {
         (void)inb(PS2_DATA);
     }
+}
+
+static void ps2_device_cmd(uint8_t cmd) {
+    ps2_write_data(cmd);
+    (void)ps2_read_data();
+}
+
+static char shift_char(char c) {
+    switch (c) {
+    case '`': return '~';
+    case '1': return '!';
+    case '2': return '@';
+    case '3': return '#';
+    case '4': return '$';
+    case '5': return '%';
+    case '6': return '^';
+    case '7': return '&';
+    case '8': return '*';
+    case '9': return '(';
+    case '0': return ')';
+    case '-': return '_';
+    case '=': return '+';
+    case '[': return '{';
+    case ']': return '}';
+    case '\\': return '|';
+    case ';': return ':';
+    case '\'': return '"';
+    case ',': return '<';
+    case '.': return '>';
+    case '/': return '?';
+    default:
+        if (c >= 'a' && c <= 'z') {
+            return (char)(c - 32);
+        }
+        return c;
+    }
+}
+
+static char apply_modifiers(char c) {
+    if (c >= 'a' && c <= 'z') {
+        if ((shift_count > 0) ^ caps_lock) {
+            return (char)(c - 32);
+        }
+        return c;
+    }
+    if (shift_count > 0) {
+        return shift_char(c);
+    }
+    return c;
+}
+
+static void ps2_init_controller(void) {
+    ps2_write_cmd(0xAD);
+    ps2_write_cmd(0xA7);
+    ps2_flush_output();
 
     ps2_write_cmd(0x20);
     ps2_wait_read();
@@ -90,37 +147,40 @@ static void ps2_init_controller(void) {
     cfg &= ~(1 << 1);
     cfg &= ~(1 << 4);
     cfg &= ~(1 << 5);
+    cfg |= (1 << 6);
 
     ps2_write_cmd(0x60);
     ps2_write_data(cfg);
     ps2_write_cmd(0xAE);
 
-    ps2_write_data(0xFF);
-    (void)ps2_read_data();
-    (void)ps2_read_data();
-
-    ps2_write_data(0xF0);
-    (void)ps2_read_data();
-    ps2_write_data(0x01);
+    ps2_device_cmd(0xFF);
     (void)ps2_read_data();
 
-    while (inb(PS2_STATUS) & 0x01) {
-        (void)inb(PS2_DATA);
-    }
+    ps2_device_cmd(0xF0);
+    ps2_write_data(0x02);
+    (void)ps2_read_data();
+
+    ps2_device_cmd(0xF4);
+    ps2_flush_output();
 
     ps2_extended = 0;
+    shift_count = 0;
+    caps_lock = 0;
 }
 
 void keyboard_init(void) {
     ps2_init_controller();
     serial_esc_state = 0;
+    while (serial_has_byte()) {
+        (void)serial_read_char();
+    }
 }
 
 int keyboard_has_key(void) {
-    if (serial_has_byte()) {
+    if ((inb(PS2_STATUS) & 0x01) != 0) {
         return 1;
     }
-    return (inb(PS2_STATUS) & 0x01) != 0;
+    return serial_has_byte();
 }
 
 static key_event_t ps2_read_event(void) {
@@ -137,6 +197,12 @@ static key_event_t ps2_read_event(void) {
     }
 
     if (sc & 0x80) {
+        uint8_t code = sc & 0x7F;
+        if (code == 0x2A || code == 0x36) {
+            if (shift_count > 0) {
+                shift_count--;
+            }
+        }
         ps2_extended = 0;
         return ev;
     }
@@ -155,6 +221,18 @@ static key_event_t ps2_read_event(void) {
         }
     }
 
+    if (sc == 0x2A || sc == 0x36) {
+        if (shift_count < 2) {
+            shift_count++;
+        }
+        return ev;
+    }
+
+    if (sc == 0x3A) {
+        caps_lock = !caps_lock;
+        return ev;
+    }
+
     if (sc < 128) {
         char c = scancode_to_ascii[sc];
         if (c == '\t') {
@@ -165,7 +243,7 @@ static key_event_t ps2_read_event(void) {
             ev.type = KEY_BACKSPACE;
         } else if (c != 0) {
             ev.type = KEY_CHAR;
-            ev.ch = c;
+            ev.ch = apply_modifiers(c);
         }
     }
     return ev;
@@ -210,7 +288,7 @@ static key_event_t serial_read_event(void) {
         return ev;
     }
 
-    if (c == 0x7F) {
+    if (c == 0x7F || c == '\b') {
         ev.type = KEY_BACKSPACE;
         return ev;
     }
@@ -233,16 +311,15 @@ static key_event_t serial_read_event(void) {
 }
 
 key_event_t keyboard_read_event(void) {
+    if ((inb(PS2_STATUS) & 0x01) != 0) {
+        return ps2_read_event();
+    }
+
     if (serial_has_byte()) {
         return serial_read_event();
     }
 
-    if ((inb(PS2_STATUS) & 0x01) == 0) {
-        key_event_t ev = {KEY_NONE, 0};
-        return ev;
-    }
-
-    return ps2_read_event();
+    return (key_event_t){KEY_NONE, 0};
 }
 
 char keyboard_read(void) {
