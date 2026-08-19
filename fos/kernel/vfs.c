@@ -1,3 +1,17 @@
+/*
+ * vfs.c — Virtual file system: drive letters, paths, FAT32/exFAT.
+ *
+ * Drive model:
+ *   0:, 1:, ... map to physical ATA disks (boot disk is always 0:)
+ *   Each drive may have a mounted FAT32 or exFAT partition
+ *   Paths use DOS-style backslashes: \DIR\FILE.TXT
+ *
+ * Mount strategy (per physical disk):
+ *   1. Try MBR partition table entries (FAT32 / exFAT types)
+ *   2. Drive 0 fallback: raw FAT32 at LBA 2048 (our boot.img layout)
+ *   3. Other drives: try whole-disk exFAT/FAT32 at LBA 0
+ */
+
 #include "vfs.h"
 #include "block.h"
 #include "partition.h"
@@ -9,8 +23,8 @@
 typedef struct {
     int mounted;
     vfs_fs_type_t type;
-    int block_index;
-    uint32_t part_lba;
+    int block_index;       /* index into block layer (physical ATA device) */
+    uint32_t part_lba;     /* partition start sector on that device */
     uint32_t part_sectors;
     uint64_t free_bytes;
     union {
@@ -21,8 +35,8 @@ typedef struct {
 
 static drive_vol_t drives[VFS_MAX_DRIVES];
 static int num_drives;
-static int current_drive;
-static char cwd[VFS_MAX_DRIVES][VFS_PATH_MAX];
+static int current_drive;  /* active drive for relative paths */
+static char cwd[VFS_MAX_DRIVES][VFS_PATH_MAX];  /* per-drive working directory */
 
 static int try_mount_partition(int block_index, uint32_t lba, uint32_t sectors,
                                drive_vol_t *dv) {
@@ -91,6 +105,7 @@ int vfs_init(void) {
         }
 
         if (!mounted && logical == 0) {
+            /* boot.img: MBR at 0, kernel at LBA 9, FAT32 volume at LBA 2048 */
             uint32_t fallback_lba = 2048;
             uint32_t fallback_sectors = (uint32_t)block_dev_sectors(phys);
             if (fallback_sectors > fallback_lba) {
@@ -427,20 +442,7 @@ int vfs_read_file(int drive, const char *path, char *buf, size_t buf_sz, size_t 
     return -1;
 }
 
-int vfs_write_file(int drive, const char *path, const void *data, size_t len) {
-    char resolved[VFS_PATH_MAX];
-    int d = drive;
-    if (vfs_resolve(drive, path, &d, resolved, sizeof(resolved)) != 0) {
-        return -1;
-    }
-
-    drive_vol_t *dv = &drives[d];
-    if (!dv->mounted || dv->type != VFS_FS_FAT32) {
-        return -1;
-    }
-
-    char parent[VFS_PATH_MAX];
-    char file[64];
+static int vfs_split_parent_file(const char *resolved, char *parent, char *file) {
     strcpy(parent, resolved);
     char *last = parent;
     for (char *c = parent; *c; c++) {
@@ -461,15 +463,115 @@ int vfs_write_file(int drive, const char *path, const void *data, size_t len) {
             parent[1] = 0;
         }
     }
+    return 0;
+}
 
-    uint32_t dir_cluster;
+static int vfs_fat32_dir_cluster(drive_vol_t *dv, const char *parent, uint32_t *out_cluster) {
     int is_dir;
     if (fat32_find_path(&dv->fs.fat32, dv->fs.fat32.root_cluster, parent,
-                        &dir_cluster, &is_dir) != 0 || !is_dir) {
+                        out_cluster, &is_dir) != 0 || !is_dir) {
+        return -1;
+    }
+    return 0;
+}
+
+int vfs_write_file(int drive, const char *path, const void *data, size_t len) {
+    char resolved[VFS_PATH_MAX];
+    int d = drive;
+    if (vfs_resolve(drive, path, &d, resolved, sizeof(resolved)) != 0) {
+        return -1;
+    }
+
+    drive_vol_t *dv = &drives[d];
+    if (!dv->mounted || dv->type != VFS_FS_FAT32) {
+        return -1;
+    }
+
+    char parent[VFS_PATH_MAX];
+    char file[64];
+    if (vfs_split_parent_file(resolved, parent, file) != 0) {
+        return -1;
+    }
+
+    uint32_t dir_cluster;
+    if (vfs_fat32_dir_cluster(dv, parent, &dir_cluster) != 0) {
         return -1;
     }
 
     return fat32_write_file(&dv->fs.fat32, dir_cluster, file, data, (uint32_t)len);
+}
+
+int vfs_mkdir(int drive, const char *path) {
+    char resolved[VFS_PATH_MAX];
+    int d = drive;
+    if (vfs_resolve(drive, path, &d, resolved, sizeof(resolved)) != 0) {
+        return -1;
+    }
+
+    drive_vol_t *dv = &drives[d];
+    if (!dv->mounted || dv->type != VFS_FS_FAT32) {
+        return -1;
+    }
+
+    char parent[VFS_PATH_MAX];
+    char name[64];
+    if (vfs_split_parent_file(resolved, parent, name) != 0) {
+        return -1;
+    }
+
+    uint32_t dir_cluster;
+    if (vfs_fat32_dir_cluster(dv, parent, &dir_cluster) != 0) {
+        return -1;
+    }
+
+    return fat32_mkdir(&dv->fs.fat32, dir_cluster, name);
+}
+
+int vfs_delete(int drive, const char *path) {
+    char resolved[VFS_PATH_MAX];
+    int d = drive;
+    if (vfs_resolve(drive, path, &d, resolved, sizeof(resolved)) != 0) {
+        return -1;
+    }
+
+    drive_vol_t *dv = &drives[d];
+    if (!dv->mounted || dv->type != VFS_FS_FAT32) {
+        return -1;
+    }
+
+    char parent[VFS_PATH_MAX];
+    char name[64];
+    if (vfs_split_parent_file(resolved, parent, name) != 0) {
+        return -1;
+    }
+
+    uint32_t dir_cluster;
+    if (vfs_fat32_dir_cluster(dv, parent, &dir_cluster) != 0) {
+        return -1;
+    }
+
+    return fat32_delete(&dv->fs.fat32, dir_cluster, name);
+}
+
+#define VFS_COPY_MAX 65536
+
+int vfs_copy(int drive, const char *src, const char *dst) {
+    static uint8_t buf[VFS_COPY_MAX];
+    size_t len = 0;
+
+    if (vfs_is_dir(drive, src)) {
+        return -1;
+    }
+
+    if (vfs_read_file(drive, src, (char *)buf, sizeof(buf), &len) != 0) {
+        return -1;
+    }
+
+    if (len >= sizeof(buf)) {
+        return -2;
+    }
+
+    return vfs_write_file(drive, dst, buf, len);
 }
 
 int vfs_is_dir(int drive, const char *path) {
@@ -581,6 +683,83 @@ static int complete_cb(const char *name, uint8_t attr, uint32_t size, void *ctx)
 
 static int exfat_complete_cb(const char *name, uint8_t attr, uint64_t size, void *ctx) {
     return complete_cb(name, attr, (uint32_t)size, ctx);
+}
+
+typedef struct {
+    vfs_dir_list_t *out;
+} read_dir_ctx_t;
+
+static int read_dir_cb(const char *name, uint8_t attr, uint32_t size, void *ctx) {
+    read_dir_ctx_t *c = (read_dir_ctx_t *)ctx;
+    vfs_dir_list_t *out = c->out;
+
+    if ((attr & 0x08) || (attr & 0x06)) {
+        return 0;
+    }
+    if (name[0] == '.' &&
+        (name[1] == 0 || (name[1] == '.' && name[2] == 0))) {
+        return 0;
+    }
+    if (out->count >= VFS_DIR_MAX) {
+        return 0;
+    }
+
+    strncpy(out->entries[out->count].name, name, 63);
+    out->entries[out->count].name[63] = 0;
+    out->entries[out->count].is_dir = (attr & 0x10) ? 1 : 0;
+    out->entries[out->count].size = size;
+    out->count++;
+    return 0;
+}
+
+static int exfat_read_dir_cb(const char *name, uint8_t attr, uint64_t size, void *ctx) {
+    return read_dir_cb(name, attr, (uint32_t)size, ctx);
+}
+
+int vfs_read_dir(int drive, const char *path, vfs_dir_list_t *out) {
+    char resolved[VFS_PATH_MAX];
+    int d = drive;
+
+    if (!out) {
+        return -1;
+    }
+    out->count = 0;
+
+    if (path == 0 || path[0] == 0) {
+        path = vfs_get_cwd();
+    }
+
+    if (vfs_resolve(drive, path, &d, resolved, sizeof(resolved)) != 0) {
+        return -1;
+    }
+
+    drive_vol_t *dv = &drives[d];
+    if (!dv->mounted) {
+        return -1;
+    }
+
+    uint32_t cluster;
+    int is_dir;
+    read_dir_ctx_t ctx = {out};
+
+    if (dv->type == VFS_FS_FAT32) {
+        if (fat32_find_path(&dv->fs.fat32, dv->fs.fat32.root_cluster, resolved,
+                            &cluster, &is_dir) != 0 || !is_dir) {
+            return -1;
+        }
+        return fat32_list_dir(&dv->fs.fat32, cluster, read_dir_cb, &ctx);
+    }
+
+    if (dv->type == VFS_FS_EXFAT) {
+        uint64_t dummy;
+        if (exfat_find_path(&dv->fs.exfat, dv->fs.exfat.root_cluster, resolved,
+                            &cluster, &is_dir, &dummy) != 0 || !is_dir) {
+            return -1;
+        }
+        return exfat_list_dir(&dv->fs.exfat, cluster, exfat_read_dir_cb, &ctx);
+    }
+
+    return -1;
 }
 
 static int list_dir_for_complete(int drive, const char *dir_path, const char *prefix,

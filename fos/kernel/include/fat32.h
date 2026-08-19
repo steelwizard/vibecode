@@ -27,6 +27,8 @@ int fat32_read_file(fat32_vol_t *vol, uint32_t cluster, uint32_t offset,
                     void *buf, uint32_t size, uint32_t file_size);
 int fat32_write_file(fat32_vol_t *vol, uint32_t dir_cluster, const char *name,
                      const void *data, uint32_t size);
+int fat32_mkdir(fat32_vol_t *vol, uint32_t parent_cluster, const char *name);
+int fat32_delete(fat32_vol_t *vol, uint32_t dir_cluster, const char *name);
 int fat32_lookup(fat32_vol_t *vol, uint32_t dir_cluster, const char *name,
                  uint32_t *out_cluster, uint8_t *out_attr, uint32_t *out_size);
 uint64_t fat32_free_bytes(const fat32_vol_t *vol);

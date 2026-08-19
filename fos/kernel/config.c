@@ -1,5 +1,13 @@
 /*
  * config.c — Minimal INI reader for \SYSTEM.INI on the boot volume.
+ *
+ * Supported syntax:
+ *   ; or #  comment lines
+ *   [section]
+ *   key=value
+ *
+ * Sections and keys are matched case-insensitively. Only ASCII is supported;
+ * keep values plain (e.g. layout=de, not Unicode).
  */
 
 #include "config.h"
@@ -9,6 +17,7 @@
 #define CONFIG_MAX 512
 #define VALUE_MAX  64
 
+/* Raw file contents loaded once by config_init(). */
 static char config_buf[CONFIG_MAX];
 static int config_loaded;
 
@@ -83,6 +92,7 @@ void config_init(int drive) {
     config_loaded = 0;
     config_buf[0] = 0;
 
+    /* Missing SYSTEM.INI is fine — callers fall back to defaults. */
     if (vfs_read_file(drive, "\\SYSTEM.INI", config_buf, sizeof(config_buf) - 1, &len) != 0) {
         return;
     }
@@ -90,6 +100,7 @@ void config_init(int drive) {
     config_loaded = 1;
 }
 
+/* Linear scan; fine for a tiny config file. Returns static buffer — copy if needed. */
 const char *config_get(const char *section, const char *key) {
     static char value[VALUE_MAX];
     char current_section[32];

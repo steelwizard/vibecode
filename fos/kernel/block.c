@@ -1,3 +1,10 @@
+/*
+ * block.c — ATA PIO disk I/O and physical/logical drive mapping.
+ *
+ * Probes primary (0x1F0) and secondary (0x170) ATA buses via IDENTIFY.
+ * The BIOS boot drive (from stage1 at 0x7DFF) is always logical drive 0.
+ */
+
 #include "block.h"
 #include "string.h"
 

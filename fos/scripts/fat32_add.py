@@ -93,10 +93,11 @@ def parse_bpb(f, part_lba):
     }
 
 
-def find_free_cluster(f, bpb):
+def find_free_cluster(f, bpb, skip=None):
+    skip = skip or set()
     cluster = 2
     while cluster < 0x0FFFFFF0:
-        if read_fat_entry(f, bpb, cluster) == 0:
+        if cluster not in skip and read_fat_entry(f, bpb, cluster) == 0:
             return cluster
         cluster += 1
     raise SystemExit("no free clusters")
@@ -125,9 +126,12 @@ def add_file(img_path, part_lba, fat_name, content: bytes):
         spc_bytes = bpb["sectors_per_cluster"] * bpb["bytes_per_sector"]
 
         clusters = []
+        used = set()
         remaining = max(len(data), 1)
         while remaining > 0:
-            clusters.append(find_free_cluster(f, bpb))
+            cl = find_free_cluster(f, bpb, used)
+            clusters.append(cl)
+            used.add(cl)
             remaining -= spc_bytes
 
         if not clusters:

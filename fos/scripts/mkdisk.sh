@@ -9,6 +9,9 @@ KERN_LBA=$4
 PART_START=$5
 SHELL=${6:-}
 ECHO=${7:-}
+EDIT=${8:-}
+FM=${9:-}
+LESS=${10:-}
 
 TOTAL_SECTORS=65536
 PART_SECTORS=$((TOTAL_SECTORS - PART_START))
@@ -26,7 +29,6 @@ dd if="$FAT_TMP" of="$IMG" bs=512 seek="$PART_START" conv=notrunc status=none
 rm -f "$FAT_TMP"
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-echo "Hello from 0:\\README.TXT on FOS (Flash Operating System)." > /tmp/fos_readme.txt
 
 add_one() {
     name=$1
@@ -45,8 +47,18 @@ fi
 if [ -n "$ECHO" ] && [ -f "$ECHO" ]; then
     add_one ECHO.COM "$ECHO"
 fi
-add_one README.TXT /tmp/fos_readme.txt
+if [ -n "$EDIT" ] && [ -f "$EDIT" ]; then
+    add_one EDIT.COM "$EDIT"
+fi
+if [ -n "$FM" ] && [ -f "$FM" ]; then
+    add_one FM.COM "$FM"
+fi
+if [ -n "$LESS" ] && [ -f "$LESS" ]; then
+    add_one LESS.COM "$LESS"
+fi
+if [ -f "$SCRIPT_DIR/../README.md" ]; then
+    add_one README.TXT "$SCRIPT_DIR/../README.md"
+fi
 add_one SYSTEM.INI "$SCRIPT_DIR/../system.ini"
-rm -f /tmp/fos_readme.txt
 
 echo "Built $IMG — drive 0: FAT32 (LBA $PART_START, ${PART_SECTORS} sectors)"

@@ -1,5 +1,12 @@
 /*
  * shell.c — DOS-style shell with .COM programs, pipes (|), and redirect (>).
+ *
+ * Features:
+ *   Built-in commands (help, dir, cd, type, drives, ...)
+ *   External .COM programs via FOSCOM loader (echo.com, etc.)
+ *   Pipelines: capture stdout of stage N, feed as pipe_in to stage N+1
+ *   Redirect: capture stdout and write to a file on FAT32
+ *   Command history (Up/Down) and Tab filename completion
  */
 
 #include "shell.h"
@@ -24,11 +31,13 @@ typedef struct {
 
 static char line_buf[LINE_MAX];
 static int line_len = 0;
+static int line_cursor = 0; /* insertion point within line_buf (0..line_len) */
 
+/* In-memory command history ring buffer (not persisted). */
 static char hist_buf[HIST_MAX][LINE_MAX];
 static int hist_len = 0;
-static int hist_pos = -1;
-static char hist_draft[LINE_MAX];
+static int hist_pos = -1;       /* -1 = editing live line, 0 = newest recalled */
+static char hist_draft[LINE_MAX]; /* saved partial line before Up arrow */
 
 static void reboot(void) {
     uint8_t good = 0x02;
@@ -136,14 +145,22 @@ static void cmd_help(void) {
     console_write_line("  cls / clear          Clear screen");
     console_write_line("  dir [path]           List directory");
     console_write_line("  cd <path>            Change directory");
+    console_write_line("  mkdir / md <path>    Create directory");
+    console_write_line("  del / erase <path>   Delete file or empty folder");
+    console_write_line("  copy <src> <dst>     Copy file");
     console_write_line("  type <path>          Print file (or piped text)");
     console_write_line("  drives / df          List drives");
     console_write_line("  <n>:                 Switch drive");
     console_write_line("  reboot               Reboot");
     console_write_line("  <name>.com [args]    Run .COM program (e.g. echo hello)");
+    console_write_line("  edit [file]          Text editor (Ctrl+S save, Ctrl+X exit)");
+    console_write_line("  less [file]          Page through a file (q to quit)");
+    console_write_line("  fm                   File manager (browser)");
     console_write_line("  cmd1 | cmd2          Pipe stdout to stdin");
     console_write_line("  cmd > file           Redirect stdout to file");
-    console_write_line("  Up/Down              Command history");
+    console_write_line("  Up/Down/Left/Right  Edit command line");
+    console_write_line("  PgUp/PgDn            Scroll terminal output");
+    console_write_line("  | and >              Pipe / redirect (DE: AltGr+< is |, Shift+< is >)");
     console_write_line("  Tab                  Filename completion");
 }
 
@@ -171,6 +188,92 @@ static void cmd_cd(const char *args) {
     }
     if (vfs_set_cwd(args) != 0) {
         console_write_line("CD failed");
+    }
+}
+
+static int confirm_yes_no(void) {
+    console_write(" (Y/N)? ");
+    for (;;) {
+        while (!keyboard_has_key()) {
+            __asm__ volatile("pause");
+        }
+        key_event_t ev = keyboard_read_event();
+        if (ev.type == KEY_CHAR) {
+            if (ev.ch == 'y' || ev.ch == 'Y') {
+                console_write_line("Y");
+                return 1;
+            }
+            if (ev.ch == 'n' || ev.ch == 'N') {
+                console_write_line("N");
+                return 0;
+            }
+        }
+        if (ev.type == KEY_ENTER) {
+            console_putchar('\n');
+            return 0;
+        }
+    }
+}
+
+static void cmd_mkdir(const char *args) {
+    if (*args == 0) {
+        console_write_line("MKDIR: path required");
+        return;
+    }
+    if (vfs_mkdir(vfs_get_drive(), args) != 0) {
+        console_write_line("MKDIR failed");
+    }
+}
+
+static void cmd_del(const char *args) {
+    if (*args == 0) {
+        console_write_line("DEL: path required");
+        return;
+    }
+    console_write("Delete ");
+    console_write(args);
+    if (!confirm_yes_no()) {
+        console_write_line("Cancelled");
+        return;
+    }
+    int rc = vfs_delete(vfs_get_drive(), args);
+    if (rc == -2) {
+        console_write_line("Directory not empty");
+    } else if (rc != 0) {
+        console_write_line("DEL failed");
+    }
+}
+
+static int split_two_paths(const char *args, char *first, size_t first_sz,
+                           char *second, size_t second_sz) {
+    args = skip_spaces(args);
+    size_t i = 0;
+    while (*args && *args != ' ' && i + 1 < first_sz) {
+        first[i++] = *args++;
+    }
+    first[i] = 0;
+    args = skip_spaces(args);
+    strncpy(second, args, second_sz - 1);
+    second[second_sz - 1] = 0;
+    trim(second);
+    return first[0] != 0 && second[0] != 0;
+}
+
+static void cmd_copy(const char *args) {
+    char src[VFS_PATH_MAX];
+    char dst[VFS_PATH_MAX];
+
+    if (!split_two_paths(args, src, sizeof(src), dst, sizeof(dst))) {
+        console_write_line("COPY: source and destination required");
+        return;
+    }
+    int rc = vfs_copy(vfs_get_drive(), src, dst);
+    if (rc == -2) {
+        console_write_line("COPY failed: file too large (max 64 KB)");
+    } else if (rc != 0) {
+        console_write_line("COPY failed");
+    } else {
+        console_write_line("        1 file(s) copied");
     }
 }
 
@@ -205,6 +308,10 @@ static void cmd_type(const char *args) {
 static int try_drive_switch(char *line) {
     const char *s = skip_spaces(line);
     if (s[0] >= '0' && s[0] <= '9' && s[1] == ':') {
+        const char *rest = skip_spaces(s + 2);
+        if (*rest != 0) {
+            return 0;
+        }
         int d = s[0] - '0';
         if (vfs_set_drive(d) == 0) {
             return 1;
@@ -227,6 +334,36 @@ static int try_run_com(const char *line) {
     return exec_run(vfs_get_drive(), path, args) == 0;
 }
 
+static void cmd_edit(const char *args) {
+    console_begin_direct();
+    if (exec_run(vfs_get_drive(), "\\EDIT.COM", args) != 0) {
+        console_end_direct();
+        console_write_line("EDIT failed (missing or corrupt EDIT.COM — run: make clean && make)");
+        return;
+    }
+    console_end_direct();
+}
+
+static void cmd_fm(const char *args) {
+    console_begin_direct();
+    if (exec_run(vfs_get_drive(), "\\FM.COM", args) != 0) {
+        console_end_direct();
+        console_write_line("FM failed (missing or corrupt FM.COM — run: make clean && make)");
+        return;
+    }
+    console_end_direct();
+}
+
+static void cmd_less(const char *args) {
+    console_begin_direct();
+    if (exec_run(vfs_get_drive(), "\\LESS.COM", args) != 0) {
+        console_end_direct();
+        console_write_line("LESS failed (missing or corrupt LESS.COM — run: make clean && make)");
+        return;
+    }
+    console_end_direct();
+}
+
 static int run_builtin(char *line) {
     if (try_drive_switch(line)) {
         return 1;
@@ -242,6 +379,12 @@ static int run_builtin(char *line) {
         cmd_dir(cmd_arg(line));
     } else if (match_cmd(line, "CD")) {
         cmd_cd(cmd_arg(line));
+    } else if (match_cmd(line, "MKDIR") || match_cmd(line, "MD")) {
+        cmd_mkdir(cmd_arg(line));
+    } else if (match_cmd(line, "DEL") || match_cmd(line, "ERASE")) {
+        cmd_del(cmd_arg(line));
+    } else if (match_cmd(line, "COPY")) {
+        cmd_copy(cmd_arg(line));
     } else if (match_cmd(line, "TYPE")) {
         cmd_type(cmd_arg(line));
     } else if (match_cmd(line, "DRIVES") || match_cmd(line, "DF")) {
@@ -249,6 +392,12 @@ static int run_builtin(char *line) {
     } else if (match_cmd(line, "REBOOT")) {
         console_write_line("Rebooting...");
         reboot();
+    } else if (match_cmd(line, "EDIT")) {
+        cmd_edit(cmd_arg(line));
+    } else if (match_cmd(line, "FM")) {
+        cmd_fm(cmd_arg(line));
+    } else if (match_cmd(line, "LESS") || match_cmd(line, "MORE")) {
+        cmd_less(cmd_arg(line));
     } else if (try_run_com(line)) {
         return 1;
     } else {
@@ -259,6 +408,7 @@ static int run_builtin(char *line) {
 }
 
 static void parse_redirect(shell_stage_t *st) {
+    /* Split "cmd args > file.txt" — only the last stage may redirect in a pipeline. */
     char *gt = 0;
     for (char *p = st->cmd; *p; p++) {
         if (*p == '>') {
@@ -332,6 +482,7 @@ static void run_pipeline(char *line) {
         int has_pipe = (i + 1 < n);
         int capture = has_redirect || has_pipe;
 
+        /* Previous stage output becomes this stage's stdin (for .COM pipe_in). */
         if (pipe_len > 0) {
             fos_api_set_pipe(pipe_buf, pipe_len);
         } else {
@@ -340,6 +491,7 @@ static void run_pipeline(char *line) {
 
         if (capture) {
             char cap_buf[CAPTURE_MAX];
+            /* Intercept console_write* into cap_buf instead of the screen. */
             console_begin_capture(cap_buf, sizeof(cap_buf));
             run_builtin(stages[i].cmd);
             size_t out_len = console_end_capture();
@@ -375,24 +527,83 @@ static void run_command(char *line) {
 
 static void line_reset(void) {
     line_len = 0;
+    line_cursor = 0;
     line_buf[0] = 0;
 }
 
-static void line_backspace(void) {
-    if (line_len > 0) {
-        line_len--;
-        line_buf[line_len] = 0;
-        console_backspace();
+static void line_redraw_tail(void) {
+    /* Repaint from cursor to end of line; leave hardware cursor at line_cursor. */
+    console_write(line_buf + line_cursor);
+    console_putchar(' ');
+    int n = line_len - line_cursor + 1;
+    while (n-- > 0) {
+        console_cursor_back();
     }
 }
 
-static void line_append(char c) {
+static void line_backspace(void) {
+    if (line_cursor <= 0) {
+        return;
+    }
+    if (line_cursor == line_len) {
+        line_len--;
+        line_buf[line_len] = 0;
+        line_cursor--;
+        console_backspace();
+        return;
+    }
+    memmove(line_buf + line_cursor - 1, line_buf + line_cursor,
+            (size_t)(line_len - line_cursor));
+    line_len--;
+    line_buf[line_len] = 0;
+    line_cursor--;
+    console_cursor_back();
+    line_redraw_tail();
+}
+
+static void line_delete(void) {
+    if (line_cursor >= line_len) {
+        return;
+    }
+    memmove(line_buf + line_cursor, line_buf + line_cursor + 1,
+            (size_t)(line_len - line_cursor - 1));
+    line_len--;
+    line_buf[line_len] = 0;
+    line_redraw_tail();
+}
+
+static void line_insert(char c) {
     if (line_len + 1 >= LINE_MAX) {
         return;
     }
-    line_buf[line_len++] = c;
+    if (line_cursor == line_len) {
+        line_buf[line_len++] = c;
+        line_buf[line_len] = 0;
+        line_cursor++;
+        console_putchar(c);
+        return;
+    }
+    memmove(line_buf + line_cursor + 1, line_buf + line_cursor,
+            (size_t)(line_len - line_cursor));
+    line_buf[line_cursor] = c;
+    line_len++;
     line_buf[line_len] = 0;
-    console_putchar(c);
+    line_cursor++;
+    line_redraw_tail();
+}
+
+static void line_cursor_left(void) {
+    if (line_cursor > 0) {
+        line_cursor--;
+        console_cursor_back();
+    }
+}
+
+static void line_cursor_right(void) {
+    if (line_cursor < line_len) {
+        console_putchar(line_buf[line_cursor]);
+        line_cursor++;
+    }
 }
 
 static void line_replace_from(int start, const char *replacement) {
@@ -403,7 +614,7 @@ static void line_replace_from(int start, const char *replacement) {
         replacement = "";
     }
     for (const char *p = replacement; *p; p++) {
-        line_append(*p);
+        line_insert(*p);
     }
 }
 
@@ -415,8 +626,9 @@ static void line_set(const char *text) {
         text = "";
     }
     for (const char *p = text; *p; p++) {
-        line_append(*p);
+        line_insert(*p);
     }
+    line_cursor = line_len;
 }
 
 static void hist_add(const char *line) {
@@ -465,6 +677,7 @@ static void hist_down(void) {
 }
 
 static int word_start_index(void) {
+    /* Index of the word being edited (for Tab completion) — stops at | > space. */
     int i = line_len - 1;
     while (i >= 0 && line_buf[i] != ' ' && line_buf[i] != '\t' &&
            line_buf[i] != '|' && line_buf[i] != '>') {
@@ -507,6 +720,7 @@ static size_t matches_common_prefix(vfs_complete_result_t *res) {
 }
 
 static void line_complete(void) {
+    /* Tab: complete filename on current drive; list matches if ambiguous. */
     int ws = word_start_index();
     char partial[LINE_MAX];
     strncpy(partial, line_buf + ws, sizeof(partial) - 1);
@@ -568,6 +782,16 @@ static void line_complete(void) {
     }
     print_prompt();
     console_write(line_buf);
+    line_cursor = line_len;
+}
+
+static void shell_restore_live_view(void) {
+    if (!console_at_bottom()) {
+        console_scroll_to_bottom();
+        print_prompt();
+        console_write(line_buf);
+        line_cursor = line_len;
+    }
 }
 
 void shell_run(void) {
@@ -585,6 +809,18 @@ void shell_run(void) {
             continue;
         }
 
+        if (ev.type == KEY_PAGEUP) {
+            console_page_up();
+            continue;
+        }
+
+        if (ev.type == KEY_PAGEDOWN) {
+            console_page_down();
+            continue;
+        }
+
+        shell_restore_live_view();
+
         if (ev.type == KEY_ENTER) {
             console_putchar('\n');
             hist_add(line_buf);
@@ -597,6 +833,12 @@ void shell_run(void) {
 
         if (ev.type == KEY_BACKSPACE) {
             line_backspace();
+            hist_pos = -1;
+            continue;
+        }
+
+        if (ev.type == KEY_DELETE) {
+            line_delete();
             hist_pos = -1;
             continue;
         }
@@ -616,9 +858,29 @@ void shell_run(void) {
             continue;
         }
 
-        if (ev.type == KEY_CHAR && ev.ch >= 32 && ev.ch <= 126) {
+        if (ev.type == KEY_LEFT) {
+            line_cursor_left();
+            continue;
+        }
+
+        if (ev.type == KEY_RIGHT) {
+            line_cursor_right();
+            continue;
+        }
+
+        if (ev.type == KEY_CHAR && ev.ch == 3) {
+            /* Ctrl+C — abandon current line and start a fresh prompt. */
+            console_write("^C");
+            console_putchar('\n');
+            line_reset();
             hist_pos = -1;
-            line_append(ev.ch);
+            print_prompt();
+            continue;
+        }
+
+        if (ev.type == KEY_CHAR && (unsigned char)ev.ch >= 32) {
+            hist_pos = -1;
+            line_insert(ev.ch);
         }
     }
 }

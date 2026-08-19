@@ -2,14 +2,22 @@
 
 #include "types.h"
 
+/* High-level key events consumed by the shell. */
 typedef enum {
     KEY_NONE = 0,
     KEY_CHAR,
     KEY_ENTER,
     KEY_BACKSPACE,
+    KEY_DELETE,
     KEY_TAB,
     KEY_UP,
-    KEY_DOWN
+    KEY_DOWN,
+    KEY_LEFT,
+    KEY_RIGHT,
+    KEY_HOME,
+    KEY_END,
+    KEY_PAGEUP,
+    KEY_PAGEDOWN
 } key_type_t;
 
 typedef struct {
@@ -21,5 +29,7 @@ void keyboard_init(void);
 int  keyboard_has_key(void);
 char keyboard_read(void);
 key_event_t keyboard_read_event(void);
+
+/* Layout from SYSTEM.INI or defaults: "de" (QWERTZ) / "us" (QWERTY). */
 void keyboard_set_layout(const char *name);
 const char *keyboard_get_layout(void);

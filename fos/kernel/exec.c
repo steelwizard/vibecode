@@ -1,3 +1,11 @@
+/*
+ * exec.c — FOSCOM (.COM) program loader.
+ *
+ * .COM files have a 64-byte FOSCOM header followed by flat x86-64 code.
+ * The kernel copies the payload to load_addr, zeroes BSS, sets RSP, and
+ * jumps to entry. Programs call the fixed API block at 0xFF0000 (fos_api).
+ */
+
 #include "foscom.h"
 #include "fos_api.h"
 #include "vfs.h"
@@ -21,6 +29,7 @@ static int load_and_run(const foscom_hdr_t *hdr, const void *payload) {
     uint8_t *dest = (uint8_t *)(uintptr_t)hdr->load_addr;
     memcpy(dest, payload, (size_t)hdr->payload_size);
 
+    /* Zero the mem_size region beyond the loaded payload (BSS). */
     uint64_t mem_span = hdr->mem_size;
     if (mem_span > hdr->load_addr && mem_span < hdr->load_addr + 0x10000000ULL) {
         mem_span -= hdr->load_addr;
@@ -31,9 +40,13 @@ static int load_and_run(const foscom_hdr_t *hdr, const void *payload) {
 
     uint64_t stack = hdr->stack_top ? hdr->stack_top : DEFAULT_STACK;
     void (*entry)(void) = (void (*)(void))(uintptr_t)hdr->entry;
+    uint64_t saved_rsp;
 
-    __asm__ volatile("mov %0, %%rsp" : : "r"(stack));
+    /* Run .COM on its own stack; restore kernel RSP when it returns. */
+    __asm__ volatile("mov %%rsp, %0" : "=r"(saved_rsp));
+    __asm__ volatile("mov %0, %%rsp" : : "r"(stack) : "memory");
     entry();
+    __asm__ volatile("mov %0, %%rsp" : : "r"(saved_rsp) : "memory");
     return 0;
 }
 

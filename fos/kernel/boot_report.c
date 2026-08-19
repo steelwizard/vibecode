@@ -1,5 +1,8 @@
 /*
  * boot_report.c — Hardware/volume reports shown during boot (blue screen).
+ *
+ * Uses boot_line() / console_set_color(15,1) so output stays on the blue
+ * boot background after the shell starts on black.
  */
 
 #include "boot_report.h"
@@ -21,7 +24,7 @@ void boot_print_ata_disks(void) {
         console_write("  ");
         console_putchar((char)('0' + i));
         if (logical == 0) {
-            console_write("* ");
+            console_write("* ");  /* marks the disk we booted from -> drive 0: */
         } else {
             console_write("  ");
         }
@@ -47,4 +50,27 @@ void boot_print_ata_disks(void) {
 void boot_print_drive_table(void) {
     console_set_color(15, 1);
     vfs_print_drive_table();
+}
+
+static void boot_print_color_strip(void) {
+    int c;
+
+    for (c = 0; c < 16; c++) {
+        /* 13×5 + 3×4 = 77 — stay under 80 cols to avoid wrap + extra newline */
+        console_write_color(15, (uint8_t)c, (c < 13) ? "     " : "    ");
+    }
+    console_write_color(15, 4, "\n");
+}
+
+void boot_print_logo(void) {
+    /* White on dark red (VGA fg=15, bg=4). Block letters — F has no bottom bar. */
+    console_write_line_color(15, 4, "");
+    console_write_line_color(15, 4, "  #####    #####    ##### ");
+    console_write_line_color(15, 4, "  #        #   #    #     ");
+    console_write_line_color(15, 4, "  ####     #   #     #### ");
+    console_write_line_color(15, 4, "  #        #   #        # ");
+    console_write_line_color(15, 4, "  #        #####    ##### ");
+    boot_print_color_strip();
+    console_write_line_color(15, 4, "      Flash Operating System");
+    console_write_line_color(15, 4, "");
 }
