@@ -1,0 +1,7 @@
+*.o
+*.elf
+*.bin
+*.img
+*.com
+*.iso
+boot
