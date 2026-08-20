@@ -21,6 +21,8 @@ int  vfs_set_cwd(const char *path);
 int  vfs_resolve(int drive, const char *path, int *out_drive, char *out_path, size_t out_sz);
 int  vfs_list_dir(int drive, const char *path);
 int  vfs_read_file(int drive, const char *path, char *buf, size_t buf_sz, size_t *out_len);
+int  vfs_read_at(int drive, const char *path, uint32_t offset, void *buf, uint32_t cap, uint32_t *out_len);
+int  vfs_stat(int drive, const char *path, uint32_t *size, int *is_dir);
 int  vfs_write_file(int drive, const char *path, const void *data, size_t len);
 int  vfs_mkdir(int drive, const char *path);
 int  vfs_delete(int drive, const char *path);

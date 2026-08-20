@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Add a small 8.3-named file to a FAT32 partition inside a raw disk image."""
+"""Add 8.3-named files to a FAT32 partition inside a raw disk image.
+
+Names may be nested paths (EFI/BOOT/BOOTX64.EFI); missing directories are created.
+"""
 
 import struct
 import sys
@@ -22,6 +25,10 @@ def wr16(b, o, v):
 
 
 def name83(name: str) -> bytes:
+    if name == ".":
+        return b".          "
+    if name == "..":
+        return b"..         "
     base, _, ext = name.upper().partition(".")
     base = base[:8].ljust(8)
     ext = ext[:3].ljust(3)
@@ -103,25 +110,108 @@ def find_free_cluster(f, bpb, skip=None):
     raise SystemExit("no free clusters")
 
 
-def find_dir_slot(f, bpb):
-    cluster = bpb["root_cluster"]
+def first_cluster(ent: bytes) -> int:
+    return rd16(ent, 26) | (rd16(ent, 20) << 16)
+
+
+def write_dir_entry(buf, slot, nm, attr, cluster, size):
+    buf[slot : slot + 11] = nm
+    buf[slot + 11] = attr
+    wr16(buf, slot + 26, cluster & 0xFFFF)
+    wr16(buf, slot + 20, (cluster >> 16) & 0xFFFF)
+    wr32(buf, slot + 28, size)
+
+
+def alloc_zero_cluster(f, bpb, used=None):
+    cl = find_free_cluster(f, bpb, used)
+    write_fat_entry(f, bpb, cl, 0x0FFFFFF8)
+    lba = cluster_lba(bpb, cl)
+    zeros = bytes(bpb["bytes_per_sector"])
+    for s in range(bpb["sectors_per_cluster"]):
+        write_sector(f, bpb, lba + s, zeros)
+    return cl
+
+
+def cluster_chain(f, bpb, start):
+    cluster = start
     while cluster >= 2 and cluster < 0x0FFFFFF0:
-        lba = cluster_lba(bpb, cluster)
-        for s in range(bpb["sectors_per_cluster"]):
-            root = read_sector(f, bpb, lba + s)
-            for i in range(0, len(root), 32):
-                if root[i] == 0x00 or root[i] == 0xE5:
-                    return lba + s, i
+        yield cluster
         nxt = read_fat_entry(f, bpb, cluster)
         if nxt >= 0x0FFFFFF8:
             break
         cluster = nxt
-    return None, -1
 
 
-def add_file(img_path, part_lba, fat_name, content: bytes):
+def find_named(f, bpb, dir_cluster, nm: bytes):
+    for cluster in cluster_chain(f, bpb, dir_cluster):
+        lba0 = cluster_lba(bpb, cluster)
+        for s in range(bpb["sectors_per_cluster"]):
+            sector = read_sector(f, bpb, lba0 + s)
+            for i in range(0, len(sector), 32):
+                if sector[i] == 0x00:
+                    return None
+                if sector[i] == 0xE5:
+                    continue
+                attr = sector[i + 11]
+                if attr == 0x0F or (attr & 0x08):
+                    continue
+                if sector[i : i + 11] == nm:
+                    return lba0 + s, i, sector[i : i + 32]
+    return None
+
+
+def find_dir_slot(f, bpb, dir_cluster):
+    last = dir_cluster
+    for cluster in cluster_chain(f, bpb, dir_cluster):
+        last = cluster
+        lba0 = cluster_lba(bpb, cluster)
+        for s in range(bpb["sectors_per_cluster"]):
+            sector = read_sector(f, bpb, lba0 + s)
+            for i in range(0, len(sector), 32):
+                if sector[i] == 0x00 or sector[i] == 0xE5:
+                    return lba0 + s, i
+    new_cl = alloc_zero_cluster(f, bpb)
+    write_fat_entry(f, bpb, last, new_cl)
+    return cluster_lba(bpb, new_cl), 0
+
+
+def ensure_dir(f, bpb, parent_cluster, name: str) -> int:
+    nm = name83(name)
+    found = find_named(f, bpb, parent_cluster, nm)
+    if found:
+        _lba, _slot, ent = found
+        if ent[11] & 0x10:
+            cl = first_cluster(ent)
+            return cl if cl else bpb["root_cluster"]
+        raise SystemExit(f"{name} exists and is not a directory")
+
+    new_cl = alloc_zero_cluster(f, bpb)
+    lba = cluster_lba(bpb, new_cl)
+    sector = bytearray(read_sector(f, bpb, lba))
+    parent_dot = 0 if parent_cluster == bpb["root_cluster"] else parent_cluster
+    write_dir_entry(sector, 0, name83("."), 0x10, new_cl, 0)
+    write_dir_entry(sector, 32, name83(".."), 0x10, parent_dot, 0)
+    write_sector(f, bpb, lba, sector)
+
+    slot_lba, slot = find_dir_slot(f, bpb, parent_cluster)
+    parent = bytearray(read_sector(f, bpb, slot_lba))
+    write_dir_entry(parent, slot, nm, 0x10, new_cl, 0)
+    write_sector(f, bpb, slot_lba, parent)
+    return new_cl
+
+
+def add_file(img_path, part_lba, fat_path, content: bytes):
+    parts = fat_path.replace("\\", "/").strip("/").split("/")
+    if not parts or not parts[-1]:
+        raise SystemExit(f"bad path {fat_path!r}")
+    dirs, fat_name = parts[:-1], parts[-1]
+
     with open(img_path, "r+b") as f:
         bpb = parse_bpb(f, part_lba)
+        dir_cluster = bpb["root_cluster"]
+        for d in dirs:
+            dir_cluster = ensure_dir(f, bpb, dir_cluster, d)
+
         data = content
         spc_bytes = bpb["sectors_per_cluster"] * bpb["bytes_per_sector"]
 
@@ -149,18 +239,13 @@ def add_file(img_path, part_lba, fat_name, content: bytes):
             write_sector(f, bpb, lba, chunk)
             offset += spc_bytes
 
-        root_lba, slot = find_dir_slot(f, bpb)
+        slot_lba, slot = find_dir_slot(f, bpb, dir_cluster)
         if slot < 0:
-            raise SystemExit("root directory full")
+            raise SystemExit("directory full")
 
-        root = bytearray(read_sector(f, bpb, root_lba))
-        nm = name83(fat_name)
-        root[slot : slot + 11] = nm
-        root[slot + 11] = 0x20  # archive
-        wr16(root, slot + 26, clusters[0] & 0xFFFF)
-        wr16(root, slot + 20, (clusters[0] >> 16) & 0xFFFF)
-        wr32(root, slot + 28, len(data))
-        write_sector(f, bpb, root_lba, root)
+        dsec = bytearray(read_sector(f, bpb, slot_lba))
+        write_dir_entry(dsec, slot, name83(fat_name), 0x20, clusters[0], len(data))
+        write_sector(f, bpb, slot_lba, dsec)
 
 
 def add_files(img_path, part_lba, pairs):

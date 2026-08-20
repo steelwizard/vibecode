@@ -96,6 +96,7 @@ int vfs_init(void) {
         for (int i = 0; i < pc && !mounted; i++) {
             if (parts[i].type == PART_TYPE_FAT32_CHS ||
                 parts[i].type == PART_TYPE_FAT32_LBA ||
+                parts[i].type == PART_TYPE_EFI ||
                 parts[i].type == PART_TYPE_EXFAT) {
                 if (try_mount_partition(phys, parts[i].lba_start, parts[i].sector_count,
                                       &drives[num_drives]) == 0) {
@@ -472,6 +473,115 @@ static int vfs_fat32_dir_cluster(drive_vol_t *dv, const char *parent, uint32_t *
                         out_cluster, &is_dir) != 0 || !is_dir) {
         return -1;
     }
+    return 0;
+}
+
+static int vfs_lookup_file(int drive, const char *path, drive_vol_t **out_dv,
+                           uint32_t *cluster, uint64_t *fsize) {
+    char resolved[VFS_PATH_MAX];
+    char parent[VFS_PATH_MAX];
+    char file[64];
+    int d = drive;
+
+    if (vfs_resolve(drive, path, &d, resolved, sizeof(resolved)) != 0) {
+        return -1;
+    }
+    *out_dv = &drives[d];
+    if (!(*out_dv)->mounted) {
+        return -1;
+    }
+    if (vfs_split_parent_file(resolved, parent, file) != 0) {
+        return -1;
+    }
+
+    if ((*out_dv)->type == VFS_FS_FAT32) {
+        uint32_t dir_cluster;
+        uint8_t attr;
+        uint32_t size;
+        int is_dir;
+        if (fat32_find_path(&(*out_dv)->fs.fat32, (*out_dv)->fs.fat32.root_cluster, parent,
+                            &dir_cluster, &is_dir) != 0 || !is_dir) {
+            return -1;
+        }
+        if (fat32_lookup(&(*out_dv)->fs.fat32, dir_cluster, file, cluster, &attr, &size) != 0) {
+            return -1;
+        }
+        if (attr & FAT_ATTR_DIR) {
+            return -1;
+        }
+        *fsize = size;
+        return 0;
+    }
+
+    if ((*out_dv)->type == VFS_FS_EXFAT) {
+        uint32_t dir_cluster;
+        int is_dir;
+        uint64_t dummy;
+        if (exfat_find_path(&(*out_dv)->fs.exfat, (*out_dv)->fs.exfat.root_cluster, parent,
+                            &dir_cluster, &is_dir, &dummy) != 0 || !is_dir) {
+            return -1;
+        }
+        if (exfat_find_path(&(*out_dv)->fs.exfat, dir_cluster, file, cluster, &is_dir, fsize) != 0 ||
+            is_dir) {
+            return -1;
+        }
+        return 0;
+    }
+    return -1;
+}
+
+int vfs_stat(int drive, const char *path, uint32_t *size, int *is_dir) {
+    drive_vol_t *dv;
+    uint32_t cluster;
+    uint64_t fsize;
+
+    if (vfs_lookup_file(drive, path, &dv, &cluster, &fsize) != 0) {
+        return -1;
+    }
+    if (size) {
+        *size = fsize > 0xFFFFFFFFULL ? 0xFFFFFFFFu : (uint32_t)fsize;
+    }
+    if (is_dir) {
+        *is_dir = 0;
+    }
+    return 0;
+}
+
+int vfs_read_at(int drive, const char *path, uint32_t offset, void *buf, uint32_t cap,
+                uint32_t *out_len) {
+    drive_vol_t *dv;
+    uint32_t cluster;
+    uint64_t fsize;
+    uint32_t to_read;
+    int n;
+
+    if (!buf || !out_len) {
+        return -1;
+    }
+    *out_len = 0;
+    if (cap == 0) {
+        return 0;
+    }
+    if (vfs_lookup_file(drive, path, &dv, &cluster, &fsize) != 0) {
+        return -1;
+    }
+    if (offset >= fsize) {
+        return 0;
+    }
+    to_read = cap;
+    if ((uint64_t)offset + to_read > fsize) {
+        to_read = (uint32_t)(fsize - offset);
+    }
+
+    if (dv->type == VFS_FS_FAT32) {
+        n = fat32_read_file(&dv->fs.fat32, cluster, offset, buf, to_read, (uint32_t)fsize);
+    } else {
+        n = exfat_read_file(&dv->fs.exfat, cluster, offset, buf, to_read, fsize);
+    }
+    if (n < 0) {
+        return -1;
+    }
+    *out_len = (uint32_t)n;
     return 0;
 }
 

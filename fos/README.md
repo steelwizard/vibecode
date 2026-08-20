@@ -5,12 +5,13 @@ A small x86-64 hobby OS: assembly bootloader, C kernel, DOS-style shell, FAT32/e
 ## Quick start
 
 ```bash
-make          # boot.img (FAT32, drive 0:) + data.img (exFAT, drive 1:)
-make run      # QEMU with serial console + bochs-display
+make          # boot.img (FAT32 ESP, drive 0:) + data.img (exFAT, drive 1:)
+make run      # QEMU BIOS (SeaBIOS) + serial console + bochs-display
+make run-uefi # QEMU UEFI (OVMF) — same disk image
 ```
 
 **Requirements:** nasm, gcc, ld, objcopy, sfdisk, mkfs.vfat, qemu-system-x86_64  
-**Optional:** mkfs.exfat, mtools, python3 (packs `.COM` files onto the boot volume)
+**Optional:** mkfs.exfat, mtools, python3 (packs `.COM` files onto the boot volume), ovmf (`make run-uefi`)
 
 ### QEMU command line
 
@@ -21,11 +22,16 @@ qemu-system-x86_64 \
   -drive format=raw,file=boot.img,index=0,media=disk \
   -drive format=raw,file=data.img,index=1,media=disk \
   -device bochs-display \
+  -audiodev pipewire,id=snd0 -device sb16,audiodev=snd0 \
   -m 128M \
   -serial stdio
 ```
 
 Type in the terminal that launches QEMU — input goes to **COM1 serial** (`-serial stdio`), not PS/2. The kernel reads both serial and PS/2.
+
+`make run-uefi` is the same plus `-bios /usr/share/ovmf/OVMF.fd` (override with `OVMF=/path/to/OVMF.fd`) and `-net none` so OVMF skips PXE. The disk is dual-boot: SeaBIOS uses the MBR, OVMF uses `\EFI\BOOT\BOOTX64.EFI`.
+
+Audio backend defaults to **PipeWire** when that session socket exists, otherwise PulseAudio. Override with `QEMU_AUDIO=pa`, `pipewire`, `alsa`, `sdl`, `none`, or `wav` (writes `fos-sb16.wav`).
 
 > **Do not use `-vga none` with `-device bochs-display`.** Under QEMU this combination reboots in a loop before the kernel starts. Keep the default VGA and add `-device bochs-display` for framebuffer modes.
 
@@ -39,17 +45,24 @@ Type in the terminal that launches QEMU — input goes to **COM1 serial** (`-ser
 - **Console** — scrollback, Page Up/Down, pipes (`|`), redirect (`>`)
 - **Video** — VGA text or framebuffer modes set in `SYSTEM.INI` (kernel-side, after mount)
 - **Keyboard layouts** — German QWERTZ or US QWERTY via config
+- **Sound** — Sound Blaster 16 (ISA DSP + DMA); `beep` from the shell
 
 ### Included programs
 
 | Program | Description |
 |---------|-------------|
 | `SHELL.COM` | Interactive shell (also built into the kernel) |
-| `ECHO.COM` | Sample FOSCOM program |
-| `EDIT.COM` | Text editor — Ctrl+S save, Ctrl+X exit, arrows, Delete |
-| `LESS.COM` | File pager — Space/b page, q quit (`more` alias in shell) |
-| `FM.COM` | File manager browser |
+| `\FOS\ECHO.COM` | Sample FOSCOM program |
+| `\FOS\EDIT.COM` | Text editor — Ctrl+S save, Ctrl+X exit, arrows, Delete |
+| `\FOS\LESS.COM` | File pager — Space/b page, q quit (`more` alias in shell) |
+| `\FOS\FM.COM` | File manager browser |
+| `\FOS\DATE.COM` | Show or set the CMOS RTC (`date YYYY-MM-DD HH:MM:SS`) |
+| `\FOS\MEM.COM` | RAM map and usage |
+| `\FOS\BEEP.COM` | Tone (`beep`, `beep 880 300`) |
+| `\FOS\PLAY.COM` | WAV/MP3 player TUI (`play DEMO.WAV`, q stops) |
 | `README.TXT` | Full project README (copy of `README.md` from the repo) |
+
+Programs under `\FOS` are found via `[shell] path=` in `SYSTEM.INI`.
 
 ## Shell commands
 
@@ -68,6 +81,10 @@ Type in the terminal that launches QEMU — input goes to **COM1 serial** (`-ser
 | `edit [file]` | Run the text editor |
 | `less [file]` / `more` | Page through a file (`type file \| less`) |
 | `fm` | Run the file manager |
+| `date [stamp]` | RTC via `date.com` |
+| `mem` | RAM map via `mem.com` |
+| `beep [hz [ms]]` | SB16 tone via `beep.com` |
+| `play <file>` | WAV/MP3 player (`play BABY.MP3`; q quits) |
 | `echo …` / `*.com` | Run a FOSCOM program |
 | `0:` / `1:` | Switch current drive |
 | `cmd1 \| cmd2` | Pipe stdout to stdin |
@@ -127,14 +144,42 @@ Example — classic VGA text only:
 mode=text
 ```
 
+### `[shell]`
+
+| Key | Values | Default | Description |
+|-----|--------|---------|-------------|
+| `path` | colon-separated dirs | `\FOS` | Directories searched for `.COM` programs |
+
+PATH entries are absolute directories on the **current drive** (no drive letters). Example: `path=\FOS:\BIN`. The shell checks the current directory first, then each PATH entry.
+
+### `[sound]`
+
+Optional. If omitted, FOS probes the usual ISA bases (`220h`, `240h`, `260h`, `280h`) with IRQ 5 and 8-bit DMA 1 (QEMU’s `sb16` defaults).
+
+| Key | Values | Default | Description |
+|-----|--------|---------|-------------|
+| `port` | hex (`220`, `0x220`) | probe | DSP base |
+| `irq` | `5`, `7`, `10` | `5` | PIC line |
+| `dma` | `1` | `1` | 8-bit ISA DMA channel |
+
+Needs **`-device sb16`** (included in `make run`). Without a card, boot prints `no Sound Blaster` and `beep` says the same.
+
+Playback is 8-bit unsigned mono through DMA. `play FILE` streams PCM WAV (8- or 16-bit, mono or stereo) or MPEG-1/2 Layer III (MP3). Stereo is mixed down to mono. Press `q` to stop. `beep FILE.WAV` still plays a short clip loaded in one go (32 KiB).
+
+A short `DEMO.WAV` is packed onto the boot volume; `DEMO.MP3` is added when `ffmpeg` is available at build time.
+
 ## Disk layout
 
 ```
-boot.img (drive 0)
-  LBA 0       MBR + stage1
+boot.img (drive 0, 64 MiB)
+  LBA 0       MBR + stage1 (BIOS)
   LBA 1–8     stage2 (enters long mode)
-  LBA 9+      kernel.bin
-  LBA 2048+   FAT32: KERNEL.BIN, SHELL.COM, ECHO.COM, EDIT.COM, LESS.COM, FM.COM, README.TXT, SYSTEM.INI, …
+  LBA 9+      kernel.bin (BIOS load; UEFI reads KERNEL.BIN from FAT)
+  LBA 2048+   FAT32 ESP (type 0xEF, ≥65525 clusters so OVMF accepts it):
+              KERNEL.BIN, \EFI\BOOT\BOOTX64.EFI, SHELL.COM,
+              \FOS\*.COM (ECHO, EDIT, LESS, FM, DATE, MEM, BEEP, PLAY),
+              DEMO.WAV, DEMO.MP3 (if ffmpeg at build), BABY.MP3 (if present),
+              README.TXT, SYSTEM.INI, …
 
 data.img (drive 1)
   LBA 2048+   exFAT (or FAT32 if mkfs.exfat is unavailable)
@@ -156,22 +201,34 @@ fos/
 │   ├── vfs.c / block.c        # Drives and ATA PIO
 │   ├── fat32.c / exfat.c      # Filesystems
 │   └── include/
+├── efi/
+│   ├── efi_main.c             # UEFI loader → same kernel at 1 MiB
+│   └── BOOTX64.EFI            # built PE32+ EFI app
 ├── apps/
 │   ├── echo/   echo.com
 │   ├── edit/   edit.com
 │   ├── less/   less.com
+│   ├── date/   date.com
+│   ├── mem/    mem.com
+│   ├── beep/   beep.com
+│   ├── play/   play.com (WAV/MP3 TUI, minimp3)
 │   └── fm/     fm.com
 ├── scripts/                   # mkdisk.sh, foscom_pack.py, …
 ├── system.ini                 # Template → 0:\SYSTEM.INI
 └── Makefile
 ```
 
-Almost all logic is **C**. Only the bootloader and short `entry.asm` stubs are assembly.
+Almost all logic is **C**. Only the bootloader, UEFI trampoline, and short `entry.asm` stubs are assembly.
 
 ## Boot sequence (summary)
 
-1. Stage1/stage2 load the kernel and enter long mode.
-2. Kernel brings up console (VGA text), CPU info, keyboard, and disks.
-3. `0:\SYSTEM.INI` is read — keyboard layout and video mode are applied here.
-4. Disk/volume report and boot logo are shown.
-5. Shell starts on a black background.
+**BIOS (`make run`):** Stage1/stage2 load the kernel from LBA 9, collect E820, enter long mode, jump to `0x100000`.
+
+**UEFI (`make run-uefi`):** OVMF runs `\EFI\BOOT\BOOTX64.EFI`, which reads `\KERNEL.BIN` from the ESP, `ExitBootServices`, installs the same GDT/page tables as stage2, and jumps to `0x100000`.
+
+Then both paths:
+
+1. Kernel brings up console (VGA text), CPU info, keyboard, and disks.
+2. `0:\SYSTEM.INI` is read — keyboard layout and video mode are applied here.
+3. Disk/volume report and boot logo are shown.
+4. Shell starts on a black background.

@@ -7,6 +7,7 @@
  *   e                edit file (EDIT.COM)
  *   v                view file
  *   n                new empty file
+ *   m                mkdir
  *   q                quit
  */
 
@@ -219,7 +220,7 @@ static void draw(fos_api_t *api) {
     }
 
     api->goto_xy(0, ROW_HELP);
-    api->write("Enter dir  e edit  v view  n new  q quit  Up/Dn/Pg");
+    api->write("Enter  e edit  v view  n file  m mkdir  q quit");
 }
 
 static void view_file(fos_api_t *api, const char *path, const char *title) {
@@ -401,6 +402,27 @@ static void view_selected(fos_api_t *api) {
     draw(api);
 }
 
+static void new_dir(fos_api_t *api) {
+    char name[64];
+    char path[256];
+
+    if (!api->mkdir) {
+        draw(api);
+        return;
+    }
+    if (prompt_name(api, "New folder (Esc cancel)", name, sizeof(name)) != 0) {
+        draw(api);
+        return;
+    }
+    join_path(path, sizeof(path), cwd, name);
+    if (api->mkdir(path) != 0) {
+        draw(api);
+        return;
+    }
+    reload_entries(api);
+    draw(api);
+}
+
 static void new_file(fos_api_t *api) {
     char name[64];
     char path[256];
@@ -475,6 +497,10 @@ void com_main(void) {
             }
             if (ev.ch == 'n' || ev.ch == 'N') {
                 new_file(api);
+                continue;
+            }
+            if (ev.ch == 'm' || ev.ch == 'M') {
+                new_dir(api);
                 continue;
             }
             continue;

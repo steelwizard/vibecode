@@ -20,6 +20,10 @@
 #include "fos_api.h"
 #include "config.h"
 #include "video.h"
+#include "timer.h"
+#include "rtc.h"
+#include "memory.h"
+#include "sb16.h"
 
 void kmain(void) {
     /* --- Phase 1: console and CPU --- */
@@ -30,9 +34,19 @@ void kmain(void) {
     boot_line("============================");
     boot_line("");
 
+    timer_init();
+    memory_init();
+    {
+        extern char _end[];
+        memory_set_kernel_size((uint64_t)(uintptr_t)_end - 0x100000ULL);
+    }
     boot_line("[boot] CPU");
     console_set_color(15, 1);
     cpu_print_info();
+    boot_line("[boot] PIT 1000 Hz (IRQ0)");
+    boot_line("[boot] RTC");
+    console_set_color(15, 1);
+    rtc_print();
     boot_line("");
 
     /* Keyboard HW init; layout comes from SYSTEM.INI after VFS is up. */
@@ -57,6 +71,7 @@ void kmain(void) {
     if (video_is_framebuffer()) {
         console_clear_color(15, 1);
     }
+    sb16_init();
     boot_line("");
 
     console_set_color(15, 1);

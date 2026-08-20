@@ -15,22 +15,15 @@ start:
 
     call serial_init16
 
+    call e820_collect
+
     mov si, msg_stage2
     call print_both16
 
     mov si, msg_load_kern
     call print_both16
 
-    mov ax, KERNEL_STAGE_ADDR >> 4
-    mov es, ax
-    xor bx, bx
-    mov ah, 0x02
-    mov al, KERNEL_MAX_SECTORS
-    mov ch, 0
-    mov dh, 0
-    mov cl, KERNEL_LBA + 1
-    mov dl, [BOOT_DRIVE_ADDR]
-    int 0x13
+    call load_kernel
     jc disk_fail
 
     mov si, msg_kern_ok
@@ -65,6 +58,109 @@ enable_a20:
     or al, 2
     out 0x92, al
     ret
+
+; INT 15h AX=E820 — store physical memory map at MEM_MAP_ADDR for the kernel.
+e820_collect:
+    push es
+    xor ax, ax
+    mov es, ax
+    mov dword [MEM_MAP_ADDR], MEM_MAP_MAGIC
+    mov dword [MEM_MAP_ADDR + 4], 0
+    mov di, MEM_MAP_ADDR + 8
+    xor ebx, ebx
+.loop:
+    mov eax, 0xE820
+    mov edx, 0x534D4150
+    mov ecx, 24
+    mov dword [es:di + 20], 1
+    int 0x15
+    jc .done
+    cmp eax, 0x534D4150
+    jne .done
+    inc dword [MEM_MAP_ADDR + 4]
+    add di, 24
+    cmp dword [MEM_MAP_ADDR + 4], MEM_MAP_MAX
+    jae .done
+    test ebx, ebx
+    jnz .loop
+.done:
+    pop es
+    ret
+
+; INT 13h AH=42h — load KERNEL_MAX_SECTORS from KERNEL_LBA into KERNEL_STAGE_ADDR.
+; Reads KERNEL_CHUNK_SECTORS at a time so we stay under the BIOS 127-sector
+; limit and do not wrap a 64K buffer (the old 0x9000 + 192-sector read failed).
+load_kernel:
+    pusha
+    push es
+
+    mov ah, 0x41
+    mov bx, 0x55AA
+    mov dl, [BOOT_DRIVE_ADDR]
+    int 0x13
+    jc .fail
+    cmp bx, 0xAA55
+    jne .fail
+
+    mov dword [dap_lba], KERNEL_LBA
+    mov dword [dap_lba + 4], 0
+    mov word [dap_off], 0
+    mov word [dap_seg], KERNEL_STAGE_ADDR >> 4
+    mov word [kern_left], KERNEL_MAX_SECTORS
+
+.chunk:
+    mov ax, [kern_left]
+    test ax, ax
+    jz .ok
+    cmp ax, KERNEL_CHUNK_SECTORS
+    jbe .count_ok
+    mov ax, KERNEL_CHUNK_SECTORS
+.count_ok:
+    mov [dap_count], ax
+
+    mov dl, [BOOT_DRIVE_ADDR]
+    mov si, dap
+    mov ah, 0x42
+    int 0x13
+    jc .fail
+
+    mov bx, [dap_count]
+    sub [kern_left], bx
+    add [dap_lba], bx
+    adc word [dap_lba + 2], 0
+    adc word [dap_lba + 4], 0
+    adc word [dap_lba + 6], 0
+    ; next buffer: count * 512 bytes = count * 32 paragraphs
+    shl bx, 5
+    add [dap_seg], bx
+    jmp .chunk
+
+.ok:
+    pop es
+    popa
+    clc
+    ret
+
+.fail:
+    pop es
+    popa
+    stc
+    ret
+
+kern_left dw 0
+
+align 16
+dap:
+    db 16
+    db 0
+dap_count:
+    dw 0
+dap_off:
+    dw 0
+dap_seg:
+    dw 0
+dap_lba:
+    dq 0
 
 ; Serial helpers must live in this real-mode section (before [bits 32])
 %include "boot_serial.inc"

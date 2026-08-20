@@ -6,6 +6,7 @@
 #define PART_TYPE_FAT32_CHS 0x0B
 #define PART_TYPE_FAT32_LBA 0x0C
 #define PART_TYPE_EXFAT     0x07
+#define PART_TYPE_EFI       0xEF
 
 typedef struct {
     uint8_t  type;

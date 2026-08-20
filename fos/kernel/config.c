@@ -14,8 +14,8 @@
 #include "vfs.h"
 #include "string.h"
 
-#define CONFIG_MAX 512
-#define VALUE_MAX  64
+#define CONFIG_MAX 1024
+#define VALUE_MAX  256
 
 /* Raw file contents loaded once by config_init(). */
 static char config_buf[CONFIG_MAX];

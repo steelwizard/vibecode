@@ -17,6 +17,7 @@
 #include "boot_report.h"
 #include "foscom.h"
 #include "fos_api.h"
+#include "config.h"
 #include "string.h"
 
 #define LINE_MAX       256
@@ -109,18 +110,15 @@ static void split_cmd(const char *line, char *name, size_t name_sz, char *args, 
     args[args_sz - 1] = 0;
 }
 
-static void build_com_path(const char *name, char *path, size_t sz) {
-    char base[64];
+/* Uppercase name and append .COM when no extension is present. */
+static void make_com_name(const char *name, char *base, size_t base_sz) {
     size_t i = 0;
     const char *n = name;
 
-    if (n[0] == '\\') {
-        strncpy(path, n, sz - 1);
-        path[sz - 1] = 0;
-        return;
+    while (*n == ' ' || *n == '\t') {
+        n++;
     }
-
-    while (*n && i + 1 < sizeof(base)) {
+    while (*n && i + 1 < base_sz) {
         char c = *n++;
         if (c >= 'a' && c <= 'z') {
             c = (char)(c - 32);
@@ -130,12 +128,139 @@ static void build_com_path(const char *name, char *path, size_t sz) {
     base[i] = 0;
 
     if (!strchr(base, '.')) {
-        strncat(base, ".COM", sizeof(base) - strlen(base) - 1);
+        strncat(base, ".COM", base_sz - strlen(base) - 1);
+    }
+}
+
+static int path_join(char *out, size_t out_sz, const char *dir, const char *file) {
+    size_t n = 0;
+    const char *d = dir;
+
+    if (!out || out_sz == 0 || !file || !file[0]) {
+        return -1;
     }
 
-    path[0] = '\\';
-    path[1] = 0;
-    strncat(path, base, sz - 2);
+    while (*d == ' ' || *d == '\t') {
+        d++;
+    }
+    if (*d == 0) {
+        d = "\\";
+    }
+
+    if (*d != '\\') {
+        if (n + 1 >= out_sz) {
+            return -1;
+        }
+        out[n++] = '\\';
+    }
+    while (*d && n + 1 < out_sz) {
+        out[n++] = *d++;
+    }
+    /* Trim trailing slashes, but keep a single root "\". */
+    while (n > 1 && out[n - 1] == '\\') {
+        n--;
+    }
+    if (!(n == 1 && out[0] == '\\')) {
+        if (n + 1 >= out_sz) {
+            return -1;
+        }
+        out[n++] = '\\';
+    }
+    while (*file && n + 1 < out_sz) {
+        out[n++] = *file++;
+    }
+    out[n] = 0;
+    return 0;
+}
+
+static int com_exists(const char *path) {
+    uint32_t size = 0;
+    int is_dir = 0;
+
+    if (vfs_stat(vfs_get_drive(), path, &size, &is_dir) != 0) {
+        return 0;
+    }
+    return !is_dir;
+}
+
+/*
+ * Resolve a .COM program name using PATH from [shell] path= in SYSTEM.INI.
+ * Entries are colon-separated absolute directories on the current drive (e.g. \FOS:\BIN).
+ * Absolute names (leading \) are used as-is. Otherwise: cwd, then each PATH entry.
+ */
+static int resolve_com(const char *name, char *out, size_t out_sz) {
+    char base[64];
+    char pathenv[256];
+    const char *cfg;
+    const char *p;
+
+    if (!name || !name[0] || !out || out_sz == 0) {
+        return -1;
+    }
+
+    make_com_name(name, base, sizeof(base));
+    if (base[0] == 0) {
+        return -1;
+    }
+
+    /* Absolute or nested path: use from drive root. */
+    if (name[0] == '\\' || strchr(base, '\\')) {
+        if (base[0] == '\\') {
+            strncpy(out, base, out_sz - 1);
+        } else {
+            out[0] = '\\';
+            strncpy(out + 1, base, out_sz - 2);
+        }
+        out[out_sz - 1] = 0;
+        return com_exists(out) ? 0 : -1;
+    }
+
+    /* Current working directory. */
+    strncpy(out, base, out_sz - 1);
+    out[out_sz - 1] = 0;
+    if (com_exists(out)) {
+        return 0;
+    }
+
+    cfg = config_get("shell", "path");
+    if (cfg && cfg[0]) {
+        strncpy(pathenv, cfg, sizeof(pathenv) - 1);
+        pathenv[sizeof(pathenv) - 1] = 0;
+    } else {
+        strcpy(pathenv, "\\FOS");
+    }
+
+    p = pathenv;
+    while (*p) {
+        char dir[VFS_PATH_MAX];
+        size_t di = 0;
+
+        while (*p == ':') {
+            p++;
+        }
+        if (*p == 0) {
+            break;
+        }
+        while (*p && *p != ':' && di + 1 < sizeof(dir)) {
+            dir[di++] = *p++;
+        }
+        dir[di] = 0;
+        while (di > 0 && (dir[di - 1] == ' ' || dir[di - 1] == '\t')) {
+            dir[--di] = 0;
+        }
+
+        if (dir[0] == 0) {
+            continue;
+        }
+        if (path_join(out, out_sz, dir, base) != 0) {
+            continue;
+        }
+        if (com_exists(out)) {
+            return 0;
+        }
+    }
+
+    return -1;
 }
 
 static void cmd_help(void) {
@@ -155,13 +280,18 @@ static void cmd_help(void) {
     console_write_line("  <name>.com [args]    Run .COM program (e.g. echo hello)");
     console_write_line("  edit [file]          Text editor (Ctrl+S save, Ctrl+X exit)");
     console_write_line("  less [file]          Page through a file (q to quit)");
-    console_write_line("  fm                   File manager (browser)");
+    console_write_line("  fm                   File manager (m = mkdir)");
+    console_write_line("  date [when]          Show or set RTC (date.com)");
+    console_write_line("  mem                  RAM map and usage (mem.com)");
+    console_write_line("  beep [hz [ms]|file]  Sound Blaster beep (beep.com)");
+    console_write_line("  play <file>          WAV/MP3 player (q quits)");
     console_write_line("  cmd1 | cmd2          Pipe stdout to stdin");
     console_write_line("  cmd > file           Redirect stdout to file");
     console_write_line("  Up/Down/Left/Right  Edit command line");
     console_write_line("  PgUp/PgDn            Scroll terminal output");
     console_write_line("  | and >              Pipe / redirect (DE: AltGr+< is |, Shift+< is >)");
     console_write_line("  Tab                  Filename completion");
+    console_write_line("  PATH                 [shell] path= in SYSTEM.INI (e.g. \\FOS)");
 }
 
 static void cmd_ver(void) {
@@ -330,38 +460,47 @@ static int try_run_com(const char *line) {
         return 0;
     }
 
-    build_com_path(name, path, sizeof(path));
+    if (resolve_com(name, path, sizeof(path)) != 0) {
+        return 0;
+    }
     return exec_run(vfs_get_drive(), path, args) == 0;
 }
 
-static void cmd_edit(const char *args) {
+static int run_direct_com(const char *prog, const char *args, const char *fail_msg) {
+    char path[VFS_PATH_MAX];
+
+    if (resolve_com(prog, path, sizeof(path)) != 0) {
+        console_write_line(fail_msg);
+        return -1;
+    }
     console_begin_direct();
-    if (exec_run(vfs_get_drive(), "\\EDIT.COM", args) != 0) {
+    if (exec_run(vfs_get_drive(), path, args) != 0) {
         console_end_direct();
-        console_write_line("EDIT failed (missing or corrupt EDIT.COM — run: make clean && make)");
-        return;
+        console_write_line(fail_msg);
+        return -1;
     }
     console_end_direct();
+    return 0;
+}
+
+static void cmd_edit(const char *args) {
+    run_direct_com("EDIT", args,
+                   "EDIT failed (missing or corrupt EDIT.COM — run: make clean && make)");
 }
 
 static void cmd_fm(const char *args) {
-    console_begin_direct();
-    if (exec_run(vfs_get_drive(), "\\FM.COM", args) != 0) {
-        console_end_direct();
-        console_write_line("FM failed (missing or corrupt FM.COM — run: make clean && make)");
-        return;
-    }
-    console_end_direct();
+    run_direct_com("FM", args,
+                   "FM failed (missing or corrupt FM.COM — run: make clean && make)");
 }
 
 static void cmd_less(const char *args) {
-    console_begin_direct();
-    if (exec_run(vfs_get_drive(), "\\LESS.COM", args) != 0) {
-        console_end_direct();
-        console_write_line("LESS failed (missing or corrupt LESS.COM — run: make clean && make)");
-        return;
-    }
-    console_end_direct();
+    run_direct_com("LESS", args,
+                   "LESS failed (missing or corrupt LESS.COM — run: make clean && make)");
+}
+
+static void cmd_play(const char *args) {
+    run_direct_com("PLAY", args,
+                   "PLAY failed (missing or corrupt PLAY.COM — run: make clean && make)");
 }
 
 static int run_builtin(char *line) {
@@ -398,6 +537,8 @@ static int run_builtin(char *line) {
         cmd_fm(cmd_arg(line));
     } else if (match_cmd(line, "LESS") || match_cmd(line, "MORE")) {
         cmd_less(cmd_arg(line));
+    } else if (match_cmd(line, "PLAY")) {
+        cmd_play(cmd_arg(line));
     } else if (try_run_com(line)) {
         return 1;
     } else {

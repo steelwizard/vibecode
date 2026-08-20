@@ -149,6 +149,7 @@ static void init_layout_de(void) {
     /* QWERTZ physical layout — indices are scancode set 1 make codes. */
     layout_clear(&layout_de, "de");
 
+    layout_set(&layout_de, 0x01, 27, 0, 0); /* Esc */
     layout_set(&layout_de, 0x02, '1', '!', 0);
     layout_set(&layout_de, 0x03, '2', '"', CP_sup2);
     layout_set(&layout_de, 0x04, '3', CP_SS, CP_sup3);
@@ -366,11 +367,7 @@ const char *keyboard_get_layout(void) {
 }
 
 int keyboard_has_key(void) {
-    /* Prefer PS/2 when both have data — avoids duplicate keys with -serial stdio. */
-    if ((inb(PS2_STATUS) & 0x01) != 0) {
-        return 1;
-    }
-    return serial_has_byte();
+    return serial_has_byte() || ((inb(PS2_STATUS) & 0x01) != 0);
 }
 
 static key_event_t key_from_scancode(uint8_t sc) {
@@ -615,14 +612,14 @@ normal_char:
 }
 
 key_event_t keyboard_read_event(void) {
-    if ((inb(PS2_STATUS) & 0x01) != 0) {
-        return ps2_read_event();
-    }
-
+    /* Serial first: `make run` types on COM1. PS/2 status can sit full of
+     * break codes and starve q if we always drain the keyboard first. */
     if (serial_has_byte()) {
         return serial_read_event();
     }
-
+    if ((inb(PS2_STATUS) & 0x01) != 0) {
+        return ps2_read_event();
+    }
     return (key_event_t){KEY_NONE, 0};
 }
 

@@ -4,4 +4,7 @@
 *.img
 *.com
 *.iso
+*.mp3
+baby.mp3
 boot
+__pycache__/

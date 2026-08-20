@@ -11,12 +11,32 @@
 #include "vfs.h"
 #include "console.h"
 #include "string.h"
+#include "irq.h"
 
-#define EXEC_BUF_MAX 65536
-#define DEFAULT_STACK 0x8F000ULL
+#define EXEC_BUF_MAX 131072
+
+/*
+ * Program stacks live well above the kernel's, which grows down from 0x90000.
+ * The kernel is already ~12 KB deep by the time it starts a program, so a
+ * stack placed just below 0x90000 would sit inside live kernel frames and a
+ * deep program (an MP3 decoder, say) would quietly shred them. Each nesting
+ * level of api->run_com gets its own slot below COM_STACK_TOP.
+ */
+#define COM_STACK_TOP    0x800000ULL
+#define COM_STACK_SIZE   0x100000ULL
+#define COM_STACK_LEVELS 4
+#define COM_LOAD_MIN     0x200000ULL
+#define COM_LOAD_MAX     (COM_STACK_TOP - COM_STACK_LEVELS * COM_STACK_SIZE)
+
+extern void com_call(void (*entry)(void), uint64_t stack_top);
+
+static int com_level;
 
 static int load_and_run(const foscom_hdr_t *hdr, const void *payload) {
-    if (hdr->load_addr < 0x100000 || hdr->entry < hdr->load_addr) {
+    if (hdr->load_addr < COM_LOAD_MIN || hdr->entry < hdr->load_addr) {
+        return -1;
+    }
+    if (com_level >= COM_STACK_LEVELS) {
         return -1;
     }
     if (hdr->payload_size == 0 || hdr->mem_size < hdr->payload_size) {
@@ -26,27 +46,33 @@ static int load_and_run(const foscom_hdr_t *hdr, const void *payload) {
         return -1;
     }
 
-    uint8_t *dest = (uint8_t *)(uintptr_t)hdr->load_addr;
-    memcpy(dest, payload, (size_t)hdr->payload_size);
-
-    /* Zero the mem_size region beyond the loaded payload (BSS). */
+    /* Normalise mem_size: it may be an end address or a span. */
     uint64_t mem_span = hdr->mem_size;
     if (mem_span > hdr->load_addr && mem_span < hdr->load_addr + 0x10000000ULL) {
         mem_span -= hdr->load_addr;
     }
+    if (hdr->load_addr + mem_span > COM_LOAD_MAX) {
+        return -1; /* image would reach into the program stacks */
+    }
+
+    uint8_t *dest = (uint8_t *)(uintptr_t)hdr->load_addr;
+    memcpy(dest, payload, (size_t)hdr->payload_size);
     if (mem_span > hdr->payload_size) {
         memset(dest + hdr->payload_size, 0, (size_t)(mem_span - hdr->payload_size));
     }
 
-    uint64_t stack = hdr->stack_top ? hdr->stack_top : DEFAULT_STACK;
-    void (*entry)(void) = (void (*)(void))(uintptr_t)hdr->entry;
-    uint64_t saved_rsp;
+    /* Honour a requested stack only inside the safe window; images packed
+     * before the stacks moved still carry the old kernel-adjacent value. */
+    uint64_t stack = COM_STACK_TOP - (uint64_t)com_level * COM_STACK_SIZE;
+    if (com_level == 0 && hdr->stack_top > COM_LOAD_MAX &&
+        hdr->stack_top <= COM_STACK_TOP) {
+        stack = hdr->stack_top;
+    }
 
-    /* Run .COM on its own stack; restore kernel RSP when it returns. */
-    __asm__ volatile("mov %%rsp, %0" : "=r"(saved_rsp));
-    __asm__ volatile("mov %0, %%rsp" : : "r"(stack) : "memory");
-    entry();
-    __asm__ volatile("mov %0, %%rsp" : : "r"(saved_rsp) : "memory");
+    com_level++;
+    com_call((void (*)(void))(uintptr_t)hdr->entry, stack);
+    com_level--;
+    irq_clear_handlers();
     return 0;
 }
 

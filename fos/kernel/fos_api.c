@@ -11,6 +11,11 @@
 #include "vfs.h"
 #include "foscom.h"
 #include "string.h"
+#include "timer.h"
+#include "rtc.h"
+#include "memory.h"
+#include "irq.h"
+#include "sb16.h"
 
 #define api ((fos_api_t *)FOS_API_ADDR)
 
@@ -72,6 +77,20 @@ static int api_read_file(const char *path, char *buf, size_t cap, size_t *out_le
     return vfs_read_file(vfs_get_drive(), path, buf, cap, out_len);
 }
 
+static int api_stat_file(const char *path, uint32_t *size, int *is_dir) {
+    if (!path) {
+        return -1;
+    }
+    return vfs_stat(vfs_get_drive(), path, size, is_dir);
+}
+
+static int api_read_at(const char *path, uint32_t offset, void *buf, uint32_t cap, uint32_t *out_len) {
+    if (!path || !buf || !out_len) {
+        return -1;
+    }
+    return vfs_read_at(vfs_get_drive(), path, offset, buf, cap, out_len);
+}
+
 static int api_write_file(const char *path, const char *buf, size_t len) {
     if (!path || !buf) {
         return -1;
@@ -111,6 +130,17 @@ static void api_get_cwd(char *buf, size_t cap) {
     buf[cap - 1] = 0;
 }
 
+static int api_mkdir(const char *path) {
+    if (!path || !path[0]) {
+        return -1;
+    }
+    return vfs_mkdir(vfs_get_drive(), path);
+}
+
+static int api_get_mem_info(fos_mem_info_t *out) {
+    return memory_get_info(out);
+}
+
 static int api_run_com(const char *path, const char *args) {
     if (!path) {
         return -1;
@@ -141,6 +171,30 @@ void fos_api_init(void) {
     api->run_com = api_run_com;
     api->set_color = console_set_color;
     api->write_color = console_write_color;
+    api->get_ticks_ms = timer_ticks_ms;
+    api->sleep_ms = timer_sleep_ms;
+    api->rtc_read = rtc_read;
+    api->rtc_write = rtc_write;
+    api->mkdir = api_mkdir;
+    api->get_mem_info = api_get_mem_info;
+    api->irq_register = irq_register;
+    api->irq_unregister = irq_unregister;
+    api->irq_enable = irq_enable;
+    api->irq_disable = irq_disable;
+    api->irq_pending = irq_get_pending;
+    api->irq_clear = irq_clear_pending;
+    api->irq_in_handler = irq_in_handler;
+    api->sound_present = sb16_present;
+    api->sound_beep = sb16_beep;
+    api->sound_play = sb16_play;
+    api->sound_stop = sb16_stop;
+    api->sound_playing = sb16_playing;
+    api->stat_file = api_stat_file;
+    api->read_at = api_read_at;
+    api->begin_direct = console_begin_direct;
+    api->end_direct = console_end_direct;
+    api->sound_start = sb16_start;
+    api->sound_can_queue = sb16_can_queue;
     api->cmdline[0] = 0;
     api->pipe_in_len = 0;
 }

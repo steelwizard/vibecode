@@ -96,7 +96,22 @@ static int serial_ready(void) {
 }
 
 static void serial_putchar(char c) {
-    while (!serial_ready()) {
+    int spins;
+
+    /* Full-screen .COM UIs draw via VGA; echoing every cell to COM1 can
+     * block forever when -serial stdio isn't draining (and it garbles the
+     * host terminal with CP437 box chars). */
+    if (direct_vga) {
+        return;
+    }
+
+    for (spins = 0; spins < 100000; spins++) {
+        if (serial_ready()) {
+            break;
+        }
+    }
+    if (spins >= 100000) {
+        return;
     }
     if (c == '\n') {
         outb(COM1, (uint8_t)'\r');
