@@ -4,6 +4,31 @@
 
 #include "fos_api.h"
 
+#define FG_NORMAL  15
+#define FG_DIM      8
+#define FG_LABEL    7
+#define FG_TITLE   11
+#define FG_HEAD    14
+#define FG_HEX     11
+#define FG_USABLE  10
+#define FG_RESERVE 14
+#define FG_ACPI     3
+#define FG_NVS     13
+#define FG_BAD     12
+#define FG_OTHER    7
+#define FG_OK      10
+#define FG_FAIL    12
+
+static void fg(fos_api_t *api, uint8_t c) {
+    if (api->set_color) {
+        api->set_color(c, 0);
+    }
+}
+
+static void reset_fg(fos_api_t *api) {
+    fg(api, FG_NORMAL);
+}
+
 static void write_str(fos_api_t *api, const char *s) {
     api->write(s);
 }
@@ -78,6 +103,23 @@ static const char *type_name(uint32_t type) {
     }
 }
 
+static uint8_t type_color(uint32_t type) {
+    switch (type) {
+    case 1:
+        return FG_USABLE;
+    case 2:
+        return FG_RESERVE;
+    case 3:
+        return FG_ACPI;
+    case 4:
+        return FG_NVS;
+    case 5:
+        return FG_BAD;
+    default:
+        return FG_OTHER;
+    }
+}
+
 static void pad_field(fos_api_t *api, int width) {
     while (width-- > 0) {
         api->putchar(' ');
@@ -94,14 +136,18 @@ static void write_padded(fos_api_t *api, const char *s, int width) {
 }
 
 static void print_region_table(fos_api_t *api, const fos_mem_info_t *info) {
+    fg(api, FG_HEAD);
     write_line(api, "Physical RAM (BIOS E820)");
+    fg(api, FG_DIM);
     write_line(api, "  #   Base           Length         Type");
     write_line(api, "  --  -------------  -------------  ------------");
 
     for (int i = 0; i < info->count; i++) {
         const fos_mem_region_t *r = &info->regions[i];
         char idx[4];
+        uint8_t tc = type_color(r->type);
 
+        fg(api, FG_LABEL);
         api->write("  ");
         if (i < 10) {
             api->putchar((char)('0' + i));
@@ -113,45 +159,66 @@ static void print_region_table(fos_api_t *api, const fos_mem_info_t *info) {
             api->write(idx);
             api->putchar(' ');
         }
+        fg(api, FG_HEX);
         write_hex64(api, r->base);
+        fg(api, FG_DIM);
         api->write("  ");
+        fg(api, FG_HEX);
         write_hex64(api, r->length);
+        fg(api, FG_DIM);
         api->write("  ");
+        fg(api, tc);
         write_padded(api, type_name(r->type), 12);
         api->putchar('\n');
     }
 }
 
+static void print_kv_size(fos_api_t *api, const char *label, uint64_t bytes, uint8_t vc) {
+    fg(api, FG_LABEL);
+    api->write(label);
+    fg(api, vc);
+    write_size(api, bytes);
+    api->putchar('\n');
+}
+
 static void print_summary(fos_api_t *api, const fos_mem_info_t *info) {
     write_line(api, "");
+    fg(api, FG_HEAD);
     write_line(api, "Summary");
-    api->write("  Total installed:  ");
-    write_size(api, info->total_bytes);
-    api->putchar('\n');
-    api->write("  Usable RAM:       ");
-    write_size(api, info->usable_bytes);
-    api->putchar('\n');
-    api->write("  Reserved/other:   ");
-    write_size(api, info->reserved_bytes);
-    api->putchar('\n');
+    print_kv_size(api, "  Total installed:  ", info->total_bytes, FG_NORMAL);
+    print_kv_size(api, "  Usable RAM:       ", info->usable_bytes, FG_USABLE);
+    print_kv_size(api, "  Reserved/other:   ", info->reserved_bytes, FG_RESERVE);
+}
+
+static void print_map_line(fos_api_t *api, const char *label, const char *value) {
+    fg(api, FG_LABEL);
+    api->write(label);
+    fg(api, FG_HEX);
+    write_line(api, value);
 }
 
 static void print_kernel_map(fos_api_t *api, const fos_mem_info_t *info) {
     write_line(api, "");
+    fg(api, FG_HEAD);
     write_line(api, "Kernel and fixed addresses");
+    fg(api, FG_LABEL);
     api->write("  Kernel image:     0x");
+    fg(api, FG_HEX);
     write_hex64(api, info->kernel_base);
+    fg(api, FG_DIM);
     api->write(" (");
+    fg(api, FG_NORMAL);
     write_size(api, info->kernel_size);
+    fg(api, FG_DIM);
     api->write(")\n");
-    write_line(api, "  Page tables:      0x5000 - 0x7FFF");
-    write_line(api, "  E820 map stash:   0x4000");
-    write_line(api, "  FOS API block:    0xFF0000");
-    write_line(api, "  Identity map:     512 MB");
-    write_line(api, "  .COM load addr:   0x300000");
-    write_line(api, "  .COM image max:   32 MB");
-    write_line(api, "  .COM stack top:   0x4300000 (8 MB x 4)");
-    write_line(api, "  Kernel stack top: 0x90000");
+    print_map_line(api, "  Page tables:      ", "0x5000 - 0x7FFF");
+    print_map_line(api, "  E820 map stash:   ", "0x4000");
+    print_map_line(api, "  FOS API block:    ", "0xFF0000");
+    print_map_line(api, "  Identity map:     ", "512 MB");
+    print_map_line(api, "  .COM load addr:   ", "0x300000");
+    print_map_line(api, "  .COM image max:   ", "32 MB");
+    print_map_line(api, "  .COM stack top:   ", "0x4300000 (8 MB x 4)");
+    print_map_line(api, "  Kernel stack top: ", "0x90000");
 }
 
 static void print_largest_usable(fos_api_t *api, const fos_mem_info_t *info) {
@@ -166,13 +233,18 @@ static void print_largest_usable(fos_api_t *api, const fos_mem_info_t *info) {
     }
 
     write_line(api, "");
+    fg(api, FG_LABEL);
     api->write("  Largest usable region: ");
     if (best_len == 0) {
+        fg(api, FG_DIM);
         write_line(api, "(none)");
         return;
     }
+    fg(api, FG_USABLE);
     write_size(api, best_len);
+    fg(api, FG_DIM);
     api->write(" @ 0x");
+    fg(api, FG_HEX);
     write_hex64(api, best_base);
     api->putchar('\n');
 }
@@ -181,20 +253,32 @@ static void print_heap(fos_api_t *api) {
     fos_heap_info_t h;
 
     write_line(api, "");
+    fg(api, FG_HEAD);
     write_line(api, "Allocator");
     if (!api->get_heap_info || api->get_heap_info(&h) != 0) {
+        fg(api, FG_FAIL);
         write_line(api, "  (heap API missing — rebuild the kernel)");
         return;
     }
+    fg(api, FG_LABEL);
     api->write("  Page pool:        ");
+    fg(api, FG_NORMAL);
     write_size(api, h.pool_total);
+    fg(api, FG_DIM);
     api->write(" total, ");
+    fg(api, FG_NORMAL);
     write_size(api, h.pool_used);
+    fg(api, FG_DIM);
     api->write(" held by the heap\n");
+    fg(api, FG_LABEL);
     api->write("  Heap in use:      ");
+    fg(api, h.heap_used ? FG_USABLE : FG_DIM);
     write_size(api, h.heap_used);
+    fg(api, FG_DIM);
     api->write(" across ");
+    fg(api, FG_NORMAL);
     write_dec(api, h.heap_blocks);
+    fg(api, FG_DIM);
     api->write(" block(s)\n");
 }
 
@@ -231,7 +315,9 @@ static int check(const void *p, uint32_t n, uint8_t seed) {
 }
 
 static void report(fos_api_t *api, const char *name, int ok) {
+    fg(api, ok ? FG_OK : FG_FAIL);
     api->write(ok ? "  ok    " : "  FAIL  ");
+    fg(api, ok ? FG_NORMAL : FG_FAIL);
     write_line(api, name);
 }
 
@@ -241,6 +327,7 @@ static int run_stress(fos_api_t *api) {
     int i;
 
     if (!api->mem_alloc || !api->mem_free || !api->get_heap_info) {
+        fg(api, FG_FAIL);
         write_line(api, "MEM: heap API missing — rebuild the kernel");
         return 1;
     }
@@ -350,6 +437,7 @@ static int run_stress(fos_api_t *api) {
     }
 
     write_line(api, "");
+    fg(api, fails ? FG_FAIL : FG_OK);
     write_line(api, fails ? "RESULT: FAIL" : "RESULT: PASS");
     return fails;
 }
@@ -367,9 +455,11 @@ void com_main(void) {
     const char *arg = skip_ws(api->cmdline);
 
     if (arg[0] == 't' || (arg[0] == '-' && arg[1] == 't')) {
+        fg(api, FG_TITLE);
         write_line(api, "FOS heap stress test");
         write_line(api, "");
         run_stress(api);
+        reset_fg(api);
         return;
     }
 
@@ -378,24 +468,33 @@ void com_main(void) {
     if (arg[0] == 'l') {
         for (int i = 0; i < 8; i++) {
             if (!api->mem_alloc || !api->mem_alloc(512u * 1024u)) {
+                fg(api, FG_FAIL);
                 write_line(api, "MEM: allocation failed");
+                reset_fg(api);
                 return;
             }
         }
+        fg(api, FG_RESERVE);
         write_line(api, "Leaked 4 MB on purpose — it is the loader's problem now.");
+        reset_fg(api);
         return;
     }
 
     if (!api->get_mem_info) {
+        fg(api, FG_FAIL);
         write_line(api, "MEM: memory API missing — rebuild the kernel");
+        reset_fg(api);
         return;
     }
 
     if (api->get_mem_info(&info) != 0) {
+        fg(api, FG_FAIL);
         write_line(api, "MEM: no BIOS memory map (E820 unavailable)");
+        reset_fg(api);
         return;
     }
 
+    fg(api, FG_TITLE);
     write_line(api, "FOS memory report");
     write_line(api, "");
     print_region_table(api, &info);
@@ -403,4 +502,5 @@ void com_main(void) {
     print_kernel_map(api, &info);
     print_largest_usable(api, &info);
     print_heap(api);
+    reset_fg(api);
 }

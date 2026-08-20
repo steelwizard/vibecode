@@ -22,6 +22,8 @@ void console_backspace(void);
 void console_cursor_back(void);
 void console_goto_xy(int x, int y);
 void console_set_cursor_visible(int visible);
+/* Toggle the block cursor on a ~1 Hz blink. Call from idle input polls. */
+void console_tick_cursor(void);
 void console_write_line_color(uint8_t fg, uint8_t bg, const char *s);
 void console_write_color(uint8_t fg, uint8_t bg, const char *s);
 void console_clear_color(uint8_t fg, uint8_t bg);
@@ -39,7 +41,7 @@ void console_init_framebuffer(const video_mode_t *mode);
 int  console_is_framebuffer(void);
 void console_get_size(int *cols, int *rows);
 
-/* Modal error: red screen, blue box, TUI OK button. Enter (or Space) dismisses.
+/* Modal error: red screen, blue box, bomb + [ OK ]. Enter/Space dismisses.
  * Restores the previous screen afterwards. While capturing (pipes/redirects)
  * this just writes the message as a line so scripts still see it. */
 void console_error(const char *msg);

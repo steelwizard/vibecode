@@ -10,6 +10,7 @@
 #include "string.h"
 #include "font8x16.h"
 #include "keyboard.h"
+#include "timer.h"
 
 #define VGA_MEM   ((volatile uint16_t *)0xB8000)
 #define VGA_TEXT_COLS  80
@@ -68,6 +69,7 @@ static uint8_t color = 0x0F;
 static char *capture_buf = 0;
 static size_t capture_cap = 0;
 static size_t capture_len = 0;
+static int capture_tui;
 
 /* Software block cursor: white glyph on light blue (VGA 9). The hardware
  * cursor is disabled — in framebuffer modes it does not exist, and in text
@@ -75,11 +77,14 @@ static size_t capture_len = 0;
 #define CURSOR_FG 15
 #define CURSOR_BG 9
 
+#define CURSOR_BLINK_MS 500
+
 static int cursor_enabled = 1;
 static int cursor_painted;
 static int cursor_px;
 static int cursor_py;
 static uint16_t cursor_under;
+static uint64_t cursor_blink_at;
 static uint16_t screen_cell[CONSOLE_MAX_ROWS][CONSOLE_MAX_COLS];
 
 static uint16_t scrollback[SCROLLBACK_MAX][CONSOLE_MAX_COLS];
@@ -212,7 +217,30 @@ static void show_soft_cursor(void) {
 
 static void sync_hw_cursor(void) {
     vga_hide_hw_cursor();
+    /* Movement / typing: show the block immediately and restart the blink. */
+    cursor_blink_at = timer_ticks_ms() + CURSOR_BLINK_MS;
     show_soft_cursor();
+}
+
+void console_tick_cursor(void) {
+    uint64_t now;
+
+    if (!cursor_enabled || capture_buf) {
+        return;
+    }
+    if (!direct_vga && !scroll_follow) {
+        return;
+    }
+    now = timer_ticks_ms();
+    if (now < cursor_blink_at) {
+        return;
+    }
+    cursor_blink_at = now + CURSOR_BLINK_MS;
+    if (cursor_painted) {
+        hide_soft_cursor();
+    } else {
+        show_soft_cursor();
+    }
 }
 
 static void stamp_cell(int x, int y, uint16_t cell) {
@@ -506,6 +534,12 @@ void console_set_theme(uint8_t fg, uint8_t bg) {
 void console_clear(void) {
     int i;
 
+    if (capture_buf) {
+        capture_tui = 1;
+        capture_buf = 0;
+        capture_cap = 0;
+    }
+
     direct_wrap_pending = 0;
 
     if (direct_vga) {
@@ -658,6 +692,11 @@ void console_cursor_back(void) {
 }
 
 void console_goto_xy(int x, int y) {
+    if (capture_buf) {
+        capture_tui = 1;
+        capture_buf = 0;
+        capture_cap = 0;
+    }
     if (x < 0) {
         x = 0;
     }
@@ -686,21 +725,31 @@ void console_set_cursor_visible(int visible) {
 }
 
 void console_begin_capture(char *buf, size_t cap) {
+    capture_tui = 0;
     capture_buf = buf;
     capture_cap = cap;
     capture_len = 0;
-    if (cap > 0) {
+    if (cap > 0 && buf) {
         buf[0] = 0;
     }
 }
 
 size_t console_end_capture(void) {
     size_t n = capture_len;
+
+    if (capture_tui) {
+        capture_tui = 0;
+        capture_buf = 0;
+        capture_cap = 0;
+        capture_len = 0;
+        return 0;
+    }
     if (capture_buf && capture_cap > 0) {
         if (capture_len >= capture_cap) {
             capture_len = capture_cap - 1;
         }
         capture_buf[capture_len] = 0;
+        n = capture_len;
     }
     capture_buf = 0;
     capture_cap = 0;
@@ -715,6 +764,7 @@ static void capture_putchar(char c) {
     if (!capture_buf || capture_cap == 0) {
         return;
     }
+    serial_putchar(c);
     if (capture_len + 1 < capture_cap) {
         capture_buf[capture_len++] = c;
         capture_buf[capture_len] = 0;
@@ -934,11 +984,12 @@ void console_write_size(uint64_t bytes) {
 #define ERR_BOX_FG   15
 #define ERR_BOX_BG    9  /* bright blue */
 #define ERR_EDGE_FG  11  /* cyan */
-#define ERR_HINT_FG  11
+#define ERR_BOMB_FG  14  /* yellow bomb in the title */
 #define ERR_BTN_FG    0  /* black on white — selected TUI button */
 #define ERR_BTN_BG    7
 #define ERR_SHAD_FG   8
 #define ERR_SHAD_BG   4
+#define ERR_CH_BOMB  0x0Fu
 
 #define ERR_CH_TL    0xC9u
 #define ERR_CH_TR    0xBBu
@@ -1057,7 +1108,6 @@ static void err_wait_ok(void) {
 void console_error(const char *msg) {
     char lines[ERR_MAX_LINES][ERR_LINE_MAX];
     const char *title = " ERROR ";
-    const char *hint = "Enter to return";
     const char *btn = "  OK  ";
     int nlines;
     int inner;
@@ -1071,7 +1121,6 @@ void console_error(const char *msg) {
     int btn_w;
     int btn_x;
     int btn_y;
-    int hint_x;
     int saved_color;
 
     if (console_is_capturing()) {
@@ -1099,10 +1148,7 @@ void console_error(const char *msg) {
     }
     nlines = err_wrap(msg, lines, maxw);
 
-    inner = (int)strlen(title);
-    if ((int)strlen(hint) > inner) {
-        inner = (int)strlen(hint);
-    }
+    inner = (int)strlen(title) + 2; /* bomb + gap in the title bar */
     if ((int)strlen(btn) + 4 > inner) {
         inner = (int)strlen(btn) + 4;
     }
@@ -1117,7 +1163,7 @@ void console_error(const char *msg) {
     }
 
     box_w = inner + 4;
-    box_h = 7 + nlines;
+    box_h = 6 + nlines;
     if (box_w > term_cols - 2) {
         box_w = term_cols - 2;
     }
@@ -1155,8 +1201,12 @@ void console_error(const char *msg) {
         err_cell(bx + box_w - 1, by + i, ERR_CH_V, ERR_EDGE_FG, ERR_BOX_BG);
     }
 
-    title_x = bx + (box_w - (int)strlen(title)) / 2;
-    err_puts(title_x, by, title, ERR_BOX_FG, ERR_BOX_BG);
+    title_x = bx + (box_w - ((int)strlen(title) + 1)) / 2;
+    if (title_x < bx + 1) {
+        title_x = bx + 1;
+    }
+    err_cell(title_x, by, ERR_CH_BOMB, ERR_BOMB_FG, ERR_BOX_BG);
+    err_puts(title_x + 1, by, title, ERR_BOX_FG, ERR_BOX_BG);
 
     for (i = 0; i < nlines; i++) {
         int lx = bx + 2;
@@ -1165,7 +1215,7 @@ void console_error(const char *msg) {
 
     btn_w = (int)strlen(btn);
     btn_x = bx + (box_w - (btn_w + 2)) / 2;
-    btn_y = by + box_h - 4;
+    btn_y = by + box_h - 3;
     err_cell(btn_x + 1, btn_y + 1, ' ', ERR_SHAD_FG, 0);
     for (i = 0; i < btn_w; i++) {
         err_cell(btn_x + 2 + i, btn_y + 1, ' ', ERR_SHAD_FG, 0);
@@ -1173,9 +1223,6 @@ void console_error(const char *msg) {
     err_cell(btn_x, btn_y, '[', ERR_EDGE_FG, ERR_BOX_BG);
     err_puts(btn_x + 1, btn_y, btn, ERR_BTN_FG, ERR_BTN_BG);
     err_cell(btn_x + 1 + btn_w, btn_y, ']', ERR_EDGE_FG, ERR_BOX_BG);
-
-    hint_x = bx + (box_w - (int)strlen(hint)) / 2;
-    err_puts(hint_x, by + box_h - 2, hint, ERR_HINT_FG, ERR_BOX_BG);
 
     err_wait_ok();
 

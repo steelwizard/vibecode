@@ -18,6 +18,7 @@
 #include "sb16.h"
 #include "heap.h"
 #include "env.h"
+#include "shell.h"
 
 #define api ((fos_api_t *)FOS_API_ADDR)
 
@@ -193,6 +194,13 @@ static int api_run_com(const char *path, const char *args) {
     return r;
 }
 
+static int api_run_bat(const char *path, const char *args) {
+    if (!path) {
+        return -1;
+    }
+    return shell_run_bat(path, args ? args : "");
+}
+
 void fos_api_init(void) {
     memset((void *)FOS_API_ADDR, 0, sizeof(fos_api_t));
     api->magic = FOS_API_MAGIC;
@@ -251,6 +259,9 @@ void fos_api_init(void) {
     api->drive_count = vfs_drive_count;
     api->getenv = env_get;
     api->setenv = env_set;
+    api->begin_capture = console_begin_capture;
+    api->end_capture = console_end_capture;
+    api->run_bat = api_run_bat;
     api->cmdline[0] = 0;
     api->pipe_in_len = 0;
 }

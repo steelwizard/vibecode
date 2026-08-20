@@ -2,7 +2,8 @@
  * fm.c — Directory browser (ncurses-style TUI).
  *
  *   Up/Dn/PgUp/PgDn/Home/End  move selection
- *   Enter                     open directory, or run a .COM
+ *   Enter                     open directory, or run a .COM / .BAT (line
+ *                             output is shown on a grey screen with an OK button)
  *   e                         edit file
  *   v                         view file
  *   n                         new empty file
@@ -35,6 +36,13 @@
 #define C_ALERT_BG 4
 #define C_ALERT_BR 14
 #define C_ALERT_FG 15
+#define C_OUT_BG   7  /* grey stdout screen */
+#define C_OUT_FG   0
+#define C_OUT_BR   1  /* blue border */
+#define C_OUT_TTL  1
+#define C_OUT_HINT 8
+#define C_OUT_BTN_FG 15
+#define C_OUT_BTN_BG 1
 
 #define CH_TL  0xC9u
 #define CH_TR  0xBBu
@@ -129,15 +137,18 @@ static int my_stricmp(const char *a, const char *b) {
     return (unsigned char)*a - (unsigned char)*b;
 }
 
-static int is_com_name(const char *name) {
+static int is_ext_name(const char *name, const char *ext) {
     size_t n = my_strlen(name);
-    if (n < 4) {
+    size_t e = my_strlen(ext);
+
+    if (n < e) {
         return 0;
     }
-    return up_ch(name[n - 4]) == '.' &&
-           up_ch(name[n - 3]) == 'C' &&
-           up_ch(name[n - 2]) == 'O' &&
-           up_ch(name[n - 1]) == 'M';
+    return my_stricmp(name + n - e, ext) == 0;
+}
+
+static int is_runnable_name(const char *name) {
+    return is_ext_name(name, ".COM") || is_ext_name(name, ".BAT");
 }
 
 static void join_path(char *out, size_t out_sz, const char *base, const char *name) {
@@ -953,7 +964,7 @@ static void drain_keys(fos_api_t *api) {
     }
 }
 
-/* After a nested .COM: drop leftover keys/audio, put VFS back, redraw. */
+/* After a nested .COM: drop leftover keys/audio, put VFS back. */
 static void resume_after_com(fos_api_t *api, int saved_drive, const char *saved_cwd) {
     drain_keys(api);
     if (api->sound_stop) {
@@ -968,39 +979,262 @@ static void resume_after_com(fos_api_t *api, int saved_drive, const char *saved_
     if (reload_entries(api) != 0) {
         entry_count = 0;
     }
-    draw(api);
 }
 
-static void run_selected_com(fos_api_t *api) {
+static int output_has_body(const char *s) {
+    while (s && *s) {
+        char c = *s++;
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int output_line_count(const char *s, int width) {
+    int lines = 0;
+    int col = 0;
+    int any = 0;
+
+    if (width < 1) {
+        width = 1;
+    }
+    while (*s) {
+        if (*s == '\r') {
+            s++;
+            continue;
+        }
+        any = 1;
+        if (*s == '\n') {
+            lines++;
+            col = 0;
+            s++;
+            continue;
+        }
+        col++;
+        s++;
+        if (col >= width) {
+            lines++;
+            col = 0;
+        }
+    }
+    if (col > 0 || !any) {
+        lines++;
+    }
+    return lines;
+}
+
+static const char *output_skip_lines(const char *s, int skip, int width) {
+    int line = 0;
+    int col = 0;
+
+    if (width < 1) {
+        width = 1;
+    }
+    while (*s && line < skip) {
+        if (*s == '\r') {
+            s++;
+            continue;
+        }
+        if (*s == '\n') {
+            s++;
+            line++;
+            col = 0;
+            continue;
+        }
+        col++;
+        s++;
+        if (col >= width) {
+            line++;
+            col = 0;
+        }
+    }
+    return s;
+}
+
+static void show_com_output(fos_api_t *api, const char *title, const char *text) {
+    int scroll = 0;
+    int box_x = 2;
+    int box_y = 1;
+    int box_w = cols - 4;
+    int box_h = rows - 2;
+    int text_w;
+    int text_h;
+    int lines;
+    const char *btn = "  OK  ";
+    int btn_n = 6;
+
+    if (box_w < 24) {
+        box_w = cols > 4 ? cols - 2 : cols;
+        box_x = (cols - box_w) / 2;
+    }
+    if (box_h < 8) {
+        box_h = rows > 2 ? rows - 2 : rows;
+        box_y = 0;
+    }
+    text_w = box_w - 4;
+    text_h = box_h - 6;
+    if (text_w < 8) {
+        text_w = 8;
+    }
+    if (text_h < 1) {
+        text_h = 1;
+    }
+    lines = output_line_count(text, text_w);
+
+    set_cursor(api, 0);
+    for (;;) {
+        const char *p;
+        int shown = 0;
+        int btn_x;
+        int btn_y;
+        int max_scroll;
+
+        max_scroll = lines - text_h;
+        if (max_scroll < 0) {
+            max_scroll = 0;
+        }
+        if (scroll > max_scroll) {
+            scroll = max_scroll;
+        }
+        if (scroll < 0) {
+            scroll = 0;
+        }
+
+        if (api->set_color) {
+            api->set_color(C_OUT_FG, C_OUT_BG);
+        }
+        api->clear_screen();
+        draw_box_fill(api, box_x + 1, box_y + 1, box_w, box_h, C_OUT_FG, C_SHADOW);
+        draw_box_fill(api, box_x, box_y, box_w, box_h, C_OUT_FG, C_OUT_BG);
+        draw_box(api, box_x, box_y, box_w, box_h, C_OUT_BR, C_OUT_BG);
+        box_title(api, box_x, box_y, " Output ", C_OUT_TTL, C_OUT_BG);
+        paint_text(api, box_x + 2, box_y + 1, C_OUT_TTL, C_OUT_BG, title, text_w);
+
+        p = output_skip_lines(text, scroll, text_w);
+        while (*p && shown < text_h) {
+            char line[MAX_COLS + 1];
+            int n = 0;
+
+            while (*p == '\r') {
+                p++;
+            }
+            while (*p && *p != '\n' && n < text_w) {
+                char c = *p++;
+                if (c == '\t') {
+                    c = ' ';
+                }
+                line[n++] = (c >= 32 && c <= 126) ? c : '.';
+            }
+            if (*p == '\n') {
+                p++;
+            }
+            line[n] = 0;
+            paint_span(api, box_x + 2, box_y + 2 + shown, text_w, C_OUT_FG, C_OUT_BG, ' ');
+            paint_text(api, box_x + 2, box_y + 2 + shown, C_OUT_FG, C_OUT_BG, line, text_w);
+            shown++;
+        }
+
+        btn_y = box_y + box_h - 3;
+        btn_x = box_x + (box_w - (btn_n + 2)) / 2;
+        paint_text(api, box_x + 2, box_y + box_h - 2, C_OUT_HINT, C_OUT_BG,
+                   "Enter OK   Up/Dn scroll", text_w);
+        paint_ch(api, btn_x, btn_y, C_OUT_BR, C_OUT_BG, '[');
+        paint_text(api, btn_x + 1, btn_y, C_OUT_BTN_FG, C_OUT_BTN_BG, btn, btn_n);
+        paint_ch(api, btn_x + 1 + btn_n, btn_y, C_OUT_BR, C_OUT_BG, ']');
+
+        wait_key(api);
+        {
+            fos_key_event_t ev = api->read_key();
+            if (ev.type == FOS_KEY_ENTER) {
+                return;
+            }
+            if (ev.type == FOS_KEY_CHAR &&
+                (ev.ch == ' ' || ev.ch == 'o' || ev.ch == 'O' ||
+                 ev.ch == 'q' || ev.ch == 'Q' || ev.ch == 27 || ev.ch == '\r')) {
+                return;
+            }
+            if (ev.type == FOS_KEY_HOME) {
+                scroll = 0;
+            } else if (ev.type == FOS_KEY_END) {
+                scroll = max_scroll;
+            } else if (ev.type == FOS_KEY_UP && scroll > 0) {
+                scroll--;
+            } else if (ev.type == FOS_KEY_DOWN && scroll < max_scroll) {
+                scroll++;
+            } else if (ev.type == FOS_KEY_PAGEUP) {
+                scroll -= text_h;
+                if (scroll < 0) {
+                    scroll = 0;
+                }
+            } else if (ev.type == FOS_KEY_PAGEDOWN) {
+                scroll += text_h;
+                if (scroll > max_scroll) {
+                    scroll = max_scroll;
+                }
+            }
+        }
+    }
+}
+
+static void run_selected_prog(fos_api_t *api) {
     char path[256];
     char saved_cwd[256];
-    const char *name = entries[selection].name;
+    char cap[8192];
+    char title[64];
     int saved_drive;
     int rc;
+    int bat;
+    size_t n = 0;
+    int (*run)(const char *path, const char *args);
 
-    if (my_stricmp(name, "FM.COM") == 0) {
+    my_strcpy(title, entries[selection].name);
+    bat = is_ext_name(title, ".BAT");
+    if (my_stricmp(title, "FM.COM") == 0) {
         show_result(api, "Already in FM");
         draw(api);
         return;
     }
-    if (my_stricmp(name, "SHELL.COM") == 0) {
+    if (my_stricmp(title, "SHELL.COM") == 0) {
         show_result(api, "Use q to return to the shell");
         draw(api);
         return;
     }
 
-    join_path(path, sizeof(path), cwd, name);
+    if (bat) {
+        run = api->run_bat;
+        if (!run) {
+            show_result(api, "Need a newer kernel to run .BAT");
+            draw(api);
+            return;
+        }
+    } else {
+        run = api->run_com;
+    }
+
+    join_path(path, sizeof(path), cwd, title);
     saved_drive = api->get_drive ? api->get_drive() : 0;
     my_strcpy(saved_cwd, cwd);
 
-    rc = api->run_com(path, "");
+    cap[0] = 0;
+    if (api->begin_capture && api->end_capture) {
+        api->begin_capture(cap, sizeof(cap));
+        rc = run(path, "");
+        n = api->end_capture();
+    } else {
+        rc = run(path, "");
+    }
     if (rc != 0) {
         resume_after_com(api, saved_drive, saved_cwd);
-        show_result(api, "Could not run program");
+        show_result(api, bat ? "Could not run script" : "Could not run program");
         draw(api);
         return;
     }
     resume_after_com(api, saved_drive, saved_cwd);
+    if (n > 0 && output_has_body(cap)) {
+        show_com_output(api, title, cap);
+    }
+    draw(api);
 }
 
 static void open_selected(fos_api_t *api) {
@@ -1020,8 +1254,8 @@ static void open_selected(fos_api_t *api) {
         if (api->set_cwd(next) != 0) {
             return;
         }
-    } else if (!pick_mode && is_com_name(e->name)) {
-        run_selected_com(api);
+    } else if (!pick_mode && is_runnable_name(e->name)) {
+        run_selected_prog(api);
         return;
     } else {
         return;
@@ -1048,6 +1282,7 @@ static void edit_selected(fos_api_t *api) {
     my_strcpy(saved_cwd, cwd);
     api->run_com("\\FOS\\EDIT.COM", args);
     resume_after_com(api, saved_drive, saved_cwd);
+    draw(api);
 }
 
 static void view_selected(fos_api_t *api) {

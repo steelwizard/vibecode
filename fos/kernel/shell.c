@@ -832,6 +832,13 @@ static int run_bat_file(const char *path, const char *args) {
     return 1;
 }
 
+int shell_run_bat(const char *path, const char *args) {
+    if (!path || !path[0]) {
+        return -1;
+    }
+    return run_bat_file(path, args ? args : "") ? 0 : -1;
+}
+
 static int try_run_bat(const char *line) {
     char name[64];
     char args[256];

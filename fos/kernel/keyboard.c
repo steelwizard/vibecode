@@ -14,6 +14,7 @@
  */
 
 #include "keyboard.h"
+#include "console.h"
 #include "string.h"
 
 #define PS2_DATA    0x60   /* data port (read scancodes, write device commands) */
@@ -367,6 +368,7 @@ const char *keyboard_get_layout(void) {
 }
 
 int keyboard_has_key(void) {
+    console_tick_cursor();
     return serial_has_byte() || ((inb(PS2_STATUS) & 0x01) != 0);
 }
 

@@ -156,7 +156,7 @@ typedef struct {
     int (*delete_file)(const char *path);
     int (*copy_file)(const char *src, const char *dst);
     int (*move_file)(const char *src, const char *dst);
-    /* Modal error dialog (blue box on red, TUI OK). Enter dismisses. */
+    /* Modal error dialog (blue box on red, bomb + OK). Enter dismisses. */
     void (*show_error)(const char *msg);
     void (*set_cursor_visible)(int visible);
     int (*set_drive)(int drive);
@@ -164,6 +164,12 @@ typedef struct {
     /* Environment. Names are case-sensitive ($PATH, $PWD, $HOME, $DRIVE). */
     const char *(*getenv)(const char *name);
     int (*setenv)(const char *name, const char *value);
+    /* Capture console writes into buf (pipes / FM stdout viewer). goto_xy
+     * and clear_screen abort capture so full-screen programs still paint. */
+    void (*begin_capture)(char *buf, size_t cap);
+    size_t (*end_capture)(void);
+    /* Run a .BAT by path (same language as the shell). 0 = ran, -1 = missing. */
+    int (*run_bat)(const char *path, const char *args);
 } fos_api_t;
 
 void fos_api_init(void);
