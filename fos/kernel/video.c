@@ -17,6 +17,7 @@
 #define DISPI_REG_BPP          0x0003
 #define DISPI_REG_ENABLE       0x0004
 #define DISPI_REG_VIRT_WIDTH   0x0006
+#define DISPI_REG_VRAM_64K     0x000A
 
 #define DISPI_ID5              0xB0C5
 #define DISPI_ENABLED          0x0001
@@ -39,8 +40,11 @@
 
 #define FB_MIN_W 640
 #define FB_MIN_H 480
-#define FB_MAX_W 1920
-#define FB_MAX_H 1080
+#define FB_MAX_W 2560
+#define FB_MAX_H 1440
+
+/* bochs-display defaults to 16 MiB of VRAM; a 32bpp mode must fit. */
+#define FB_VRAM_DEFAULT (16u * 1024u * 1024u)
 
 typedef struct {
     const char *name;
@@ -61,6 +65,8 @@ static const video_preset_t video_presets[] = {
     { "xga",   "1024x768", 1024, 768 },
     { "720p",  "1280x720", 1280, 720 },
     { "1080p", "1920x1080", 1920, 1080 },
+    { "1200p", "1920x1200", 1920, 1200 },
+    { "1440p", "2560x1440", 2560, 1440 },
 };
 
 static video_mode_t current_mode;
@@ -149,14 +155,21 @@ static pci_bochs_t pci_find_bochs(void) {
     return info;
 }
 
-static void map_page(uint64_t virt, uint64_t phys) {
+#define PTE_PRESENT_RW_2M 0x83ULL
+#define PTE_UNCACHED      0x18ULL /* PCD | PWT */
+
+static void map_page_flags(uint64_t virt, uint64_t phys, uint64_t flags) {
     volatile uint64_t *pd = (volatile uint64_t *)PD_ADDR;
     uint64_t idx = (virt >> 21) & 0x1FF;
 
     if (idx >= 512) {
         return;
     }
-    pd[idx] = (phys & ~0x1FFFFFULL) | 0x83;
+    pd[idx] = (phys & ~0x1FFFFFULL) | PTE_PRESENT_RW_2M | flags;
+}
+
+static void map_page(uint64_t virt, uint64_t phys) {
+    map_page_flags(virt, phys, 0);
 }
 
 static void flush_tlb(void) {
@@ -175,10 +188,11 @@ static void map_range(uint64_t virt, uint64_t phys, uint32_t bytes) {
     flush_tlb();
 }
 
+/* The legacy 0x1CE/0x1CF pair is index/data, but the PCI MMIO aperture exposes
+ * the same registers as a flat array of 16-bit words (reg N at BAR2+0x500+N*2). */
 static void dispi_write(uint16_t reg, uint16_t value) {
     if (dispi_regs) {
-        dispi_regs[0] = reg;
-        dispi_regs[1] = value;
+        dispi_regs[reg] = value;
         return;
     }
     outw(0x1CE, reg);
@@ -187,8 +201,7 @@ static void dispi_write(uint16_t reg, uint16_t value) {
 
 static uint16_t dispi_read(uint16_t reg) {
     if (dispi_regs) {
-        dispi_regs[0] = reg;
-        return dispi_regs[1];
+        return dispi_regs[reg];
     }
     outw(0x1CE, reg);
     return inw(0x1CF);
@@ -265,10 +278,16 @@ static int setup_bochs_hw(pci_bochs_t *pci) {
     }
 
     if (pci->found && pci->mmio_phys != 0) {
-        map_page(MMIO_VIRT_ADDR, pci->mmio_phys);
+        map_page_flags(MMIO_VIRT_ADDR, pci->mmio_phys, PTE_UNCACHED);
+        flush_tlb();
         dispi_regs = (volatile uint16_t *)(MMIO_VIRT_ADDR + PCI_VGA_BOCHS_OFFSET);
+        if (dispi_present()) {
+            return 1;
+        }
+        dispi_regs = 0;
     }
 
+    /* Older/ISA setups only answer on the legacy index/data ports. */
     return dispi_present();
 }
 
@@ -280,12 +299,30 @@ static int set_mode_framebuffer(uint16_t width, uint16_t height) {
         return -1;
     }
 
+    uint32_t vram = (uint32_t)dispi_read(DISPI_REG_VRAM_64K) * 64U * 1024U;
+
+    if (vram == 0) {
+        vram = FB_VRAM_DEFAULT;
+    }
+    if ((uint32_t)width * height * 4U > vram) {
+        boot_line("[boot] mode needs more VRAM than the display has "
+                  "(try bochs-display,vgamem=64M) — staying on VGA text");
+        return -1;
+    }
+
     dispi_write(DISPI_REG_ENABLE, 0);
     dispi_write(DISPI_REG_XRES, width);
     dispi_write(DISPI_REG_YRES, height);
     dispi_write(DISPI_REG_BPP, 32);
     dispi_write(DISPI_REG_VIRT_WIDTH, width);
     dispi_write(DISPI_REG_ENABLE, DISPI_ENABLED | DISPI_LFB_ENABLED);
+
+    /* DISPI silently clamps modes it cannot do; trust the readback, not the request. */
+    if (dispi_read(DISPI_REG_XRES) != width || dispi_read(DISPI_REG_YRES) != height) {
+        dispi_write(DISPI_REG_ENABLE, 0);
+        boot_line("[boot] display rejected the requested mode — staying on VGA text");
+        return -1;
+    }
 
     map_range(FB_VIRT_ADDR, fb_phys_addr, (uint32_t)width * height * 4U);
 

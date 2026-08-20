@@ -16,6 +16,7 @@
 #include "memory.h"
 #include "irq.h"
 #include "sb16.h"
+#include "heap.h"
 
 #define api ((fos_api_t *)FOS_API_ADDR)
 
@@ -141,6 +142,15 @@ static int api_get_mem_info(fos_mem_info_t *out) {
     return memory_get_info(out);
 }
 
+static int api_get_heap_info(fos_heap_info_t *out) {
+    if (!out) {
+        return -1;
+    }
+    memory_pages_stats(&out->pool_total, &out->pool_used);
+    heap_stats(&out->heap_reserved, &out->heap_used, &out->heap_blocks);
+    return 0;
+}
+
 static int api_run_com(const char *path, const char *args) {
     if (!path) {
         return -1;
@@ -184,6 +194,11 @@ void fos_api_init(void) {
     api->irq_pending = irq_get_pending;
     api->irq_clear = irq_clear_pending;
     api->irq_in_handler = irq_in_handler;
+    api->get_term_size = console_get_size;
+    api->mem_alloc = heap_alloc;
+    api->mem_free = heap_free;
+    api->mem_realloc = heap_realloc;
+    api->get_heap_info = api_get_heap_info;
     api->sound_present = sb16_present;
     api->sound_beep = sb16_beep;
     api->sound_play = sb16_play;

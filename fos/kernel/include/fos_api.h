@@ -80,6 +80,14 @@ typedef struct {
 } fos_mem_info_t;
 
 typedef struct {
+    uint64_t pool_total;    /* page pool size */
+    uint64_t pool_used;     /* pages handed to the heap */
+    uint64_t heap_reserved; /* bytes the heap holds */
+    uint64_t heap_used;     /* bytes handed out to callers */
+    uint64_t heap_blocks;   /* live allocations */
+} fos_heap_info_t;
+
+typedef struct {
     uint16_t year;    /* 1970–2099 */
     uint8_t  month;   /* 1–12 */
     uint8_t  day;     /* 1–31 */
@@ -137,6 +145,14 @@ typedef struct {
     void (*end_direct)(void);
     int (*sound_start)(const uint8_t *pcm, uint32_t bytes, uint32_t rate_hz);
     int (*sound_can_queue)(void);
+    /* Console text grid: 80x25 on VGA text, larger in framebuffer modes. */
+    void (*get_term_size)(int *cols, int *rows);
+    /* Heap. Anything still allocated when the program exits is reclaimed by
+     * the loader, so freeing is good manners rather than a requirement. */
+    void *(*mem_alloc)(size_t bytes);
+    void (*mem_free)(void *ptr);
+    void *(*mem_realloc)(void *ptr, size_t bytes);
+    int (*get_heap_info)(fos_heap_info_t *out);
 } fos_api_t;
 
 void fos_api_init(void);

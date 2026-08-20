@@ -13,13 +13,16 @@
 
 #include "fos_api.h"
 
-#define COLS       80
-#define LIST_ROWS  20
+#define MAX_COLS   320
 #define ROW_PATH   0
 #define ROW_LIST   2
-#define ROW_HELP   23
 
 #define ENTRY_MAX  128
+
+/* Console geometry, filled from the kernel at startup. */
+static int cols = 80;
+static int list_rows = 20;
+static int row_help = 23;
 
 typedef struct {
     char name[64];
@@ -160,17 +163,49 @@ static int reload_entries(fos_api_t *api) {
     return 0;
 }
 
+static void init_geometry(fos_api_t *api) {
+    int c = 80;
+    int r = 25;
+
+    if (api->get_term_size) {
+        api->get_term_size(&c, &r);
+    }
+    if (c < 20) {
+        c = 20;
+    }
+    if (c > MAX_COLS) {
+        c = MAX_COLS;
+    }
+    if (r < 6) {
+        r = 6;
+    }
+    cols = c;
+    row_help = r - 2;
+    list_rows = row_help - ROW_LIST - 1;
+    if (list_rows < 1) {
+        list_rows = 1;
+    }
+}
+
+static void clear_row(fos_api_t *api, int y) {
+    api->goto_xy(0, y);
+    for (int i = 0; i < cols; i++) {
+        api->putchar(' ');
+    }
+    api->goto_xy(0, y);
+}
+
 static void ensure_visible(void) {
     if (selection < list_scroll) {
         list_scroll = selection;
     }
-    if (selection >= list_scroll + LIST_ROWS) {
-        list_scroll = selection - LIST_ROWS + 1;
+    if (selection >= list_scroll + list_rows) {
+        list_scroll = selection - list_rows + 1;
     }
 }
 
 static void draw(fos_api_t *api) {
-    char line[COLS + 1];
+    char line[MAX_COLS + 1];
 
     ensure_visible();
     api->clear_screen();
@@ -179,23 +214,23 @@ static void draw(fos_api_t *api) {
     line[0] = 0;
     {
         const char *prefix = "Path: ";
-        size_t n = 0;
-        for (const char *p = prefix; *p && n + 1 < COLS; p++) {
+        int n = 0;
+        for (const char *p = prefix; *p && n + 1 < cols; p++) {
             line[n++] = *p;
         }
-        for (const char *p = cwd; *p && n + 1 < COLS; p++) {
+        for (const char *p = cwd; *p && n + 1 < cols; p++) {
             line[n++] = *p;
         }
         line[n] = 0;
     }
     api->write(line);
 
-    for (int row = 0; row < LIST_ROWS; row++) {
+    for (int row = 0; row < list_rows; row++) {
         int idx = list_scroll + row;
-        size_t n;
+        int n;
         api->goto_xy(0, ROW_LIST + row);
         if (idx >= entry_count) {
-            api->write("                                                                                ");
+            clear_row(api, ROW_LIST + row);
             continue;
         }
         n = 0;
@@ -209,7 +244,7 @@ static void draw(fos_api_t *api) {
         if (entries[idx].is_dir) {
             line[n++] = '[';
         }
-        for (const char *p = entries[idx].name; *p && n + 2 < COLS; p++) {
+        for (const char *p = entries[idx].name; *p && n + 2 < cols; p++) {
             line[n++] = *p;
         }
         if (entries[idx].is_dir) {
@@ -219,7 +254,7 @@ static void draw(fos_api_t *api) {
         api->write(line);
     }
 
-    api->goto_xy(0, ROW_HELP);
+    api->goto_xy(0, row_help);
     api->write("Enter  e edit  v view  n file  m mkdir  q quit");
 }
 
@@ -227,7 +262,7 @@ static void view_file(fos_api_t *api, const char *path, const char *title) {
     static char buf[8192];
     size_t len = 0;
     int scroll = 0;
-    const int view_rows = 22;
+    const int view_rows = row_help - 2 > 1 ? row_help - 2 : 1;
 
     if (api->read_file(path, buf, sizeof(buf) - 1, &len) != 0) {
         return;
@@ -250,7 +285,7 @@ static void view_file(fos_api_t *api, const char *path, const char *title) {
 
         int shown = 0;
         int line_no = 0;
-        char line[COLS + 1];
+        char line[MAX_COLS + 1];
         size_t i = 0;
         while (i < len && shown < view_rows) {
             if (line_no < scroll) {
@@ -263,8 +298,8 @@ static void view_file(fos_api_t *api, const char *path, const char *title) {
                 line_no++;
                 continue;
             }
-            size_t n = 0;
-            while (i < len && buf[i] != '\n' && n < COLS) {
+            int n = 0;
+            while (i < len && buf[i] != '\n' && n < cols) {
                 char c = buf[i++];
                 line[n++] = (c >= 32 && c <= 126) ? c : '.';
             }
@@ -314,9 +349,7 @@ static int prompt_name(fos_api_t *api, const char *title, char *out, size_t out_
     size_t len = 0;
 
     for (;;) {
-        api->goto_xy(0, ROW_HELP);
-        api->write("                                                                                ");
-        api->goto_xy(0, ROW_HELP);
+        clear_row(api, row_help);
         api->write(title);
         api->write(": ");
         api->write(buf);
@@ -444,6 +477,8 @@ void com_main(void) {
     fos_api_t *api = (fos_api_t *)FOS_API_ADDR;
     const char *start = api->cmdline;
 
+    init_geometry(api);
+
     while (*start == ' ' || *start == '\t') {
         start++;
     }
@@ -525,7 +560,7 @@ void com_main(void) {
         }
 
         if (ev.type == FOS_KEY_PAGEUP) {
-            selection -= LIST_ROWS;
+            selection -= list_rows;
             if (selection < 0) {
                 selection = 0;
             }
@@ -534,7 +569,7 @@ void com_main(void) {
         }
 
         if (ev.type == FOS_KEY_PAGEDOWN) {
-            selection += LIST_ROWS;
+            selection += list_rows;
             if (selection >= entry_count) {
                 selection = entry_count > 0 ? entry_count - 1 : 0;
             }

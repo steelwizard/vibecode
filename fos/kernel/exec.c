@@ -12,6 +12,7 @@
 #include "console.h"
 #include "string.h"
 #include "irq.h"
+#include "heap.h"
 
 #define EXEC_BUF_MAX 131072
 
@@ -69,9 +70,17 @@ static int load_and_run(const foscom_hdr_t *hdr, const void *payload) {
         stack = hdr->stack_top;
     }
 
+    /* Tag the program's allocations so they can be reclaimed even if it
+     * exits without freeing (or crashes out of a nested run_com). */
+    uint16_t owner = (uint16_t)(com_level + 1);
+    uint16_t prev_owner = heap_set_owner(owner);
+
     com_level++;
     com_call((void (*)(void))(uintptr_t)hdr->entry, stack);
     com_level--;
+
+    heap_set_owner(prev_owner);
+    heap_free_owner(owner);
     irq_clear_handlers();
     return 0;
 }

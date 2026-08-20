@@ -14,8 +14,6 @@
 #define IN_MAX     4096
 #define PCM8_MAX   4096
 
-#define COLS       80
-
 #define BG_DESK    5  /* purple */
 #define FG_DESK    13
 #define BG_SHADOW  0
@@ -41,9 +39,28 @@
 
 #define WIN_W      64
 #define WIN_H      13
-#define WIN_X      ((COLS - WIN_W) / 2)
-#define WIN_Y      5
 #define BAR_W      (WIN_W - 8)
+
+/* Window origin, centred on the real console at startup. */
+static int win_x = (80 - WIN_W) / 2;
+static int win_y = 5;
+
+static void init_geometry(fos_api_t *api) {
+    int c = 80;
+    int r = 25;
+
+    if (api->get_term_size) {
+        api->get_term_size(&c, &r);
+    }
+    win_x = (c - WIN_W) / 2;
+    win_y = (r - WIN_H) / 2;
+    if (win_x < 0) {
+        win_x = 0;
+    }
+    if (win_y < 0) {
+        win_y = 0;
+    }
+}
 
 static uint8_t inbuf[IN_MAX];
 static uint8_t pcm8[PCM8_MAX];
@@ -173,7 +190,7 @@ static void format_time(uint32_t ms, char *out) {
 }
 
 static void inner_fill(fos_api_t *api, int row, uint8_t fg, uint8_t bg) {
-    fill_rect(api, WIN_X + 1, WIN_Y + row, WIN_W - 2, 1, fg, bg, ' ');
+    fill_rect(api, win_x + 1, win_y + row, WIN_W - 2, 1, fg, bg, ' ');
 }
 
 static void draw_frame(fos_api_t *api) {
@@ -185,33 +202,33 @@ static void draw_frame(fos_api_t *api) {
     api->set_color(FG_DESK, BG_DESK);
     api->clear_screen();
 
-    fill_rect(api, WIN_X + 2, WIN_Y + 1, WIN_W, WIN_H, 7, BG_SHADOW, ' ');
-    fill_rect(api, WIN_X, WIN_Y, WIN_W, WIN_H, FG_WIN, BG_WIN, ' ');
+    fill_rect(api, win_x + 2, win_y + 1, WIN_W, WIN_H, 7, BG_SHADOW, ' ');
+    fill_rect(api, win_x, win_y, WIN_W, WIN_H, FG_WIN, BG_WIN, ' ');
 
     for (i = 1; i < WIN_W - 1; i++) {
-        put_xy(api, WIN_X + i, WIN_Y, FG_WIN, BG_WIN, CH_H);
-        put_xy(api, WIN_X + i, WIN_Y + WIN_H - 1, FG_WIN, BG_WIN, CH_H);
+        put_xy(api, win_x + i, win_y, FG_WIN, BG_WIN, CH_H);
+        put_xy(api, win_x + i, win_y + WIN_H - 1, FG_WIN, BG_WIN, CH_H);
     }
     for (i = 1; i < WIN_H - 1; i++) {
-        put_xy(api, WIN_X, WIN_Y + i, FG_WIN, BG_WIN, CH_V);
-        put_xy(api, WIN_X + WIN_W - 1, WIN_Y + i, FG_WIN, BG_WIN, CH_V);
+        put_xy(api, win_x, win_y + i, FG_WIN, BG_WIN, CH_V);
+        put_xy(api, win_x + WIN_W - 1, win_y + i, FG_WIN, BG_WIN, CH_V);
     }
-    put_xy(api, WIN_X, WIN_Y, FG_WIN, BG_WIN, CH_TL);
-    put_xy(api, WIN_X + WIN_W - 1, WIN_Y, FG_WIN, BG_WIN, CH_TR);
-    put_xy(api, WIN_X, WIN_Y + WIN_H - 1, FG_WIN, BG_WIN, CH_BL);
-    put_xy(api, WIN_X + WIN_W - 1, WIN_Y + WIN_H - 1, FG_WIN, BG_WIN, CH_BR);
+    put_xy(api, win_x, win_y, FG_WIN, BG_WIN, CH_TL);
+    put_xy(api, win_x + WIN_W - 1, win_y, FG_WIN, BG_WIN, CH_TR);
+    put_xy(api, win_x, win_y + WIN_H - 1, FG_WIN, BG_WIN, CH_BL);
+    put_xy(api, win_x + WIN_W - 1, win_y + WIN_H - 1, FG_WIN, BG_WIN, CH_BR);
 
-    title_x = WIN_X + (WIN_W - title_len) / 2;
+    title_x = win_x + (WIN_W - title_len) / 2;
     inner_fill(api, 1, FG_TITLE, BG_TITLE);
-    put_xy(api, WIN_X + 2, WIN_Y + 1, FG_TITLE, BG_TITLE, CH_NOTE);
-    put_str(api, title_x, WIN_Y + 1, FG_TITLE, BG_TITLE, title, title_len);
+    put_xy(api, win_x + 2, win_y + 1, FG_TITLE, BG_TITLE, CH_NOTE);
+    put_str(api, title_x, win_y + 1, FG_TITLE, BG_TITLE, title, title_len);
 
     inner_fill(api, WIN_H - 2, FG_MUTED, BG_WIN);
-    put_str(api, WIN_X + 2, WIN_Y + WIN_H - 2, FG_MUTED, BG_WIN, "q  quit", 0);
+    put_str(api, win_x + 2, win_y + WIN_H - 2, FG_MUTED, BG_WIN, "q  quit", 0);
 
     /* Park the cursor on the help line. */
-    x = WIN_X + 2;
-    y = WIN_Y + WIN_H - 2;
+    x = win_x + 2;
+    y = win_y + WIN_H - 2;
     api->set_color(FG_MUTED, BG_WIN);
     api->goto_xy(x, y);
 }
@@ -219,12 +236,12 @@ static void draw_frame(fos_api_t *api) {
 static void draw_filename(fos_api_t *api) {
     const char *name = base_name(ui.path);
     inner_fill(api, 3, FG_WIN, BG_WIN);
-    put_str(api, WIN_X + 2, WIN_Y + 3, FG_WIN, BG_WIN, name, WIN_W - 4);
+    put_str(api, win_x + 2, win_y + 3, FG_WIN, BG_WIN, name, WIN_W - 4);
 }
 
 static void draw_meta(fos_api_t *api) {
-    int x = WIN_X + 2;
-    int y = WIN_Y + 4;
+    int x = win_x + 2;
+    int y = win_y + 4;
 
     inner_fill(api, 4, FG_WIN, BG_WIN);
     if (!ui.kind) {
@@ -284,35 +301,35 @@ static void draw_time_bar(fos_api_t *api, int force) {
         ttot[5] = 0;
     }
 
-    y = WIN_Y + 6;
+    y = win_y + 6;
     inner_fill(api, 6, FG_WIN, BG_WIN);
-    put_str(api, WIN_X + 2, y, FG_WIN, BG_WIN, tpos, 5);
-    put_str(api, WIN_X + 7, y, FG_MUTED, BG_WIN, "/", 1);
-    put_str(api, WIN_X + 9, y, FG_WIN, BG_WIN, ttot, 5);
+    put_str(api, win_x + 2, y, FG_WIN, BG_WIN, tpos, 5);
+    put_str(api, win_x + 7, y, FG_MUTED, BG_WIN, "/", 1);
+    put_str(api, win_x + 9, y, FG_WIN, BG_WIN, ttot, 5);
 
-    y = WIN_Y + 7;
+    y = win_y + 7;
     inner_fill(api, 7, FG_WIN, BG_WIN);
-    put_xy(api, WIN_X + 2, y, FG_WIN, BG_WIN, '[');
+    put_xy(api, win_x + 2, y, FG_WIN, BG_WIN, '[');
     for (i = 0; i < BAR_W; i++) {
         if (i < filled) {
-            put_xy(api, WIN_X + 3 + (int)i, y, FG_TITLE, BG_TITLE, CH_FILL);
+            put_xy(api, win_x + 3 + (int)i, y, FG_TITLE, BG_TITLE, CH_FILL);
         } else {
-            put_xy(api, WIN_X + 3 + (int)i, y, FG_EMPTY, BG_WIN, CH_EMPTY);
+            put_xy(api, win_x + 3 + (int)i, y, FG_EMPTY, BG_WIN, CH_EMPTY);
         }
     }
-    put_xy(api, WIN_X + 3 + BAR_W, y, FG_WIN, BG_WIN, ']');
+    put_xy(api, win_x + 3 + BAR_W, y, FG_WIN, BG_WIN, ']');
 
-    y = WIN_Y + 9;
+    y = win_y + 9;
     inner_fill(api, 9, ui.status_fg, BG_WIN);
     if (ui.status) {
-        put_str(api, WIN_X + 2, y, ui.status_fg, BG_WIN, ui.status, WIN_W - 4);
+        put_str(api, win_x + 2, y, ui.status_fg, BG_WIN, ui.status, WIN_W - 4);
     }
 
     ui.last_filled = (int)filled;
     ui.last_sec = sec;
-    x = WIN_X + 2;
+    x = win_x + 2;
     api->set_color(FG_MUTED, BG_WIN);
-    api->goto_xy(x, WIN_Y + WIN_H - 2);
+    api->goto_xy(x, win_y + WIN_H - 2);
 }
 
 static void ui_paint(fos_api_t *api) {
@@ -943,6 +960,7 @@ void com_main(void) {
         return;
     }
 
+    init_geometry(api);
     path = skip_ws(api->cmdline);
     if (api->begin_direct) {
         api->begin_direct();

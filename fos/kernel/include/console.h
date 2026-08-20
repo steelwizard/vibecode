@@ -36,3 +36,4 @@ int  console_at_bottom(void);
 
 void console_init_framebuffer(const video_mode_t *mode);
 int  console_is_framebuffer(void);
+void console_get_size(int *cols, int *rows);

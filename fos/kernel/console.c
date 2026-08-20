@@ -14,8 +14,9 @@
 #define VGA_TEXT_COLS  80
 #define VGA_TEXT_ROWS  25
 
-#define CONSOLE_MAX_COLS 240
-#define CONSOLE_MAX_ROWS 68
+/* Upper bound on the text grid: 2560x1440 with the 8x16 font. */
+#define CONSOLE_MAX_COLS 320
+#define CONSOLE_MAX_ROWS 90
 #define SCROLLBACK_MAX 400
 
 #define COM1 0x3F8
@@ -24,6 +25,15 @@
 
 static int term_cols = VGA_TEXT_COLS;
 static int term_rows = VGA_TEXT_ROWS;
+
+/*
+ * Full-screen programs paint a bar across the bottom row, and the last cell of
+ * it used to wrap the cursor and scroll the screen out from under them. Real
+ * terminals defer that wrap: the cursor parks in the last column and only moves
+ * on when another character actually arrives. Any explicit cursor move or
+ * newline cancels it, which is what a redraw does anyway.
+ */
+static int direct_wrap_pending;
 static int fb_active = 0;
 static volatile uint32_t *framebuffer = 0;
 static uint32_t fb_pitch = 0;
@@ -265,6 +275,7 @@ static void scroll_write_cell(int abs_line, int x, uint16_t cell) {
 
 static void scroll_newline(void) {
     cursor_x = 0;
+    direct_wrap_pending = 0;
     int next_abs = scroll_view_top + cursor_y + 1;
     scroll_ensure_line(next_abs);
 
@@ -316,6 +327,22 @@ static void putchar_at(char c, int x, int y) {
     VGA_MEM[y * term_cols + x] = cell;
 }
 
+static void direct_emit(char c) {
+    if (direct_wrap_pending) {
+        direct_wrap_pending = 0;
+        cursor_x = 0;
+        cursor_y++;
+        direct_scroll();
+    }
+    putchar_at(c, cursor_x, cursor_y);
+    if (cursor_x + 1 >= term_cols) {
+        direct_wrap_pending = 1;
+    } else {
+        cursor_x++;
+    }
+    sync_hw_cursor();
+}
+
 void console_init(void) {
     int i;
 
@@ -331,6 +358,7 @@ void console_init(void) {
     scroll_view_top = 0;
     scroll_follow = 1;
     direct_vga = 0;
+    direct_wrap_pending = 0;
     for (i = 0; i < term_cols; i++) {
         scrollback[0][i] = blank_cell();
     }
@@ -360,6 +388,7 @@ void console_init_framebuffer(const video_mode_t *mode) {
     scroll_view_top = 0;
     scroll_follow = 1;
     direct_vga = 0;
+    direct_wrap_pending = 0;
     cursor_x = 0;
     cursor_y = 0;
 
@@ -372,6 +401,15 @@ void console_init_framebuffer(const video_mode_t *mode) {
 
 int console_is_framebuffer(void) {
     return fb_active;
+}
+
+void console_get_size(int *cols, int *rows) {
+    if (cols) {
+        *cols = term_cols;
+    }
+    if (rows) {
+        *rows = term_rows;
+    }
 }
 
 void console_clear_color(uint8_t fg, uint8_t bg) {
@@ -390,6 +428,8 @@ void console_set_theme(uint8_t fg, uint8_t bg) {
 
 void console_clear(void) {
     int i;
+
+    direct_wrap_pending = 0;
 
     if (direct_vga) {
         if (fb_active) {
@@ -428,6 +468,7 @@ void console_begin_direct(void) {
     }
     direct_nest++;
     direct_vga = 1;
+    direct_wrap_pending = 0;
 }
 
 void console_end_direct(void) {
@@ -435,6 +476,7 @@ void console_end_direct(void) {
         return;
     }
     direct_nest--;
+    direct_wrap_pending = 0;
     if (direct_nest == 0) {
         direct_vga = 0;
         scroll_lines = saved_session.scroll_lines;
@@ -496,6 +538,7 @@ void console_page_down(void) {
 }
 
 void console_backspace(void) {
+    direct_wrap_pending = 0;
     if (cursor_x > 0) {
         cursor_x--;
         if (direct_vga) {
@@ -511,6 +554,7 @@ void console_backspace(void) {
 }
 
 void console_cursor_back(void) {
+    direct_wrap_pending = 0;
     if (cursor_x > 0) {
         cursor_x--;
         sync_hw_cursor();
@@ -538,6 +582,7 @@ void console_goto_xy(int x, int y) {
     }
     cursor_x = x;
     cursor_y = y;
+    direct_wrap_pending = 0;
     sync_hw_cursor();
 }
 
@@ -616,6 +661,7 @@ void console_putchar(char c) {
 
     if (c == '\r') {
         cursor_x = 0;
+        direct_wrap_pending = 0;
         sync_hw_cursor();
         return;
     }
@@ -623,14 +669,7 @@ void console_putchar(char c) {
     cell = (uint16_t)(c | ((uint16_t)color << 8));
 
     if (direct_vga) {
-        putchar_at(c, cursor_x, cursor_y);
-        cursor_x++;
-        if (cursor_x >= term_cols) {
-            cursor_x = 0;
-            cursor_y++;
-            direct_scroll();
-        }
-        sync_hw_cursor();
+        direct_emit(c);
         return;
     }
 
@@ -681,6 +720,7 @@ static void emit_char_colored(char c, uint8_t fg, uint8_t bg) {
     if (c == '\r') {
         color = prev;
         cursor_x = 0;
+        direct_wrap_pending = 0;
         sync_hw_cursor();
         return;
     }
@@ -688,15 +728,8 @@ static void emit_char_colored(char c, uint8_t fg, uint8_t bg) {
     cell = (uint16_t)(c | ((uint16_t)(((bg & 0x0F) << 4) | (fg & 0x0F)) << 8));
 
     if (direct_vga) {
-        putchar_at((char)(cell & 0xFF), cursor_x, cursor_y);
-        cursor_x++;
-        if (cursor_x >= term_cols) {
-            cursor_x = 0;
-            cursor_y++;
-            direct_scroll();
-        }
+        direct_emit((char)(cell & 0xFF));
         color = prev;
-        sync_hw_cursor();
         return;
     }
 

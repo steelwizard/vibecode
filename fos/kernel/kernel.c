@@ -23,6 +23,7 @@
 #include "timer.h"
 #include "rtc.h"
 #include "memory.h"
+#include "heap.h"
 #include "sb16.h"
 
 void kmain(void) {
@@ -36,6 +37,8 @@ void kmain(void) {
 
     timer_init();
     memory_init();
+    memory_pages_init();
+    heap_init();
     {
         extern char _end[];
         memory_set_kernel_size((uint64_t)(uintptr_t)_end - 0x100000ULL);

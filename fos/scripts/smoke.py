@@ -14,19 +14,23 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qemu_console import Machine, cpu_exceptions, image_copy  # noqa: E402
 
-# (command, timeout, interrupt_after, expected substring of the output)
+# (command, timeout, seconds before sending key, key to send, expected output)
 CASES = [
-    ("ver", 10, None, "FOS"),
-    ("dir", 10, None, "SYSTEM.INI"),
-    ("dir FOS", 10, None, "PLAY.COM"),
-    ("mem", 15, None, "stack top"),
-    ("date", 10, None, None),
-    ("echo hello", 10, None, "hello"),
-    ("beep 440 100", 15, None, None),
-    ("play DEMO.WAV", 25, None, "DEMO.WAV"),
-    ("play DEMO.MP3", 25, None, "DEMO.MP3"),
-    ("play BABY.MP3", 25, 4.0, "BABY.MP3"),
-    ("dir FOS", 10, None, "PLAY.COM"),  # shell still alive after the audio runs
+    ("ver", 10, None, None, "FOS"),
+    ("dir", 10, None, None, "SYSTEM.INI"),
+    ("dir FOS", 10, None, None, "PLAY.COM"),
+    ("mem", 15, None, None, "stack top"),
+    ("mem test", 30, None, None, "RESULT: PASS"),
+    ("mem leak", 15, None, None, None),
+    ("mem", 15, None, None, "0 B across 0 block(s)"),  # leak reclaimed on exit
+    ("date", 10, None, None, None),
+    ("echo hello", 10, None, None, "hello"),
+    ("beep 440 100", 15, None, None, None),
+    ("edit README.TXT", 20, 3.0, "\x18", None),  # Ctrl+X exits
+    ("play DEMO.WAV", 25, None, None, "DEMO.WAV"),
+    ("play DEMO.MP3", 25, None, None, "DEMO.MP3"),
+    ("play BABY.MP3", 25, 4.0, "q", "BABY.MP3"),
+    ("dir FOS", 10, None, None, "PLAY.COM"),  # shell alive after the audio runs
 ]
 
 
@@ -42,9 +46,9 @@ def main():
             print("FAIL: never reached the shell prompt")
             return 1
         print("boot: reached prompt")
-        for cmd, timeout, interrupt, expect in CASES:
+        for cmd, timeout, interrupt, key, expect in CASES:
             mark = len(m.buf)
-            dt = m.run(cmd, timeout, interrupt_after=interrupt)
+            dt = m.run(cmd, timeout, interrupt_after=interrupt, key=key or "q")
             out = m.buf[mark:].decode("latin1", "replace")
             if dt is None:
                 print(f"FAIL {cmd:16s} no prompt within {timeout}s")

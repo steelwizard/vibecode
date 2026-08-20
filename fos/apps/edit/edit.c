@@ -10,9 +10,14 @@
 #include "fos_api.h"
 
 #define TEXT_MAX   32768
-#define COLS       80
-#define EDIT_ROWS  23
-#define STATUS_ROW 23
+#define MAX_COLS   320
+#define FG_STATUS  15 /* white on blue */
+#define BG_STATUS  1
+
+/* Console geometry, filled from the kernel at startup. */
+static int cols = 80;
+static int edit_rows = 23;
+static int status_row = 23;
 
 static char text[TEXT_MAX];
 static int text_len;
@@ -117,18 +122,56 @@ static void row_col_to_cursor(int row, int col) {
     cursor = i;
 }
 
+static void init_geometry(fos_api_t *api) {
+    int c = 80;
+    int r = 25;
+
+    if (api->get_term_size) {
+        api->get_term_size(&c, &r);
+    }
+    if (c < 20) {
+        c = 20;
+    }
+    if (c > MAX_COLS) {
+        c = MAX_COLS;
+    }
+    if (r < 4) {
+        r = 4;
+    }
+    cols = c;
+    status_row = r - 1;
+    edit_rows = status_row;
+}
+
+/* Padded to the full width so the bar colour spans the whole row. */
+static void status_bar(fos_api_t *api, const char *s) {
+    char line[MAX_COLS + 1];
+    int n = 0;
+
+    while (s[n] && n < cols) {
+        line[n] = s[n];
+        n++;
+    }
+    while (n < cols) {
+        line[n++] = ' ';
+    }
+    line[n] = 0;
+    api->goto_xy(0, status_row);
+    api->write_color(FG_STATUS, BG_STATUS, line);
+}
+
 static void ensure_visible(int row) {
     if (row < scroll_line) {
         scroll_line = row;
     }
-    if (row >= scroll_line + EDIT_ROWS) {
-        scroll_line = row - EDIT_ROWS + 1;
+    if (row >= scroll_line + edit_rows) {
+        scroll_line = row - edit_rows + 1;
     }
 }
 
 static void draw(fos_api_t *api) {
-    char line[COLS + 1];
-    char status[COLS + 1];
+    char line[MAX_COLS + 1];
+    char status[MAX_COLS + 1];
     int row;
     int col;
 
@@ -137,12 +180,12 @@ static void draw(fos_api_t *api) {
 
     api->clear_screen();
 
-    for (int vr = 0; vr < EDIT_ROWS; vr++) {
+    for (int vr = 0; vr < edit_rows; vr++) {
         int sr = scroll_line + vr;
         int start = line_index(sr);
         int i = 0;
 
-        while (i < COLS && start + i < text_len && text[start + i] != '\n') {
+        while (i < cols && start + i < text_len && text[start + i] != '\n') {
             line[i] = text[start + i];
             i++;
         }
@@ -157,31 +200,32 @@ static void draw(fos_api_t *api) {
         const char *base = "^X Exit  ^S Save  Arrows/Home/End move";
         const char *shown = filename[0] ? filename : "[New file]";
         int n = 0;
-        for (const char *p = base; *p && n + 1 < COLS; p++) {
+        for (const char *p = base; *p && n < cols; p++) {
             status[n++] = *p;
         }
-        for (const char *p = mod; *p && n + 1 < COLS; p++) {
+        for (const char *p = mod; *p && n < cols; p++) {
             status[n++] = *p;
         }
-        status[n++] = ' ';
-        for (const char *p = shown; *p && n + 1 < COLS; p++) {
+        if (n < cols) {
+            status[n++] = ' ';
+        }
+        for (const char *p = shown; *p && n < cols; p++) {
             status[n++] = *p;
         }
         status[n] = 0;
     }
-    api->goto_xy(0, STATUS_ROW);
-    api->write(status);
+    status_bar(api, status);
 
     {
         int cy = row - scroll_line;
         int cx = col;
-        if (cx > COLS - 1) {
-            cx = COLS - 1;
+        if (cx > cols - 1) {
+            cx = cols - 1;
         }
-        if (cy >= 0 && cy < EDIT_ROWS) {
+        if (cy >= 0 && cy < edit_rows) {
             api->goto_xy(cx, cy);
         } else {
-            api->goto_xy(0, STATUS_ROW);
+            api->goto_xy(0, status_row);
         }
     }
 }
@@ -298,14 +342,26 @@ static int prompt_filename(fos_api_t *api, const char *title, char *out, size_t 
     size_t len = 0;
     size_t cur = 0;
 
+    buf[0] = 0;
     for (;;) {
-        api->goto_xy(0, STATUS_ROW);
-        api->write("                                                                                ");
-        api->goto_xy(0, STATUS_ROW);
-        api->write(title);
-        api->write(": ");
-        api->write(buf);
-        api->goto_xy((int)(my_strlen(title) + 2 + cur), STATUS_ROW);
+        char row[MAX_COLS + 1];
+        int n = 0;
+
+        for (const char *p = title; *p && n < cols; p++) {
+            row[n++] = *p;
+        }
+        if (n < cols) {
+            row[n++] = ':';
+        }
+        if (n < cols) {
+            row[n++] = ' ';
+        }
+        for (const char *p = buf; *p && n < cols; p++) {
+            row[n++] = *p;
+        }
+        row[n] = 0;
+        status_bar(api, row);
+        api->goto_xy((int)(my_strlen(title) + 2 + cur), status_row);
 
         while (!api->has_key()) {
             __asm__ volatile("pause");
@@ -403,6 +459,7 @@ void com_main(void) {
     fos_api_t *api = (fos_api_t *)FOS_API_ADDR;
     size_t loaded = 0;
 
+    init_geometry(api);
     normalize_path(filename, api->cmdline);
 
     text_len = 0;

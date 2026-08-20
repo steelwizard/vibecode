@@ -175,9 +175,214 @@ static void print_largest_usable(fos_api_t *api, const fos_mem_info_t *info) {
     api->putchar('\n');
 }
 
+static void print_heap(fos_api_t *api) {
+    fos_heap_info_t h;
+
+    write_line(api, "");
+    write_line(api, "Allocator");
+    if (!api->get_heap_info || api->get_heap_info(&h) != 0) {
+        write_line(api, "  (heap API missing — rebuild the kernel)");
+        return;
+    }
+    api->write("  Page pool:        ");
+    write_size(api, h.pool_total);
+    api->write(" total, ");
+    write_size(api, h.pool_used);
+    api->write(" held by the heap\n");
+    api->write("  Heap in use:      ");
+    write_size(api, h.heap_used);
+    api->write(" across ");
+    write_dec(api, h.heap_blocks);
+    api->write(" block(s)\n");
+}
+
+/* --- heap stress test (mem test) --- */
+
+#define TEST_PTRS 256
+
+static void *ptrs[TEST_PTRS];
+static uint32_t sizes[TEST_PTRS];
+static uint32_t rnd_state = 2463534242u;
+
+static uint32_t rnd(void) {
+    rnd_state ^= rnd_state << 13;
+    rnd_state ^= rnd_state >> 17;
+    rnd_state ^= rnd_state << 5;
+    return rnd_state;
+}
+
+static void fill(void *p, uint32_t n, uint8_t seed) {
+    uint8_t *b = (uint8_t *)p;
+    for (uint32_t i = 0; i < n; i++) {
+        b[i] = (uint8_t)(seed + (uint8_t)i);
+    }
+}
+
+static int check(const void *p, uint32_t n, uint8_t seed) {
+    const uint8_t *b = (const uint8_t *)p;
+    for (uint32_t i = 0; i < n; i++) {
+        if (b[i] != (uint8_t)(seed + (uint8_t)i)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void report(fos_api_t *api, const char *name, int ok) {
+    api->write(ok ? "  ok    " : "  FAIL  ");
+    write_line(api, name);
+}
+
+static int run_stress(fos_api_t *api) {
+    fos_heap_info_t before, after;
+    int fails = 0;
+    int i;
+
+    if (!api->mem_alloc || !api->mem_free || !api->get_heap_info) {
+        write_line(api, "MEM: heap API missing — rebuild the kernel");
+        return 1;
+    }
+    api->get_heap_info(&before);
+
+    /* 1. many live blocks of mixed sizes, all holding their own pattern */
+    for (i = 0; i < TEST_PTRS; i++) {
+        sizes[i] = (rnd() % 8192u) + 1u;
+        ptrs[i] = api->mem_alloc(sizes[i]);
+        if (ptrs[i]) {
+            fill(ptrs[i], sizes[i], (uint8_t)i);
+        }
+    }
+    {
+        int ok = 1;
+        for (i = 0; i < TEST_PTRS; i++) {
+            if (!ptrs[i] || !check(ptrs[i], sizes[i], (uint8_t)i)) {
+                ok = 0;
+            }
+        }
+        report(api, "256 mixed allocations do not overlap", ok);
+        fails += !ok;
+    }
+
+    /* 2. free half, allocate into the holes, survivors must be untouched */
+    for (i = 0; i < TEST_PTRS; i += 2) {
+        api->mem_free(ptrs[i]);
+        ptrs[i] = 0;
+    }
+    for (i = 0; i < TEST_PTRS; i += 2) {
+        sizes[i] = (rnd() % 4096u) + 1u;
+        ptrs[i] = api->mem_alloc(sizes[i]);
+        if (ptrs[i]) {
+            fill(ptrs[i], sizes[i], (uint8_t)(i + 7));
+        }
+    }
+    {
+        int ok = 1;
+        for (i = 0; i < TEST_PTRS; i++) {
+            uint8_t seed = (i % 2) ? (uint8_t)i : (uint8_t)(i + 7);
+            if (!ptrs[i] || !check(ptrs[i], sizes[i], seed)) {
+                ok = 0;
+            }
+        }
+        report(api, "reuse of freed holes keeps neighbours intact", ok);
+        fails += !ok;
+    }
+
+    /* 3. realloc preserves contents */
+    {
+        void *p = api->mem_alloc(64);
+        int ok = p != 0;
+        if (ok) {
+            fill(p, 64, 0xA5);
+            if (api->mem_realloc) {
+                void *q = api->mem_realloc(p, 4096);
+                ok = q && check(q, 64, 0xA5);
+                api->mem_free(q);
+            } else {
+                api->mem_free(p);
+            }
+        }
+        report(api, "realloc keeps the old contents", ok);
+        fails += !ok;
+    }
+
+    /* 4. an allocation larger than any single block forces the pool to grow */
+    {
+        void *p = api->mem_alloc(4u * 1024u * 1024u);
+        int ok = p != 0;
+        if (ok) {
+            fill(p, 4096, 0x5A);
+            ok = check(p, 4096, 0x5A);
+            api->mem_free(p);
+        }
+        report(api, "4 MB allocation succeeds and is writable", ok);
+        fails += !ok;
+    }
+
+    /* 5. an impossible request fails instead of returning junk */
+    {
+        void *p = api->mem_alloc(1024ull * 1024ull * 1024ull);
+        int ok = p == 0;
+        if (!ok) {
+            api->mem_free(p);
+        }
+        report(api, "1 GB request is refused", ok);
+        fails += !ok;
+    }
+
+    /* 6. everything freed returns the heap to its starting size */
+    for (i = 0; i < TEST_PTRS; i++) {
+        api->mem_free(ptrs[i]);
+        ptrs[i] = 0;
+    }
+    api->get_heap_info(&after);
+    {
+        int ok = after.heap_used == before.heap_used &&
+                 after.heap_blocks == before.heap_blocks;
+        report(api, "all blocks freed, heap back to baseline", ok);
+        fails += !ok;
+    }
+    {
+        int ok = after.pool_used <= before.pool_used;
+        report(api, "empty page runs returned to the pool", ok);
+        fails += !ok;
+    }
+
+    write_line(api, "");
+    write_line(api, fails ? "RESULT: FAIL" : "RESULT: PASS");
+    return fails;
+}
+
+static const char *skip_ws(const char *s) {
+    while (*s == ' ' || *s == '\t') {
+        s++;
+    }
+    return s;
+}
+
 void com_main(void) {
     fos_api_t *api = (fos_api_t *)FOS_API_ADDR;
     fos_mem_info_t info;
+    const char *arg = skip_ws(api->cmdline);
+
+    if (arg[0] == 't' || (arg[0] == '-' && arg[1] == 't')) {
+        write_line(api, "FOS heap stress test");
+        write_line(api, "");
+        run_stress(api);
+        return;
+    }
+
+    /* Deliberately exits holding memory: run "mem" afterwards and the heap
+     * should be back at zero, reclaimed by the loader. */
+    if (arg[0] == 'l') {
+        for (int i = 0; i < 8; i++) {
+            if (!api->mem_alloc || !api->mem_alloc(512u * 1024u)) {
+                write_line(api, "MEM: allocation failed");
+                return;
+            }
+        }
+        write_line(api, "Leaked 4 MB on purpose — it is the loader's problem now.");
+        return;
+    }
 
     if (!api->get_mem_info) {
         write_line(api, "MEM: memory API missing — rebuild the kernel");
@@ -195,4 +400,5 @@ void com_main(void) {
     print_summary(api, &info);
     print_kernel_map(api, &info);
     print_largest_usable(api, &info);
+    print_heap(api);
 }

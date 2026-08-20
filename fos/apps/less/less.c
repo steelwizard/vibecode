@@ -11,9 +11,7 @@
 #include "fos_api.h"
 
 #define TEXT_MAX   65536
-#define COLS       80
-#define PAGE_ROWS  23
-#define STATUS_ROW 23
+#define MAX_COLS   320
 
 #define FG_NORMAL   7
 #define FG_H1       15
@@ -38,6 +36,32 @@ static char title[256];
 static int scroll_line;
 static int total_lines;
 static int md_mode;
+
+/* Console geometry, filled from the kernel at startup. */
+static int cols = 80;
+static int page_rows = 23;
+static int status_row = 23;
+
+static void init_geometry(fos_api_t *api) {
+    int c = 80;
+    int r = 25;
+
+    if (api->get_term_size) {
+        api->get_term_size(&c, &r);
+    }
+    if (c < 20) {
+        c = 20;
+    }
+    if (c > MAX_COLS) {
+        c = MAX_COLS;
+    }
+    if (r < 4) {
+        r = 4;
+    }
+    cols = c;
+    status_row = r - 1;
+    page_rows = status_row;
+}
 
 static size_t my_strlen(const char *s) {
     size_t n = 0;
@@ -147,11 +171,11 @@ static int detect_md(const char *path) {
 }
 
 static int at_end(void) {
-    return scroll_line + PAGE_ROWS >= total_lines;
+    return scroll_line + page_rows >= total_lines;
 }
 
 static void clamp_scroll(void) {
-    int max_top = total_lines > PAGE_ROWS ? total_lines - PAGE_ROWS : 0;
+    int max_top = total_lines > page_rows ? total_lines - page_rows : 0;
     if (scroll_line < 0) {
         scroll_line = 0;
     }
@@ -162,7 +186,7 @@ static void clamp_scroll(void) {
 
 static void pad_line(fos_api_t *api, int y, int x) {
     api->set_color(FG_NORMAL, BG_NORMAL);
-    while (x < COLS) {
+    while (x < cols) {
         api->goto_xy(x, y);
         api->putchar(' ');
         x++;
@@ -170,7 +194,7 @@ static void pad_line(fos_api_t *api, int y, int x) {
 }
 
 static void emit_char(fos_api_t *api, int y, int *x, uint8_t fg, uint8_t bg, char c) {
-    if (*x >= COLS) {
+    if (*x >= cols) {
         return;
     }
     api->set_color(fg, bg);
@@ -299,7 +323,7 @@ static void emit_inline(fos_api_t *api, int y, int *x, const char *line, int len
                         uint8_t fg, uint8_t bg) {
     int i = 0;
 
-    while (i < len && *x < COLS) {
+    while (i < len && *x < cols) {
         char c = line[i];
 
         if (c == '`') {
@@ -418,7 +442,7 @@ static void draw_md_line(fos_api_t *api, int y, int line_num) {
     }
 
     if (is_hr(line, len)) {
-        for (int i = 0; i < COLS; i++) {
+        for (int i = 0; i < cols; i++) {
             emit_char(api, y, &x, FG_DIM, BG_NORMAL, '-');
         }
         return;
@@ -482,7 +506,7 @@ static void draw_md_line(fos_api_t *api, int y, int line_num) {
     }
 
     if (is_table_sep(line, len)) {
-        for (int i = 0; i < len && x < COLS; i++) {
+        for (int i = 0; i < len && x < cols; i++) {
             char c = line[i];
             uint8_t fg = (c == '-') ? FG_DIM : FG_TABLE;
             emit_char(api, y, &x, fg, BG_NORMAL, c);
@@ -511,14 +535,14 @@ static void draw_md_line(fos_api_t *api, int y, int line_num) {
 }
 
 static void draw_plain_line(fos_api_t *api, int y, int line_num) {
-    char line[COLS + 1];
+    char line[MAX_COLS + 1];
     int start = line_start(line_num);
     int i = 0;
 
     if (line_num >= total_lines) {
         line[0] = 0;
     } else {
-        while (i < COLS && start + i < text_len && text[start + i] != '\n') {
+        while (i < cols && start + i < text_len && text[start + i] != '\n') {
             line[i] = text[start + i];
             i++;
         }
@@ -531,27 +555,27 @@ static void draw_plain_line(fos_api_t *api, int y, int line_num) {
 }
 
 static void draw_status(fos_api_t *api, const char *hint) {
-    char status[COLS + 1];
+    char status[MAX_COLS + 1];
     int n = 0;
 
-    for (const char *p = title; *p && n + 1 < COLS; p++) {
+    for (const char *p = title; *p && n + 1 < cols; p++) {
         status[n++] = *p;
     }
     if (hint && hint[0]) {
-        if (n + 1 < COLS) {
+        if (n + 1 < cols) {
             status[n++] = ' ';
         }
-        for (const char *p = hint; *p && n + 1 < COLS; p++) {
+        for (const char *p = hint; *p && n + 1 < cols; p++) {
             status[n++] = *p;
         }
     }
     status[n] = 0;
 
-    api->goto_xy(0, STATUS_ROW);
+    api->goto_xy(0, status_row);
     api->set_color(FG_NORMAL, BG_NORMAL);
     api->write(status);
-    for (int i = n; i < COLS; i++) {
-        api->goto_xy(i, STATUS_ROW);
+    for (int i = n; i < cols; i++) {
+        api->goto_xy(i, status_row);
         api->putchar(' ');
     }
 }
@@ -561,7 +585,7 @@ static void draw(fos_api_t *api) {
 
     api->clear_screen();
 
-    for (int vr = 0; vr < PAGE_ROWS; vr++) {
+    for (int vr = 0; vr < page_rows; vr++) {
         int sr = scroll_line + vr;
         if (md_mode) {
             draw_md_line(api, vr, sr);
@@ -584,11 +608,11 @@ static void scroll_page_down(fos_api_t *api) {
         draw(api);
         return;
     }
-    scroll_by(api, PAGE_ROWS);
+    scroll_by(api, page_rows);
 }
 
 static void scroll_page_up(fos_api_t *api) {
-    scroll_by(api, -PAGE_ROWS);
+    scroll_by(api, -page_rows);
 }
 
 static void scroll_top(fos_api_t *api) {
@@ -597,7 +621,7 @@ static void scroll_top(fos_api_t *api) {
 }
 
 static void scroll_bottom(fos_api_t *api) {
-    scroll_line = total_lines > PAGE_ROWS ? total_lines - PAGE_ROWS : 0;
+    scroll_line = total_lines > page_rows ? total_lines - page_rows : 0;
     draw(api);
 }
 
@@ -643,6 +667,8 @@ static int load_content(fos_api_t *api) {
 
 void com_main(void) {
     fos_api_t *api = (fos_api_t *)FOS_API_ADDR;
+
+    init_geometry(api);
 
     if (load_content(api) != 0) {
         api->write_line("LESS: file required (or pipe input)");

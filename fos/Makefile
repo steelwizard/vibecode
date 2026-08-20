@@ -49,7 +49,8 @@ KERNEL_C   = kernel/kernel.c kernel/shell.c kernel/vfs.c kernel/block.c \
              kernel/console.c kernel/keyboard.c kernel/string.c \
              kernel/cpu.c kernel/boot_report.c kernel/exec.c kernel/fos_api.c \
              kernel/config.c kernel/video.c kernel/font8x16.c \
-             kernel/timer.c kernel/rtc.c kernel/memory.c kernel/irq.c kernel/sb16.c
+             kernel/timer.c kernel/rtc.c kernel/memory.c kernel/heap.c \
+             kernel/irq.c kernel/sb16.c
 
 SHELL_ASM  = shell/entry.asm
 SHELL_C    = kernel/shell.c kernel/vfs.c kernel/block.c \
@@ -100,9 +101,20 @@ PLAY_ELF   = apps/play/play.elf
 
 KERNEL_OBJ = $(KERNEL_ASM:.asm=.o) $(KERNEL_C:.c=.o)
 
-.PHONY: all run run-uefi clean
+# bochs-display VRAM. 32 MiB covers every mode up to 2560x1440 at 32bpp.
+VGAMEM ?= 32M
+
+# Where exec.c loads .COM images; the shell's static data must stay below it.
+COM_LOAD_ADDR = 3145728
+
+.PHONY: all run run-uefi clean check-font
 
 all: $(IMG) $(DATA_IMG)
+
+# The console font is only exercised in framebuffer mode, so a bad table can
+# ship unnoticed. Validate glyph alignment and coverage.
+check-font:
+	@python3 scripts/genfont.py --check
 
 $(BOOT_BIN): boot_stage1.asm boot_stage2.asm boot.inc
 	$(NASM) -f bin boot_stage1.asm -o boot_stage1.bin
@@ -180,15 +192,22 @@ $(KERNEL_BIN): $(KERNEL_ELF)
 
 SHELL_ELF = shell/shell.elf
 
-$(SHELL_ELF): $(SHELL_OBJ) kernel/exec.o kernel/fos_api.o kernel/font8x16.o kernel/timer.o kernel/rtc.o kernel/memory.o kernel/sb16.o kernel/config.o kernel/irqvec.o kernel/comcall.o kernel/irq.o shell/linker.ld
+$(SHELL_ELF): $(SHELL_OBJ) kernel/exec.o kernel/fos_api.o kernel/font8x16.o kernel/timer.o kernel/rtc.o kernel/memory.o kernel/heap.o kernel/sb16.o kernel/config.o kernel/irqvec.o kernel/comcall.o kernel/irq.o shell/linker.ld
 	$(LD) -m elf_x86_64 -T shell/linker.ld -nostdlib -o $@ shell/entry.o \
 		kernel/shell.o kernel/vfs.o kernel/block.o kernel/partition.o \
 		kernel/fat32.o kernel/exfat.o kernel/console.o kernel/keyboard.o \
 		kernel/string.o kernel/boot_report.o kernel/exec.o kernel/fos_api.o \
-		kernel/font8x16.o kernel/timer.o kernel/rtc.o kernel/irqvec.o kernel/comcall.o kernel/irq.o kernel/memory.o kernel/sb16.o kernel/config.o
+		kernel/font8x16.o kernel/timer.o kernel/rtc.o kernel/irqvec.o kernel/comcall.o kernel/irq.o kernel/memory.o kernel/heap.o kernel/sb16.o kernel/config.o
 
 $(SHELL_BIN): $(SHELL_ELF)
 	$(OBJCOPY) -O binary $< $@
+	@end=$$(( 0x$$(nm $(SHELL_ELF) | awk '$$3=="_end"{print $$1; exit}') )); \
+	 if [ "$$end" -ge $(COM_LOAD_ADDR) ]; then \
+	   echo "ERROR: shell static data ends at $$end, at or past the .COM load address $(COM_LOAD_ADDR)."; \
+	   echo "       Shrink a static buffer (e.g. CONSOLE_MAX_COLS or SCROLLBACK_MAX in kernel/console.c)."; \
+	   exit 1; \
+	 fi; \
+	 echo "shell _end=$$end — $$(( $(COM_LOAD_ADDR) - $$end )) bytes free below .COM load"
 
 $(ECHO_ELF): $(ECHO_OBJ) apps/echo/linker.ld
 	$(LD) -m elf_x86_64 -T apps/echo/linker.ld -nostdlib -o $@ $(ECHO_OBJ)
@@ -346,7 +365,7 @@ ifndef QEMU
 endif
 	$(QEMU) -drive format=raw,file=$(IMG),index=0,media=disk \
 	        -drive format=raw,file=$(DATA_IMG),index=1,media=disk \
-	        -device bochs-display \
+	        -device bochs-display,vgamem=$(VGAMEM) \
 	        $(QEMU_SB16) \
 	        -m 128M -serial stdio
 
@@ -362,7 +381,7 @@ endif
 	$(QEMU) -bios $(OVMF) \
 	        -drive format=raw,file=$(IMG),index=0,media=disk \
 	        -drive format=raw,file=$(DATA_IMG),index=1,media=disk \
-	        -device bochs-display \
+	        -device bochs-display,vgamem=$(VGAMEM) \
 	        $(QEMU_SB16) \
 	        -m 128M -serial stdio -net none
 
