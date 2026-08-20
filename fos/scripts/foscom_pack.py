@@ -32,7 +32,7 @@ def main():
     p.add_argument("--load", type=lambda x: int(x, 0), required=True)
     p.add_argument("--entry", type=lambda x: int(x, 0), required=True)
     p.add_argument("--mem-size", type=lambda x: int(x, 0), required=True)
-    p.add_argument("--stack", type=lambda x: int(x, 0), default=0x800000)
+    p.add_argument("--stack", type=lambda x: int(x, 0), default=0x4300000)
     p.add_argument("--name", default="APP")
     args = p.parse_args()
 

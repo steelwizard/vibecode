@@ -16,7 +16,7 @@
 %define KERNEL_RUNTIME     0x100000
 %define KERNEL_LBA         9
 ; Must fit the full kernel.bin — if the kernel grows, increase this and rebuild boot.bin.
-%define KERNEL_MAX_SECTORS 192
+%define KERNEL_MAX_SECTORS 256
 ; BIOS int 13h reads: stay well under 127 sectors and 64K DMA windows.
 %define KERNEL_CHUNK_SECTORS 32
 
@@ -27,6 +27,8 @@
 %define PML4_ADDR 0x5000
 %define PDPT_ADDR 0x6000
 %define PD_ADDR   0x7000
+; 256 × 2 MiB = 512 MiB identity map. Slot 256 (0x20000000) is the framebuffer.
+%define IDENTITY_2M_PAGES 256
 
 %define CODE32_SEL 0x08
 %define DATA32_SEL 0x10

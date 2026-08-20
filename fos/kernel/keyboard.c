@@ -638,3 +638,14 @@ char keyboard_read(void) {
         return 0;
     }
 }
+
+int keyboard_check_ctrl_c(void) {
+    int hit = 0;
+    while (keyboard_has_key()) {
+        key_event_t ev = keyboard_read_event();
+        if (ev.type == KEY_CHAR && ev.ch == 3) {
+            hit = 1;
+        }
+    }
+    return hit;
+}

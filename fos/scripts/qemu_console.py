@@ -36,7 +36,7 @@ class Machine:
             "-device", "bochs-display",
             "-audiodev", f"{audiodev},id=snd0",
             "-device", "sb16,audiodev=snd0,iobase=0x220,irq=5,dma=1",
-            "-m", "128M", "-display", "none",
+            "-m", "512M", "-display", "none",
             "-serial", f"unix:{self.serial_path},server=on,wait=off",
             "-monitor", f"unix:{self.monitor_path},server=on,wait=off",
             "-no-reboot",

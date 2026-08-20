@@ -21,6 +21,7 @@ void console_write_size(uint64_t bytes);
 void console_backspace(void);
 void console_cursor_back(void);
 void console_goto_xy(int x, int y);
+void console_set_cursor_visible(int visible);
 void console_write_line_color(uint8_t fg, uint8_t bg, const char *s);
 void console_write_color(uint8_t fg, uint8_t bg, const char *s);
 void console_clear_color(uint8_t fg, uint8_t bg);
@@ -37,3 +38,14 @@ int  console_at_bottom(void);
 void console_init_framebuffer(const video_mode_t *mode);
 int  console_is_framebuffer(void);
 void console_get_size(int *cols, int *rows);
+
+/* Modal error: red screen, blue box, TUI OK button. Enter (or Space) dismisses.
+ * Restores the previous screen afterwards. While capturing (pipes/redirects)
+ * this just writes the message as a line so scripts still see it. */
+void console_error(const char *msg);
+
+/* Copy/move progress: grey desktop, blue box, filenames + status bar.
+ * No-op while capturing. Pair begin with end. */
+void console_xfer_begin(const char *title, const char *src, const char *dst);
+void console_xfer_progress(uint32_t done, uint32_t total, const char *status);
+void console_xfer_end(void);

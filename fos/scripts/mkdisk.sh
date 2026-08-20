@@ -120,6 +120,9 @@ fi
 if [ -n "$PLAY" ] && [ -f "$PLAY" ]; then
     add_one FOS/PLAY.COM "$PLAY"
 fi
+if [ -f "$SCRIPT_DIR/../demo.bat" ]; then
+    add_one FOS/DEMO.BAT "$SCRIPT_DIR/../demo.bat"
+fi
 
 DEMO_WAV=$(mktemp)
 python3 - "$DEMO_WAV" <<'PY'
@@ -149,17 +152,5 @@ if command -v ffmpeg >/dev/null 2>&1; then
     rm -f "$DEMO_MP3"
 fi
 rm -f "$DEMO_WAV"
-
-# Real track for the player (8.3 name — FOS FAT32 has no LFN).
-for cand in \
-    "$SCRIPT_DIR/../01 -Baby Please Don't Go.mp3" \
-    "$SCRIPT_DIR/../Baby Please Don't Go.mp3" \
-    "$SCRIPT_DIR/../baby.mp3"
-do
-    if [ -f "$cand" ]; then
-        add_one BABY.MP3 "$cand"
-        break
-    fi
-done
 
 echo "Built $IMG — drive 0: FAT32 ESP (LBA $PART_START, ${PART_SECTORS} sectors)"

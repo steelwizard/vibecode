@@ -16,6 +16,8 @@ const char *skip_spaces(const char *s);
 int    is_digit(char c);
 int    atoi(const char *s);
 void   path_normalize_slashes(char *dst, const char *src, size_t sz);
+/* Collapse \.\ and \..\ in an absolute path (in place). Returns 0 or -1. */
+int    path_collapse(char *path);
 char  *strchr(const char *s, int c);
 char  *strncat(char *dst, const char *src, size_t n);
 void  *memmove(void *dst, const void *src, size_t count);

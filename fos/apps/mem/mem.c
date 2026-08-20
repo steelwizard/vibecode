@@ -147,8 +147,10 @@ static void print_kernel_map(fos_api_t *api, const fos_mem_info_t *info) {
     write_line(api, "  Page tables:      0x5000 - 0x7FFF");
     write_line(api, "  E820 map stash:   0x4000");
     write_line(api, "  FOS API block:    0xFF0000");
+    write_line(api, "  Identity map:     512 MB");
     write_line(api, "  .COM load addr:   0x300000");
-    write_line(api, "  .COM stack top:   0x800000");
+    write_line(api, "  .COM image max:   32 MB");
+    write_line(api, "  .COM stack top:   0x4300000 (8 MB x 4)");
     write_line(api, "  Kernel stack top: 0x90000");
 }
 

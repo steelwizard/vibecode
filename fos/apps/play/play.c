@@ -968,13 +968,21 @@ void com_main(void) {
     ui_begin(api, path);
 
     if (!api->sound_present || !api->sound_play || !api->read_at || !api->stat_file) {
-        ui_set_status(api, "API missing - rebuild the kernel", FG_ERR);
-        ui_wait_key(api);
+        if (api->show_error) {
+            api->show_error("API missing - rebuild the kernel");
+        } else {
+            ui_set_status(api, "API missing - rebuild the kernel", FG_ERR);
+            ui_wait_key(api);
+        }
         goto done;
     }
     if (!api->sound_present()) {
-        ui_set_status(api, "No Sound Blaster (QEMU: -device sb16)", FG_ERR);
-        ui_wait_key(api);
+        if (api->show_error) {
+            api->show_error("No Sound Blaster (QEMU: -device sb16)");
+        } else {
+            ui_set_status(api, "No Sound Blaster (QEMU: -device sb16)", FG_ERR);
+            ui_wait_key(api);
+        }
         goto done;
     }
 
@@ -985,14 +993,22 @@ void com_main(void) {
     }
 
     if (api->stat_file(path, &size, &is_dir) != 0 || is_dir || size == 0) {
-        ui_set_status(api, "Cannot open file", FG_ERR);
-        ui_wait_key(api);
+        if (api->show_error) {
+            api->show_error("Cannot open file");
+        } else {
+            ui_set_status(api, "Cannot open file", FG_ERR);
+            ui_wait_key(api);
+        }
         goto done;
     }
 
     if (api->read_at(path, 0, sniff, sizeof(sniff), &got) != 0 || got < 4) {
-        ui_set_status(api, "Cannot read file", FG_ERR);
-        ui_wait_key(api);
+        if (api->show_error) {
+            api->show_error("Cannot read file");
+        } else {
+            ui_set_status(api, "Cannot read file", FG_ERR);
+            ui_wait_key(api);
+        }
         goto done;
     }
 
@@ -1005,8 +1021,12 @@ void com_main(void) {
         goto done;
     }
 
-    ui_set_status(api, "Not WAV or MP3", FG_ERR);
-    ui_wait_key(api);
+    if (api->show_error) {
+        api->show_error("Not WAV or MP3");
+    } else {
+        ui_set_status(api, "Not WAV or MP3", FG_ERR);
+        ui_wait_key(api);
+    }
 
 done:
     if (api->end_direct) {

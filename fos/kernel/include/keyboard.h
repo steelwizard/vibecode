@@ -30,6 +30,9 @@ int  keyboard_has_key(void);
 char keyboard_read(void);
 key_event_t keyboard_read_event(void);
 
+/* Non-blocking: drain pending keys; return 1 if Ctrl+C (0x03) was seen. */
+int  keyboard_check_ctrl_c(void);
+
 /* Layout from SYSTEM.INI or defaults: "de" (QWERTZ) / "us" (QWERTY). */
 void keyboard_set_layout(const char *name);
 const char *keyboard_get_layout(void);

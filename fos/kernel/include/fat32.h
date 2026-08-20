@@ -14,6 +14,7 @@ typedef struct {
     uint32_t fat_begin_lba;
     uint32_t data_begin_lba;
     uint32_t total_clusters;
+    uint32_t fsinfo_lba; /* 0 if none */
 } fat32_vol_t;
 
 int  fat32_mount(fat32_vol_t *vol, int block_index, uint32_t part_lba);

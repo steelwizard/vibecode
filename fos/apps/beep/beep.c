@@ -14,6 +14,14 @@
 static uint8_t filebuf[PLAY_MAX];
 static uint8_t pcmbuf[PLAY_MAX];
 
+static void beep_error(fos_api_t *api, const char *msg) {
+    if (api->show_error) {
+        api->show_error(msg);
+    } else {
+        api->write_line(msg);
+    }
+}
+
 static int is_digit(char c) {
     return c >= '0' && c <= '9';
 }
@@ -84,7 +92,7 @@ static int play_wav_or_raw(fos_api_t *api, const uint8_t *data, size_t len) {
             off += 8 + ((cksz + 1u) & ~1u);
         }
         if (!got_fmt || !got_data) {
-            api->write_line("BEEP: not PCM WAV");
+            beep_error(api, "BEEP: not PCM WAV");
             return -1;
         }
         if (ch < 1) {
@@ -103,12 +111,12 @@ static int play_wav_or_raw(fos_api_t *api, const uint8_t *data, size_t len) {
             pcmbuf[o++] = (uint8_t)((s / 256) + 128);
         }
     } else {
-        api->write_line("BEEP: only 8- or 16-bit PCM");
+        beep_error(api, "BEEP: only 8- or 16-bit PCM");
         return -1;
     }
 
     if (o == 0) {
-        api->write_line("BEEP: empty sample");
+        beep_error(api, "BEEP: empty sample");
         return -1;
     }
     return api->sound_play(pcmbuf, o, rate);
@@ -125,18 +133,18 @@ void com_main(void) {
     size_t n = 0;
 
     if (!api->sound_present || !api->sound_beep || !api->sound_play) {
-        api->write_line("BEEP: sound API missing — rebuild the kernel");
+        beep_error(api, "BEEP: sound API missing — rebuild the kernel");
         return;
     }
     if (!api->sound_present()) {
-        api->write_line("BEEP: no Sound Blaster (QEMU: -device sb16)");
+        beep_error(api, "BEEP: no Sound Blaster (QEMU: -device sb16)");
         return;
     }
 
     arg = skip_ws(api->cmdline);
     if (!arg[0]) {
         if (api->sound_beep(440, 200) != 0) {
-            api->write_line("BEEP: playback failed");
+            beep_error(api, "BEEP: playback failed");
         }
         return;
     }
@@ -159,16 +167,16 @@ void com_main(void) {
             }
         }
         if (api->sound_beep(freq, ms) != 0) {
-            api->write_line("BEEP: playback failed");
+            beep_error(api, "BEEP: playback failed");
         }
         return;
     }
 
     if (api->read_file(arg, (char *)filebuf, sizeof(filebuf), &n) != 0 || n == 0) {
-        api->write_line("BEEP: cannot read file");
+        beep_error(api, "BEEP: cannot read file");
         return;
     }
     if (play_wav_or_raw(api, filebuf, n) != 0) {
-        api->write_line("BEEP: playback failed");
+        beep_error(api, "BEEP: playback failed");
     }
 }

@@ -17,8 +17,19 @@
 #include "irq.h"
 #include "sb16.h"
 #include "heap.h"
+#include "env.h"
 
 #define api ((fos_api_t *)FOS_API_ADDR)
+
+/* Frozen .COM ABI offsets. Insert new function pointers at the end of
+ * fos_api_t, never in the middle — and never grow pipe_in[]. */
+#define fos_offsetof(type, member) ((size_t)(uintptr_t)&((type *)0)->member)
+_Static_assert(fos_offsetof(fos_api_t, magic) == 0, "fos_api ABI");
+_Static_assert(fos_offsetof(fos_api_t, write) == 8, "fos_api ABI");
+_Static_assert(fos_offsetof(fos_api_t, cmdline) == 40, "fos_api ABI");
+_Static_assert(fos_offsetof(fos_api_t, pipe_in) == 296, "fos_api ABI");
+_Static_assert(sizeof(((fos_api_t *)0)->pipe_in) == 4096, "fos_api ABI");
+_Static_assert(fos_offsetof(fos_api_t, get_mem_info) == 4544, "fos_api ABI");
 
 static fos_key_event_t api_read_key(void) {
     key_event_t ev = keyboard_read_event();
@@ -138,6 +149,27 @@ static int api_mkdir(const char *path) {
     return vfs_mkdir(vfs_get_drive(), path);
 }
 
+static int api_delete_file(const char *path) {
+    if (!path || !path[0]) {
+        return -1;
+    }
+    return vfs_delete(vfs_get_drive(), path);
+}
+
+static int api_copy_file(const char *src, const char *dst) {
+    if (!src || !dst || !src[0] || !dst[0]) {
+        return -1;
+    }
+    return vfs_copy(vfs_get_drive(), src, dst);
+}
+
+static int api_move_file(const char *src, const char *dst) {
+    if (!src || !dst || !src[0] || !dst[0]) {
+        return -1;
+    }
+    return vfs_move(vfs_get_drive(), src, dst);
+}
+
 static int api_get_mem_info(fos_mem_info_t *out) {
     return memory_get_info(out);
 }
@@ -186,6 +218,9 @@ void fos_api_init(void) {
     api->rtc_read = rtc_read;
     api->rtc_write = rtc_write;
     api->mkdir = api_mkdir;
+    api->delete_file = api_delete_file;
+    api->copy_file = api_copy_file;
+    api->move_file = api_move_file;
     api->get_mem_info = api_get_mem_info;
     api->irq_register = irq_register;
     api->irq_unregister = irq_unregister;
@@ -210,6 +245,12 @@ void fos_api_init(void) {
     api->end_direct = console_end_direct;
     api->sound_start = sb16_start;
     api->sound_can_queue = sb16_can_queue;
+    api->show_error = console_error;
+    api->set_cursor_visible = console_set_cursor_visible;
+    api->set_drive = vfs_set_drive;
+    api->drive_count = vfs_drive_count;
+    api->getenv = env_get;
+    api->setenv = env_set;
     api->cmdline[0] = 0;
     api->pipe_in_len = 0;
 }
@@ -238,4 +279,22 @@ void fos_api_set_pipe(const char *data, size_t len) {
 
 void fos_api_clear_pipe(void) {
     api->pipe_in_len = 0;
+}
+
+void fos_api_save_io(fos_api_io_t *out) {
+    if (!out) {
+        return;
+    }
+    memcpy(out->cmdline, api->cmdline, sizeof(out->cmdline));
+    memcpy(out->pipe_in, api->pipe_in, sizeof(out->pipe_in));
+    out->pipe_in_len = api->pipe_in_len;
+}
+
+void fos_api_restore_io(const fos_api_io_t *in) {
+    if (!in) {
+        return;
+    }
+    memcpy(api->cmdline, in->cmdline, sizeof(api->cmdline));
+    memcpy(api->pipe_in, in->pipe_in, sizeof(api->pipe_in));
+    api->pipe_in_len = in->pipe_in_len;
 }

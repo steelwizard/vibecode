@@ -203,7 +203,7 @@ protected_mode:
     or eax, 0x83
     mov [PD_ADDR + ecx * 8], eax
     inc ecx
-    cmp ecx, 32
+    cmp ecx, IDENTITY_2M_PAGES
     jb .map_loop
 
     mov eax, PML4_ADDR

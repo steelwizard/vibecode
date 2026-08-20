@@ -1,4 +1,5 @@
-; Hardware IRQ stubs (PIC lines 0–15 -> IDT vectors 32–47).
+; Hardware IRQ stubs (PIC lines 0–15 -> IDT vectors 32–47)
+; plus CPU exception stubs (vectors 0–31) that print then halt.
 
 %macro IRQ 1
 global irq_stub_%1
@@ -8,8 +9,25 @@ irq_stub_%1:
     jmp irq_common
 %endmacro
 
+; Exception with no CPU error code — push a dummy so the frame matches.
+%macro EXC 1
+global exc_stub_%1
+exc_stub_%1:
+    push qword 0
+    push qword %1
+    jmp exc_common
+%endmacro
+
+; Exception that already pushed an error code.
+%macro EXC_ERR 1
+global exc_stub_%1
+exc_stub_%1:
+    push qword %1
+    jmp exc_common
+%endmacro
+
 extern irq_dispatch
-extern exc_halt_stub
+extern exception_panic
 
 section .text
 
@@ -29,6 +47,39 @@ IRQ 12
 IRQ 13
 IRQ 14
 IRQ 15
+
+EXC 0
+EXC 1
+EXC 2
+EXC 3
+EXC 4
+EXC 5
+EXC 6
+EXC 7
+EXC_ERR 8
+EXC 9
+EXC_ERR 10
+EXC_ERR 11
+EXC_ERR 12
+EXC_ERR 13
+EXC_ERR 14
+EXC 15
+EXC 16
+EXC_ERR 17
+EXC 18
+EXC 19
+EXC 20
+EXC_ERR 21
+EXC 22
+EXC 23
+EXC 24
+EXC 25
+EXC 26
+EXC 27
+EXC 28
+EXC 29
+EXC_ERR 30
+EXC 31
 
 irq_common:
     push rax
@@ -85,8 +136,15 @@ irq_common:
     add rsp, 16
     iretq
 
-exc_halt_stub:
+; Stack on entry: [vec][err][RIP][CS][RFLAGS][RSP][SS]
+; SysV: rdi, rsi, rdx, rcx
+exc_common:
     cli
+    mov rdi, [rsp]
+    mov rsi, [rsp + 8]
+    mov rdx, [rsp + 16]
+    mov rcx, cr2
+    call exception_panic
 .hang:
     hlt
     jmp .hang

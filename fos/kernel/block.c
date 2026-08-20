@@ -2,7 +2,11 @@
  * block.c — ATA PIO disk I/O and physical/logical drive mapping.
  *
  * Probes primary (0x1F0) and secondary (0x170) ATA buses via IDENTIFY.
- * The BIOS boot drive (from stage1 at 0x7DFF) is always logical drive 0.
+ * Logical drive 0: is the first disk the kernel can talk to (prefer ATA
+ * primary master). The BIOS DL saved at 0x7DFF is recorded for diagnostics
+ * only — after long mode we have no INT 13h path, so USB/AHCI boot media is
+ * not reachable. QEMU's first -drive matches ATA 0:0; real USB sticks will
+ * not work as drive 0: once the kernel starts.
  */
 
 #include "block.h"
@@ -260,7 +264,13 @@ int block_init(void) {
         }
     }
 
-    /* Boot disk is always logical drive 0. */
+    /* Prefer primary master as logical 0: (matches QEMU -drive index=0).
+     * If that device is missing, fall back to the first disk we found so
+     * drive 0: still exists. BIOS DL is not mapped — we only speak ATA PIO. */
+    if (boot_phys_index < 0 && phys_count > 0) {
+        boot_phys_index = 0;
+    }
+
     int next_logical = 1;
     for (int i = 0; i < phys_count; i++) {
         logical_map[i] = -1;

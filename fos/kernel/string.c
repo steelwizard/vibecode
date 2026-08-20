@@ -134,6 +134,77 @@ void path_normalize_slashes(char *dst, const char *src, size_t sz) {
     dst[i] = 0;
 }
 
+/*
+ * Collapse "." and ".." components in an absolute DOS path (leading '\').
+ * Modifies path in place. Returns -1 if ".." would escape the root.
+ */
+int path_collapse(char *path) {
+    enum { OUT_MAX = 260 };
+    char out[OUT_MAX];
+    size_t oi = 0;
+    const char *p;
+
+    if (!path || path[0] != '\\') {
+        return -1;
+    }
+
+    out[oi++] = '\\';
+    p = path + 1;
+
+    while (*p) {
+        const char *start;
+        size_t n;
+
+        while (*p == '\\') {
+            p++;
+        }
+        if (*p == 0) {
+            break;
+        }
+        start = p;
+        while (*p && *p != '\\') {
+            p++;
+        }
+        n = (size_t)(p - start);
+
+        if (n == 1 && start[0] == '.') {
+            continue;
+        }
+        if (n == 2 && start[0] == '.' && start[1] == '.') {
+            if (oi <= 1) {
+                return -1;
+            }
+            /* drop trailing component (and its leading '\') */
+            while (oi > 1 && out[oi - 1] != '\\') {
+                oi--;
+            }
+            if (oi > 1) {
+                oi--; /* drop the '\' before the popped name */
+            }
+            continue;
+        }
+
+        if (oi > 1) {
+            if (oi + 1 >= OUT_MAX) {
+                return -1;
+            }
+            out[oi++] = '\\';
+        }
+        if (oi + n >= OUT_MAX) {
+            return -1;
+        }
+        memcpy(out + oi, start, n);
+        oi += n;
+    }
+
+    if (oi == 0) {
+        out[oi++] = '\\';
+    }
+    out[oi] = 0;
+    strcpy(path, out);
+    return 0;
+}
+
 char *strchr(const char *s, int c) {
     while (*s) {
         if (*s == (char)c) {

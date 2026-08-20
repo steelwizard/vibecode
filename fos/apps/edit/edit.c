@@ -216,6 +216,9 @@ static void draw(fos_api_t *api) {
     }
     status_bar(api, status);
 
+    if (api->set_cursor_visible) {
+        api->set_cursor_visible(1);
+    }
     {
         int cy = row - scroll_line;
         int cx = col;
@@ -361,7 +364,19 @@ static int prompt_filename(fos_api_t *api, const char *title, char *out, size_t 
         }
         row[n] = 0;
         status_bar(api, row);
-        api->goto_xy((int)(my_strlen(title) + 2 + cur), status_row);
+        if (api->set_cursor_visible) {
+            api->set_cursor_visible(1);
+        }
+        {
+            int cx = (int)(my_strlen(title) + 2 + cur);
+            if (cx >= cols) {
+                cx = cols - 1;
+            }
+            if (cx < 0) {
+                cx = 0;
+            }
+            api->goto_xy(cx, status_row);
+        }
 
         while (!api->has_key()) {
             __asm__ volatile("pause");
@@ -381,12 +396,15 @@ static int prompt_filename(fos_api_t *api, const char *title, char *out, size_t 
             my_strcpy(out, buf);
             return 0;
         }
-        if (ev.type == FOS_KEY_BACKSPACE) {
-            if (cur > 0) {
-                cur--;
-                len--;
-                buf[len] = 0;
-            }
+        if (ev.type == FOS_KEY_BACKSPACE && cur > 0) {
+            my_memmove(buf + cur - 1, buf + cur, len - cur + 1);
+            cur--;
+            len--;
+            continue;
+        }
+        if (ev.type == FOS_KEY_DELETE && cur < len) {
+            my_memmove(buf + cur, buf + cur + 1, len - cur);
+            len--;
             continue;
         }
         if (ev.type == FOS_KEY_LEFT && cur > 0) {
@@ -395,6 +413,14 @@ static int prompt_filename(fos_api_t *api, const char *title, char *out, size_t 
         }
         if (ev.type == FOS_KEY_RIGHT && cur < len) {
             cur++;
+            continue;
+        }
+        if (ev.type == FOS_KEY_HOME) {
+            cur = 0;
+            continue;
+        }
+        if (ev.type == FOS_KEY_END) {
+            cur = len;
             continue;
         }
         if (ev.type == FOS_KEY_CHAR && ev.ch >= 32 && ev.ch <= 126) {
@@ -434,7 +460,10 @@ static int prompt_save_as(fos_api_t *api) {
     return save_file(api);
 }
 
-static void normalize_path(char *path, const char *arg) {
+static void normalize_path(fos_api_t *api, char *path, const char *arg) {
+    char cwd[256];
+    size_t n;
+
     if (!arg || !arg[0]) {
         path[0] = 0;
         return;
@@ -446,10 +475,18 @@ static void normalize_path(char *path, const char *arg) {
         my_strcpy(path, arg);
         return;
     }
-    path[0] = '\\';
-    path[1] = 0;
-    size_t n = my_strlen(path);
-    for (const char *p = arg; *p && n + 1 < sizeof(filename); p++) {
+    cwd[0] = '\\';
+    cwd[1] = 0;
+    if (api->get_cwd) {
+        api->get_cwd(cwd, sizeof(cwd));
+    }
+    my_strcpy(path, cwd);
+    n = my_strlen(path);
+    if (n > 0 && path[n - 1] != '\\' && n + 1 < 256) {
+        path[n++] = '\\';
+        path[n] = 0;
+    }
+    for (const char *p = arg; *p && n + 1 < 256; p++) {
         path[n++] = *p;
     }
     path[n] = 0;
@@ -460,7 +497,7 @@ void com_main(void) {
     size_t loaded = 0;
 
     init_geometry(api);
-    normalize_path(filename, api->cmdline);
+    normalize_path(api, filename, api->cmdline);
 
     text_len = 0;
     cursor = 0;

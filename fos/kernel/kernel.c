@@ -25,6 +25,7 @@
 #include "memory.h"
 #include "heap.h"
 #include "sb16.h"
+#include "env.h"
 
 void kmain(void) {
     /* --- Phase 1: console and CPU --- */
@@ -39,6 +40,7 @@ void kmain(void) {
     memory_init();
     memory_pages_init();
     heap_init();
+    boot_line("[boot] 512 MiB identity map, heap above .COM stacks");
     {
         extern char _end[];
         memory_set_kernel_size((uint64_t)(uintptr_t)_end - 0x100000ULL);
@@ -64,6 +66,7 @@ void kmain(void) {
 
     /* \SYSTEM.INI on drive 0: — see fos/system.ini in the repo. */
     config_init(0);
+    env_init();
     {
         const char *layout = config_get("keyboard", "layout");
         if (layout && layout[0]) {

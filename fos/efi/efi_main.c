@@ -9,13 +9,17 @@
 #include "enter_kernel_bin.h"
 
 #define KERNEL_ADDR   0x100000ULL
-#define KERNEL_MAX    (192u * 512u)
+#ifndef KERNEL_MAX_SECTORS
+#define KERNEL_MAX_SECTORS 256u
+#endif
+#define KERNEL_MAX    ((UINTN)KERNEL_MAX_SECTORS * 512u)
 #define MEM_MAP_ADDR  0x4000ULL
 #define MEM_MAP_MAGIC 0x50414D4Du
 #define MEM_MAP_MAX   32u
 #define PML4_ADDR     0x5000ULL
 #define PDPT_ADDR     0x6000ULL
 #define PD_ADDR       0x7000ULL
+#define IDENTITY_2M_PAGES 256u
 #define GDT_ADDR      0x8000ULL
 #define TRAMPOLINE    0x8100ULL
 
@@ -108,7 +112,7 @@ static void enter_kernel(void) {
 
     pml4[0] = PDPT_ADDR | 0x03;
     pdpt[0] = PD_ADDR | 0x03;
-    for (i = 0; i < 32; i++) {
+    for (i = 0; i < IDENTITY_2M_PAGES; i++) {
         pd[i] = ((UINT64)i << 21) | 0x83;
     }
 

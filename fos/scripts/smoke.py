@@ -19,17 +19,28 @@ CASES = [
     ("ver", 10, None, None, "FOS"),
     ("dir", 10, None, None, "SYSTEM.INI"),
     ("dir FOS", 10, None, None, "PLAY.COM"),
-    ("mem", 15, None, None, "stack top"),
+    ("mem", 15, None, None, "image max"),
     ("mem test", 30, None, None, "RESULT: PASS"),
     ("mem leak", 15, None, None, None),
     ("mem", 15, None, None, "0 B across 0 block(s)"),  # leak reclaimed on exit
     ("date", 10, None, None, None),
     ("echo hello", 10, None, None, "hello"),
+    ("echo $PATH", 10, None, None, "\\FOS"),
+    ("echo $(1+5)", 10, None, None, "6"),
+    ("echo $((2*3+1))", 10, None, None, "7"),
+    ("env", 10, None, None, "PATH="),
+    ("if exist SYSTEM.INI then echo IFYES", 10, None, None, "\nIFYES"),
+    ("if exist nosuch.fil then echo IFYES else echo NOPEZ", 10, None, None, "\nNOPEZ"),
+    ("for i = 1 to 3 do echo NUM$i", 10, None, None, "NUM3"),
+    ("while false do echo LOOPED", 10, None, None, None),
+    ("false", 10, None, None, None),
+    ("if errorlevel 1 then echo ELFAIL else echo ELOK", 10, None, None, "\nELFAIL"),
+    ("demo", 15, None, None, "Hello from DEMO.BAT"),
+    ("call demo.bat world", 15, None, None, "arg1=world"),
     ("beep 440 100", 15, None, None, None),
     ("edit README.TXT", 20, 3.0, "\x18", None),  # Ctrl+X exits
-    ("play DEMO.WAV", 25, None, None, "DEMO.WAV"),
-    ("play DEMO.MP3", 25, None, None, "DEMO.MP3"),
-    ("play BABY.MP3", 25, 4.0, "q", "BABY.MP3"),
+    ("play DEMO.WAV", 25, 2.0, "q", "DEMO.WAV"),
+    ("play DEMO.MP3", 25, 2.0, "q", "DEMO.MP3"),
     ("dir FOS", 10, None, None, "PLAY.COM"),  # shell alive after the audio runs
 ]
 

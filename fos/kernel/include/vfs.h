@@ -27,6 +27,7 @@ int  vfs_write_file(int drive, const char *path, const void *data, size_t len);
 int  vfs_mkdir(int drive, const char *path);
 int  vfs_delete(int drive, const char *path);
 int  vfs_copy(int drive, const char *src, const char *dst);
+int  vfs_move(int drive, const char *src, const char *dst);
 int  vfs_is_dir(int drive, const char *path);
 
 #define VFS_DIR_MAX 128

@@ -29,7 +29,10 @@ static uint32_t cluster_lba(const exfat_vol_t *vol, uint32_t cluster) {
     return vol->cluster_begin_lba + (cluster - 2) * vol->sectors_per_cluster;
 }
 
-static uint32_t exfat_next_cluster(const exfat_vol_t *vol, uint32_t cluster) {
+static uint32_t exfat_next_cluster(const exfat_vol_t *vol, uint32_t cluster, int no_fat_chain) {
+    if (no_fat_chain) {
+        return cluster + 1;
+    }
     uint32_t fat_offset = cluster * 4;
     uint32_t fat_sector = vol->fat_begin_lba + fat_offset / vol->bytes_per_sector;
     uint32_t ent_off = fat_offset % vol->bytes_per_sector;
@@ -74,8 +77,9 @@ void exfat_unmount(exfat_vol_t *vol) {
     (void)vol;
 }
 
-static void utf16le_to_ascii(const uint16_t *src, int chars, char *dst, size_t sz) {
-    size_t n = 0;
+/* Append UTF-16LE code units as ASCII into dst (already NUL-terminated). */
+static void utf16le_append_ascii(const uint16_t *src, int chars, char *dst, size_t sz) {
+    size_t n = strlen(dst);
     for (int i = 0; i < chars && n + 1 < sz; i++) {
         uint16_t ch = src[i];
         if (ch < 128) {
@@ -118,7 +122,8 @@ static int walk_dir_cluster(exfat_vol_t *vol, uint32_t cluster, exfat_dir_cb cb,
                             got |= 1;
                         } else if (se[0] == 0xC1) {
                             uint8_t nchars = se[1];
-                            utf16le_to_ascii((const uint16_t *)(se + 2), nchars, name, sizeof(name));
+                            utf16le_append_ascii((const uint16_t *)(se + 2), nchars,
+                                                 name, sizeof(name));
                             got |= 2;
                         }
                         i += 32;
@@ -134,7 +139,7 @@ static int walk_dir_cluster(exfat_vol_t *vol, uint32_t cluster, exfat_dir_cb cb,
                 i += 32;
             }
         }
-        cluster = exfat_next_cluster(vol, cluster);
+        cluster = exfat_next_cluster(vol, cluster, 0);
     }
     return 0;
 }
@@ -148,7 +153,8 @@ static int match_component(const char *name, const char *want) {
 }
 
 static int find_in_dir(exfat_vol_t *vol, uint32_t cluster, const char *comp,
-                       uint32_t *out_cluster, uint8_t *out_attr, uint64_t *out_size) {
+                       uint32_t *out_cluster, uint8_t *out_attr, uint64_t *out_size,
+                       int *out_no_fat_chain) {
     while (cluster >= 2 && cluster < 0xFFFFFFF8) {
         uint32_t lba = cluster_lba(vol, cluster);
         for (uint32_t s = 0; s < vol->sectors_per_cluster; s++) {
@@ -169,16 +175,20 @@ static int find_in_dir(exfat_vol_t *vol, uint32_t cluster, const char *comp,
                     name[0] = 0;
                     uint64_t size = 0;
                     uint32_t first_cluster = 0;
+                    int no_fat = 0;
                     int got = 0;
                     for (int sec = 0; sec < secondary && i + 32 <= 512; sec++) {
                         uint8_t *se = sector_buf + i;
                         if (se[0] == 0xC0) {
+                            /* GeneralSecondaryFlags bit 1 = NoFatChain */
+                            no_fat = (se[1] & 0x02) ? 1 : 0;
                             size = rd64(se + 8);
                             first_cluster = rd32(se + 20);
                             got |= 1;
                         } else if (se[0] == 0xC1) {
                             uint8_t nchars = se[1];
-                            utf16le_to_ascii((const uint16_t *)(se + 2), nchars, name, sizeof(name));
+                            utf16le_append_ascii((const uint16_t *)(se + 2), nchars,
+                                                 name, sizeof(name));
                             got |= 2;
                         }
                         i += 32;
@@ -187,6 +197,9 @@ static int find_in_dir(exfat_vol_t *vol, uint32_t cluster, const char *comp,
                         *out_cluster = first_cluster;
                         *out_attr = (uint8_t)attrs;
                         *out_size = size;
+                        if (out_no_fat_chain) {
+                            *out_no_fat_chain = no_fat;
+                        }
                         return 0;
                     }
                     continue;
@@ -194,16 +207,22 @@ static int find_in_dir(exfat_vol_t *vol, uint32_t cluster, const char *comp,
                 i += 32;
             }
         }
-        cluster = exfat_next_cluster(vol, cluster);
+        cluster = exfat_next_cluster(vol, cluster, 0);
     }
     return -1;
 }
 
 int exfat_find_path(exfat_vol_t *vol, uint32_t start_cluster, const char *path,
-                    uint32_t *out_cluster, int *is_dir, uint64_t *file_size) {
+                    uint32_t *out_cluster, int *is_dir, uint64_t *file_size,
+                    int *no_fat_chain) {
     uint32_t cluster = start_cluster;
     char comp[256];
     const char *p = path;
+    int last_no_fat = 0;
+
+    if (no_fat_chain) {
+        *no_fat_chain = 0;
+    }
 
     while (*p == '\\') {
         p++;
@@ -235,15 +254,20 @@ int exfat_find_path(exfat_vol_t *vol, uint32_t start_cluster, const char *path,
         uint32_t next = 0;
         uint8_t attr = 0;
         uint64_t size = 0;
-        if (find_in_dir(vol, cluster, comp, &next, &attr, &size) != 0) {
+        int no_fat = 0;
+        if (find_in_dir(vol, cluster, comp, &next, &attr, &size, &no_fat) != 0) {
             return -1;
         }
 
         cluster = next;
+        last_no_fat = no_fat;
         if (*p == 0) {
             *out_cluster = cluster;
             *is_dir = (attr & EXFAT_ATTR_DIR) != 0;
             *file_size = size;
+            if (no_fat_chain) {
+                *no_fat_chain = last_no_fat;
+            }
             return 0;
         }
         if (!(attr & EXFAT_ATTR_DIR)) {
@@ -253,7 +277,7 @@ int exfat_find_path(exfat_vol_t *vol, uint32_t start_cluster, const char *path,
 }
 
 int exfat_read_file(exfat_vol_t *vol, uint32_t cluster, uint64_t offset,
-                    void *buf, uint32_t size, uint64_t file_size) {
+                    void *buf, uint32_t size, uint64_t file_size, int no_fat_chain) {
     if (offset >= file_size) {
         return 0;
     }
@@ -266,7 +290,7 @@ int exfat_read_file(exfat_vol_t *vol, uint32_t cluster, uint64_t offset,
     uint32_t skip_bytes = (uint32_t)(offset % cluster_size);
 
     while (skip_clusters > 0) {
-        cluster = exfat_next_cluster(vol, cluster);
+        cluster = exfat_next_cluster(vol, cluster, no_fat_chain);
         if (cluster >= 0xFFFFFFF8) {
             return -1;
         }
@@ -291,7 +315,7 @@ int exfat_read_file(exfat_vol_t *vol, uint32_t cluster, uint64_t offset,
         remaining -= avail;
         skip_bytes += avail;
         if (skip_bytes >= cluster_size) {
-            cluster = exfat_next_cluster(vol, cluster);
+            cluster = exfat_next_cluster(vol, cluster, no_fat_chain);
         }
     }
 
@@ -307,7 +331,7 @@ int exfat_read_file(exfat_vol_t *vol, uint32_t cluster, uint64_t offset,
             remaining -= n;
         }
         if (remaining > 0) {
-            cluster = exfat_next_cluster(vol, cluster);
+            cluster = exfat_next_cluster(vol, cluster, no_fat_chain);
             if (cluster >= 0xFFFFFFF8) {
                 break;
             }

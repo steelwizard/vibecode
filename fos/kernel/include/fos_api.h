@@ -153,9 +153,30 @@ typedef struct {
     void (*mem_free)(void *ptr);
     void *(*mem_realloc)(void *ptr, size_t bytes);
     int (*get_heap_info)(fos_heap_info_t *out);
+    int (*delete_file)(const char *path);
+    int (*copy_file)(const char *src, const char *dst);
+    int (*move_file)(const char *src, const char *dst);
+    /* Modal error dialog (blue box on red, TUI OK). Enter dismisses. */
+    void (*show_error)(const char *msg);
+    void (*set_cursor_visible)(int visible);
+    int (*set_drive)(int drive);
+    int (*drive_count)(void);
+    /* Environment. Names are case-sensitive ($PATH, $PWD, $HOME, $DRIVE). */
+    const char *(*getenv)(const char *name);
+    int (*setenv)(const char *name, const char *value);
 } fos_api_t;
 
 void fos_api_init(void);
 void fos_api_set_cmdline(const char *args);
 void fos_api_set_pipe(const char *data, size_t len);
 void fos_api_clear_pipe(void);
+
+/* Snapshot/restore cmdline + pipe around nested exec_run. */
+typedef struct {
+    char   cmdline[256];
+    char   pipe_in[4096];
+    size_t pipe_in_len;
+} fos_api_io_t;
+
+void fos_api_save_io(fos_api_io_t *out);
+void fos_api_restore_io(const fos_api_io_t *in);

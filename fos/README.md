@@ -23,11 +23,13 @@ qemu-system-x86_64 \
   -drive format=raw,file=data.img,index=1,media=disk \
   -device bochs-display \
   -audiodev pipewire,id=snd0 -device sb16,audiodev=snd0 \
-  -m 128M \
+  -m 512M \
   -serial stdio
 ```
 
 Type in the terminal that launches QEMU — input goes to **COM1 serial** (`-serial stdio`), not PS/2. The kernel reads both serial and PS/2.
+
+> **Real USB boot:** the BIOS bootloader can load the kernel from a USB stick (stage1 now uses LBA), but once the kernel starts it only talks to **legacy ATA PIO**. There is no USB mass-storage or AHCI driver, so `0:` will not be the stick after handoff. Use `make run` / IDE disks for now.
 
 `make run-uefi` is the same plus `-bios /usr/share/ovmf/OVMF.fd` (override with `OVMF=/path/to/OVMF.fd`) and `-net none` so OVMF skips PXE. The disk is dual-boot: SeaBIOS uses the MBR, OVMF uses `\EFI\BOOT\BOOTX64.EFI`.
 
@@ -39,9 +41,10 @@ Audio backend defaults to **PipeWire** when that session socket exists, otherwis
 
 - **Drive letters** — `0:\`, `1:\`, … (boot disk is always `0:`)
 - **Backslash paths** — `0:\folder\file.txt`
-- **FAT32** on drive 0 — read/write, directories, `mkdir`, `del`, `copy`
+- **FAT32** on drive 0 — read/write, directories, `mkdir`, `del`, `copy`, `move`
 - **exFAT** on drive 1 — read-only listing and file read
 - **FOSCOM** — `.COM` programs call a fixed kernel API at `0xFF0000`
+- **Heap** — `mem_alloc` / `mem_free` / `mem_realloc`; leftovers are reclaimed when the program exits
 - **Console** — scrollback, Page Up/Down, pipes (`|`), redirect (`>`)
 - **Video** — VGA text or framebuffer modes set in `SYSTEM.INI` (kernel-side, after mount)
 - **Keyboard layouts** — German QWERTZ or US QWERTY via config
@@ -55,14 +58,16 @@ Audio backend defaults to **PipeWire** when that session socket exists, otherwis
 | `\FOS\ECHO.COM` | Sample FOSCOM program |
 | `\FOS\EDIT.COM` | Text editor — Ctrl+S save, Ctrl+X exit, arrows, Delete |
 | `\FOS\LESS.COM` | File pager — Space/b page, q quit (`more` alias in shell) |
-| `\FOS\FM.COM` | File manager browser |
+| `\FOS\FM.COM` | File manager — boxed TUI, Enter runs `.COM`, `0-3` drive, `c`/`r` copy/move, `d` delete |
 | `\FOS\DATE.COM` | Show or set the CMOS RTC (`date YYYY-MM-DD HH:MM:SS`) |
-| `\FOS\MEM.COM` | RAM map and usage |
+| `\FOS\MEM.COM` | RAM map, heap stats (`mem test` stress-tests the allocator) |
 | `\FOS\BEEP.COM` | Tone (`beep`, `beep 880 300`) |
 | `\FOS\PLAY.COM` | WAV/MP3 player TUI (`play DEMO.WAV`, q stops) |
 | `README.TXT` | Full project README (copy of `README.md` from the repo) |
 
-Programs under `\FOS` are found via `[shell] path=` in `SYSTEM.INI`.
+Programs under `\FOS` are found via `$PATH` (seeded from `[shell] path=` in `SYSTEM.INI`).
+
+A `.COM` can be 32 MiB of code+data+BSS at `0x300000`, with an 8 MiB stack. Larger working sets go on the heap (`api->mem_alloc`), which is the rest of identity-mapped RAM (512 MiB map, `make run` gives the VM 512 MiB). The loader streams the file straight to `load_addr`, so the old 128 KiB kernel bounce buffer is gone.
 
 ## Shell commands
 
@@ -75,7 +80,8 @@ Programs under `\FOS` are found via `[shell] path=` in `SYSTEM.INI`.
 | `cd <path>` | Change directory on current drive |
 | `mkdir` / `md <path>` | Create directory (FAT32 only) |
 | `del` / `erase <path>` | Delete file or empty folder (FAT32, confirms Y/N) |
-| `copy <src> <dst>` | Copy file (FAT32, max 64 KiB) |
+| `copy <src> <dst>` | Copy file (FAT32) — progress window |
+| `move` / `ren <src> <dst>` | Move or rename file (FAT32) — same window |
 | `type <path>` | Print file (or piped input) |
 | `drives` / `df` | List physical disks and mounted volumes |
 | `edit [file]` | Run the text editor |
@@ -84,14 +90,47 @@ Programs under `\FOS` are found via `[shell] path=` in `SYSTEM.INI`.
 | `date [stamp]` | RTC via `date.com` |
 | `mem` | RAM map via `mem.com` |
 | `beep [hz [ms]]` | SB16 tone via `beep.com` |
-| `play <file>` | WAV/MP3 player (`play BABY.MP3`; q quits) |
+| `play <file>` | WAV/MP3 player (`play DEMO.MP3`; q quits) |
 | `echo …` / `*.com` | Run a FOSCOM program |
+| `demo` / `*.bat` | Run a `.BAT` script (`call name` also works) |
+| `NAME=value` | Set `$NAME` (`export NAME=value` is the same) |
+| `env` / `set` | List environment variables |
+| `unset NAME` | Remove a variable |
+| `echo $PATH` | Expand `$NAME` or `${NAME}` (`'` quotes disable it) |
+| `echo $(1+5)` | Integer math (`+ - * / %`, parentheses); `$((2*3))` works too |
 | `0:` / `1:` | Switch current drive |
 | `cmd1 \| cmd2` | Pipe stdout to stdin |
 | `cmd > file` | Redirect stdout to a file |
 | `reboot` | Reboot the machine |
+| `if` / `for` / `while` | Conditionals and loops (`end` closes a block) |
+| `true` / `false` | Set `$ERRORLEVEL` to 0 or 1 |
+| `break` / `continue` | Leave or restart the innermost `for`/`while` |
 
 Prompt shows the current path, e.g. `0:\>` or `0:\docs>`.
+
+### Scripts (`if` / `for` / `while` / `.BAT`)
+
+Keywords are case-insensitive. `then` and `do` are optional. Close a multi-line block with `end` (also `endif`, `done`, or `wend`). The prompt becomes `> ` while a block is open. Ctrl+C cancels it.
+
+`.BAT` files are the same language, one command per line. `$PATH` is searched the same way as for `.COM` (a `.COM` wins if both exist). `demo`, `demo.bat`, and `call demo.bat [args]` all run `FOS\DEMO.BAT`. Leading `@` is ignored. `@echo off` / `echo on` do nothing. Arguments are `%0`…`%9` and `%*`; `%%` is a literal `%`; `%PATH%` is the same as `$PATH`. Nesting is allowed (`call` another `.BAT`, up to 4 deep). Cap is 64 lines per script (or typed block) and 10000 loop iterations.
+
+```
+if exist README.TXT then echo yes else echo no
+if exist README.TXT
+  echo yes
+else
+  echo no
+end
+
+for i in a b c do echo $i
+for i = 1 to 3
+  echo $i
+end
+
+while false do echo never
+```
+
+Conditions: `exist PATH`, `not exist PATH`, `errorlevel N` (`$ERRORLEVEL` ≥ N), `true` / `false`, and `A == B` (or `A = B`). `$ERRORLEVEL` is 0 after a successful command and 1 after a failure. `;` and `&` separate commands on one line. Nested `if`/`for`/`while` work.
 
 ## Configuration (`SYSTEM.INI`)
 
@@ -133,6 +172,7 @@ Notes:
 - Without bochs-display, FOS prints a warning and stays on VGA text.
 - Early boot messages appear on VGA text (or serial); after the mode switch the screen is cleared and output continues on the framebuffer.
 - Full-screen apps (`edit`, `fm`, `less`, `play`) read the console size at startup via `get_term_size` and lay out to fill whatever mode is active.
+- Errors (failed commands, missing files, and so on) open a modal dialog: red screen, blue box with a selected `[ OK ]` button, and `Enter to return`. Enter or Space dismisses it and restores the previous screen. Pipes and redirects still get the message as a plain line.
 - The framebuffer console draws text with the CP437 8×16 VGA font in `kernel/font8x16.c`, generated by `scripts/genfont.py` from a VGA BIOS ROM so it matches text mode exactly. `make check-font` validates it.
 - `python3 scripts/shot.py out.ppm --wait 16 [--keys l,e,s,s,ret]` boots the image headless and screendumps it, which is the quickest way to check a mode without a display.
 
@@ -157,9 +197,9 @@ mode=text
 
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
-| `path` | colon-separated dirs | `\FOS` | Directories searched for `.COM` programs |
+| `path` | colon-separated dirs | `\FOS` | Initial `$PATH` for `.COM` lookup |
 
-PATH entries are absolute directories on the **current drive** (no drive letters). Example: `path=\FOS:\BIN`. The shell checks the current directory first, then each PATH entry.
+`$PATH` is a real environment variable (`echo $PATH`, `PATH=\FOS:\BIN`). The `[shell] path=` key only seeds it at boot. Entries are absolute directories on the **current drive** (no drive letters). The shell checks the current directory first, then each PATH entry. Other variables: `$PWD`, `$HOME` (`\`), `$DRIVE`, `$ERRORLEVEL`.
 
 ### `[sound]`
 
@@ -187,7 +227,7 @@ boot.img (drive 0, 64 MiB)
   LBA 2048+   FAT32 ESP (type 0xEF, ≥65525 clusters so OVMF accepts it):
               KERNEL.BIN, \EFI\BOOT\BOOTX64.EFI, SHELL.COM,
               \FOS\*.COM (ECHO, EDIT, LESS, FM, DATE, MEM, BEEP, PLAY),
-              DEMO.WAV, DEMO.MP3 (if ffmpeg at build), BABY.MP3 (if present),
+              DEMO.WAV, DEMO.MP3 (if ffmpeg at build),
               README.TXT, SYSTEM.INI, …
 
 data.img (drive 1)

@@ -88,7 +88,7 @@ def main():
         "-drive", f"format=raw,file={boot},index=0,media=disk",
         "-drive", f"format=raw,file={data},index=1,media=disk",
         "-device", f"bochs-display,vgamem={args.vgamem}",
-        "-m", "128M",
+        "-m", "512M",
         "-display", "none",
         "-serial", f"file:{serial}",
         "-monitor", f"unix:{mon},server,nowait",

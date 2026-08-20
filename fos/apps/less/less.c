@@ -97,7 +97,10 @@ static int my_strcasecmp(const char *a, const char *b) {
     return (unsigned char)*a - (unsigned char)*b;
 }
 
-static void normalize_path(char *path, const char *arg) {
+static void normalize_path(fos_api_t *api, char *path, const char *arg) {
+    char cwd[256];
+    size_t n;
+
     if (!arg || !arg[0]) {
         path[0] = 0;
         return;
@@ -109,9 +112,17 @@ static void normalize_path(char *path, const char *arg) {
         my_strcpy(path, arg);
         return;
     }
-    path[0] = '\\';
-    path[1] = 0;
-    size_t n = 1;
+    cwd[0] = '\\';
+    cwd[1] = 0;
+    if (api->get_cwd) {
+        api->get_cwd(cwd, sizeof(cwd));
+    }
+    my_strcpy(path, cwd);
+    n = my_strlen(path);
+    if (n > 0 && path[n - 1] != '\\' && n + 1 < 256) {
+        path[n++] = '\\';
+        path[n] = 0;
+    }
     for (const char *p = arg; *p && n + 1 < 256; p++) {
         path[n++] = *p;
     }
@@ -159,7 +170,7 @@ static int ends_with_ci(const char *s, const char *suffix) {
 
 static int detect_md(const char *path) {
     if (!path || !path[0]) {
-        return 1;
+        return 0; /* piped text: plain unless the caller named a .md file */
     }
     if (ends_with_ci(path, ".MD") || ends_with_ci(path, ".MARKDOWN")) {
         return 1;
@@ -167,7 +178,7 @@ static int detect_md(const char *path) {
     if (ends_with_ci(path, "README.TXT")) {
         return 1;
     }
-    return 1;
+    return 0;
 }
 
 static int at_end(void) {
@@ -649,7 +660,7 @@ static int load_content(fos_api_t *api) {
         return 0;
     }
 
-    normalize_path(path, api->cmdline);
+    normalize_path(api, path, api->cmdline);
     if (path[0] == 0) {
         return -1;
     }
@@ -671,7 +682,11 @@ void com_main(void) {
     init_geometry(api);
 
     if (load_content(api) != 0) {
-        api->write_line("LESS: file required (or pipe input)");
+        if (api->show_error) {
+            api->show_error("LESS: file required (or pipe input)");
+        } else {
+            api->write_line("LESS: file required (or pipe input)");
+        }
         return;
     }
 

@@ -88,6 +88,14 @@ int fat32_mount(fat32_vol_t *vol, int block_index, uint32_t part_lba) {
     vol->fat_begin_lba = part_lba + vol->reserved_sectors;
     vol->data_begin_lba = vol->fat_begin_lba + vol->num_fats * vol->fat_size_sectors;
     vol->total_clusters = vol->fat_size_sectors * (vol->bytes_per_sector / 4);
+    {
+        uint16_t fsinfo = rd16(sector_buf + 48);
+        if (fsinfo != 0 && fsinfo != 0xFFFF && fsinfo < vol->reserved_sectors) {
+            vol->fsinfo_lba = part_lba + fsinfo;
+        } else {
+            vol->fsinfo_lba = 0;
+        }
+    }
     return 0;
 }
 
@@ -97,10 +105,10 @@ void fat32_unmount(fat32_vol_t *vol) {
 
 /* Read FSInfo sector for free cluster count (returns 0 if unknown). */
 uint64_t fat32_free_bytes(const fat32_vol_t *vol) {
-    if (vol->reserved_sectors < 2) {
+    if (vol->fsinfo_lba == 0) {
         return 0;
     }
-    if (read_sector_vol(vol, vol->lba_start + 1) != 0) {
+    if (read_sector_vol(vol, vol->fsinfo_lba) != 0) {
         return 0;
     }
     if (rd32(sector_buf + 0) != 0x41615252) {
@@ -111,6 +119,37 @@ uint64_t fat32_free_bytes(const fat32_vol_t *vol) {
         return 0;
     }
     return (uint64_t)free_count * vol->sectors_per_cluster * vol->bytes_per_sector;
+}
+
+static void fat32_fsinfo_adjust(fat32_vol_t *vol, int delta) {
+    uint32_t free_count;
+    uint32_t next_free;
+
+    if (!vol || vol->fsinfo_lba == 0 || delta == 0) {
+        return;
+    }
+    if (read_sector_vol(vol, vol->fsinfo_lba) != 0) {
+        return;
+    }
+    if (rd32(sector_buf + 0) != 0x41615252 || rd32(sector_buf + 0x1E4) != 0x61417272) {
+        return;
+    }
+    free_count = rd32(sector_buf + 0x1E8);
+    next_free = rd32(sector_buf + 0x1EC);
+    if (free_count != 0xFFFFFFFF) {
+        if (delta < 0 && free_count < (uint32_t)(-delta)) {
+            free_count = 0;
+        } else {
+            free_count = (uint32_t)((int32_t)free_count + delta);
+        }
+        wr32(sector_buf + 0x1E8, free_count);
+    }
+    if (delta < 0 && next_free != 0xFFFFFFFF) {
+        /* hint is stale; leave it — Windows will rescan */
+        (void)next_free;
+    }
+    wr32(sector_buf + 0x1FC, 0xAA550000);
+    write_sector_vol(vol, vol->fsinfo_lba);
 }
 
 static void format_83_name(const uint8_t *raw, char *out, size_t sz) {
@@ -390,6 +429,7 @@ static uint32_t fat32_alloc_cluster(fat32_vol_t *vol) {
     for (uint32_t c = 2; c < vol->total_clusters + 2; c++) {
         if (fat32_next_cluster(vol, c) == 0) {
             fat32_set_cluster(vol, c, 0x0FFFFFFF);
+            fat32_fsinfo_adjust(vol, -1);
             return c;
         }
     }
@@ -397,10 +437,15 @@ static uint32_t fat32_alloc_cluster(fat32_vol_t *vol) {
 }
 
 static void fat32_free_chain(fat32_vol_t *vol, uint32_t cluster) {
+    int freed = 0;
     while (cluster >= 2 && cluster < 0x0FFFFFF8) {
         uint32_t next = fat32_next_cluster(vol, cluster);
         fat32_set_cluster(vol, cluster, 0);
         cluster = next;
+        freed++;
+    }
+    if (freed) {
+        fat32_fsinfo_adjust(vol, freed);
     }
 }
 
@@ -493,8 +538,11 @@ static int fat32_write_cluster_chain(fat32_vol_t *vol, uint32_t cluster,
 
 static int fat32_find_dir_slot(fat32_vol_t *vol, uint32_t dir_cluster,
                                uint32_t *out_lba, int *out_off) {
+    uint32_t last = dir_cluster;
+
     while (dir_cluster >= 2 && dir_cluster < 0x0FFFFFF8) {
         uint32_t lba = cluster_lba(vol, dir_cluster);
+        last = dir_cluster;
         for (uint32_t s = 0; s < vol->sectors_per_cluster; s++) {
             if (read_sector_vol(vol, lba + s) != 0) {
                 return -1;
@@ -510,7 +558,28 @@ static int fat32_find_dir_slot(fat32_vol_t *vol, uint32_t dir_cluster,
         }
         dir_cluster = fat32_next_cluster(vol, dir_cluster);
     }
-    return -1;
+
+    /* Directory full — grow by one cluster and use the first slot. */
+    {
+        uint32_t extra = fat32_alloc_cluster(vol);
+        uint32_t lba;
+        uint32_t s;
+
+        if (extra < 2 || last < 2) {
+            return -1;
+        }
+        fat32_set_cluster(vol, last, extra);
+        lba = cluster_lba(vol, extra);
+        memset(sector_buf, 0, 512);
+        for (s = 0; s < vol->sectors_per_cluster; s++) {
+            if (write_sector_vol(vol, lba + s) != 0) {
+                return -1;
+            }
+        }
+        *out_lba = lba;
+        *out_off = 0;
+        return 0;
+    }
 }
 
 int fat32_write_file(fat32_vol_t *vol, uint32_t dir_cluster, const char *name,
@@ -776,6 +845,8 @@ int fat32_delete(fat32_vol_t *vol, uint32_t dir_cluster, const char *name) {
 
                 uint8_t attr = e[11];
                 uint32_t cl = ((uint32_t)rd16(e + 20) << 16) | rd16(e + 26);
+                uint32_t ent_lba = lba + s;
+                int ent_off = i;
 
                 if (attr & FAT_ATTR_DIR) {
                     if (!fat32_dir_is_empty(vol, cl)) {
@@ -786,8 +857,14 @@ int fat32_delete(fat32_vol_t *vol, uint32_t dir_cluster, const char *name) {
                     fat32_free_chain(vol, cl);
                 }
 
-                e[0] = 0xE5;
-                return write_sector_vol(vol, lba + s);
+                /* free_chain / dir_is_empty reuse sector_buf (including the
+                 * FSInfo sector, which starts with "RRaA"). Reload before
+                 * marking the slot deleted. */
+                if (read_sector_vol(vol, ent_lba) != 0) {
+                    return -1;
+                }
+                sector_buf[ent_off] = 0xE5;
+                return write_sector_vol(vol, ent_lba);
             }
         }
         scan = fat32_next_cluster(vol, scan);

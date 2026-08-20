@@ -6,7 +6,7 @@ between chunks, which is what glitching sounds like.
 Fidelity: DEMO.MP3 is a synthesized 440 Hz sine, so its captured spectrum
 should peak at 440 Hz with negligible harmonics.
 
-    python3 scripts/audio_check.py            # DEMO.MP3 (tone) + BABY.MP3
+    python3 scripts/audio_check.py            # DEMO.MP3 (tone)
     python3 scripts/audio_check.py FILE.MP3 10
 """
 
@@ -126,7 +126,7 @@ def main():
         jobs = [(sys.argv[1], float(sys.argv[2]) if len(sys.argv) > 2 else 10.0,
                  False)]
     else:
-        jobs = [("DEMO.MP3", 5.0, True), ("BABY.MP3", 10.0, False)]
+        jobs = [("DEMO.MP3", 5.0, True)]
 
     image = image_copy()
     ok = True

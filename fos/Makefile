@@ -26,10 +26,11 @@ DATA_IMG    = data.img
 
 BOOT_SECTORS = 9
 KERNEL_LBA   = 9
+KERNEL_MAX_SECTORS = 256
 PART_START   = 2048
 
 COM_LOAD     = 0x300000
-COM_STACK    = 0x800000
+COM_STACK    = 0x4300000
 
 CC      = gcc
 LD      = ld
@@ -43,6 +44,10 @@ KERNEL_CFLAGS = -m64 -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
                 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mcmodel=kernel \
                 -Wall -Wextra -O2 -I kernel/include
 
+# fos_api.h is the .COM ABI. Without this, a header-only change leaves stale
+# app objects that read NULL function pointers (mem / edit / play).
+KERNEL_HDRS = $(wildcard kernel/include/*.h)
+
 KERNEL_ASM = kernel/entry.asm kernel/irqvec.asm kernel/comcall.asm
 KERNEL_C   = kernel/kernel.c kernel/shell.c kernel/vfs.c kernel/block.c \
              kernel/partition.c kernel/fat32.c kernel/exfat.c \
@@ -50,7 +55,7 @@ KERNEL_C   = kernel/kernel.c kernel/shell.c kernel/vfs.c kernel/block.c \
              kernel/cpu.c kernel/boot_report.c kernel/exec.c kernel/fos_api.c \
              kernel/config.c kernel/video.c kernel/font8x16.c \
              kernel/timer.c kernel/rtc.c kernel/memory.c kernel/heap.c \
-             kernel/irq.c kernel/sb16.c
+             kernel/irq.c kernel/sb16.c kernel/env.c
 
 SHELL_ASM  = shell/entry.asm
 SHELL_C    = kernel/shell.c kernel/vfs.c kernel/block.c \
@@ -107,7 +112,7 @@ VGAMEM ?= 32M
 # Where exec.c loads .COM images; the shell's static data must stay below it.
 COM_LOAD_ADDR = 3145728
 
-.PHONY: all run run-uefi clean check-font
+.PHONY: all run run-uefi clean check-font qemu-clean
 
 all: $(IMG) $(DATA_IMG)
 
@@ -125,7 +130,7 @@ $(BOOT_BIN): boot_stage1.asm boot_stage2.asm boot.inc
 kernel/%.o: kernel/%.asm
 	$(NASM) -f elf64 $< -o $@
 
-kernel/%.o: kernel/%.c
+kernel/%.o: kernel/%.c $(KERNEL_HDRS)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 shell/%.o: shell/%.asm
@@ -134,49 +139,49 @@ shell/%.o: shell/%.asm
 apps/echo/%.o: apps/echo/%.asm
 	$(NASM) -f elf64 $< -o $@
 
-apps/echo/%.o: apps/echo/%.c
+apps/echo/%.o: apps/echo/%.c $(KERNEL_HDRS)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 apps/edit/%.o: apps/edit/%.asm
 	$(NASM) -f elf64 $< -o $@
 
-apps/edit/%.o: apps/edit/%.c
+apps/edit/%.o: apps/edit/%.c $(KERNEL_HDRS)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 apps/fm/%.o: apps/fm/%.asm
 	$(NASM) -f elf64 $< -o $@
 
-apps/fm/%.o: apps/fm/%.c
+apps/fm/%.o: apps/fm/%.c $(KERNEL_HDRS)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 apps/less/%.o: apps/less/%.asm
 	$(NASM) -f elf64 $< -o $@
 
-apps/less/%.o: apps/less/%.c
+apps/less/%.o: apps/less/%.c $(KERNEL_HDRS)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 apps/date/%.o: apps/date/%.asm
 	$(NASM) -f elf64 $< -o $@
 
-apps/date/%.o: apps/date/%.c
+apps/date/%.o: apps/date/%.c $(KERNEL_HDRS)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 apps/mem/%.o: apps/mem/%.asm
 	$(NASM) -f elf64 $< -o $@
 
-apps/mem/%.o: apps/mem/%.c
+apps/mem/%.o: apps/mem/%.c $(KERNEL_HDRS)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 apps/beep/%.o: apps/beep/%.asm
 	$(NASM) -f elf64 $< -o $@
 
-apps/beep/%.o: apps/beep/%.c
+apps/beep/%.o: apps/beep/%.c $(KERNEL_HDRS)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 apps/play/%.o: apps/play/%.asm
 	$(NASM) -f elf64 $< -o $@
 
-apps/play/play.o: apps/play/play.c apps/play/mp3dec_fos.h
+apps/play/play.o: apps/play/play.c apps/play/mp3dec_fos.h $(KERNEL_HDRS)
 	$(CC) $(KERNEL_CFLAGS) -I apps/play -c $< -o $@
 
 apps/play/minimp3_impl.o: apps/play/minimp3_impl.c apps/play/minimp3.h apps/play/mp3dec_fos.h
@@ -189,15 +194,22 @@ $(KERNEL_ELF): $(KERNEL_OBJ) kernel/linker.ld
 
 $(KERNEL_BIN): $(KERNEL_ELF)
 	$(OBJCOPY) -O binary $< $@
+	@sz=$$(wc -c < $@); max=$$(( $(KERNEL_MAX_SECTORS) * 512 )); \
+	 if [ "$$sz" -gt "$$max" ]; then \
+	   echo "ERROR: $@ is $$sz bytes — loaders only read $$max (KERNEL_MAX_SECTORS=$(KERNEL_MAX_SECTORS))."; \
+	   echo "       Raise KERNEL_MAX_SECTORS in boot.inc, Makefile, and the UEFI -D together."; \
+	   exit 1; \
+	 fi; \
+	 echo "kernel.bin $$sz / $$max bytes ($$(( max - sz )) free)"
 
 SHELL_ELF = shell/shell.elf
 
-$(SHELL_ELF): $(SHELL_OBJ) kernel/exec.o kernel/fos_api.o kernel/font8x16.o kernel/timer.o kernel/rtc.o kernel/memory.o kernel/heap.o kernel/sb16.o kernel/config.o kernel/irqvec.o kernel/comcall.o kernel/irq.o shell/linker.ld
+$(SHELL_ELF): $(SHELL_OBJ) kernel/exec.o kernel/fos_api.o kernel/font8x16.o kernel/timer.o kernel/rtc.o kernel/memory.o kernel/heap.o kernel/sb16.o kernel/config.o kernel/env.o kernel/irqvec.o kernel/comcall.o kernel/irq.o shell/linker.ld
 	$(LD) -m elf_x86_64 -T shell/linker.ld -nostdlib -o $@ shell/entry.o \
 		kernel/shell.o kernel/vfs.o kernel/block.o kernel/partition.o \
 		kernel/fat32.o kernel/exfat.o kernel/console.o kernel/keyboard.o \
 		kernel/string.o kernel/boot_report.o kernel/exec.o kernel/fos_api.o \
-		kernel/font8x16.o kernel/timer.o kernel/rtc.o kernel/irqvec.o kernel/comcall.o kernel/irq.o kernel/memory.o kernel/heap.o kernel/sb16.o kernel/config.o
+		kernel/font8x16.o kernel/timer.o kernel/rtc.o kernel/irqvec.o kernel/comcall.o kernel/irq.o kernel/memory.o kernel/heap.o kernel/sb16.o kernel/config.o kernel/env.o
 
 $(SHELL_BIN): $(SHELL_ELF)
 	$(OBJCOPY) -O binary $< $@
@@ -329,14 +341,14 @@ sys.stdout.write("\n};\nstatic const unsigned int enter_kernel_bin_len = %d;\n" 
 	' $< > $@
 
 efi/efi_main.o: efi/efi_main.c efi/efi.h efi/enter_kernel_bin.h
-	$(CC) $(EFI_CFLAGS) -c $< -o $@
+	$(CC) $(EFI_CFLAGS) -DKERNEL_MAX_SECTORS=$(KERNEL_MAX_SECTORS) -c $< -o $@
 
 $(EFI_EFI): efi/efi_main.o efi/efi.ld
 	$(LD) -m i386pep -nostdlib -T efi/efi.ld --subsystem 10 -e efi_main \
 	      --image-base 0x140000000 --disable-auto-import \
 	      -o $@ efi/efi_main.o
 
-$(IMG): $(BOOT_BIN) $(KERNEL_BIN) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(BEEP_COM) $(PLAY_COM) $(EFI_EFI) scripts/mkdisk.sh scripts/fat32_add.py
+$(IMG): $(BOOT_BIN) $(KERNEL_BIN) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(BEEP_COM) $(PLAY_COM) $(EFI_EFI) system.ini demo.bat scripts/mkdisk.sh scripts/fat32_add.py
 	scripts/mkdisk.sh $(IMG) $(BOOT_BIN) $(KERNEL_BIN) $(KERNEL_LBA) $(PART_START) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(EFI_EFI) $(BEEP_COM) $(PLAY_COM)
 
 $(DATA_IMG): scripts/mkdata.sh
@@ -367,7 +379,7 @@ endif
 	        -drive format=raw,file=$(DATA_IMG),index=1,media=disk \
 	        -device bochs-display,vgamem=$(VGAMEM) \
 	        $(QEMU_SB16) \
-	        -m 128M -serial stdio
+	        -m 512M -serial stdio
 
 OVMF ?= $(firstword $(wildcard /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd /usr/share/qemu/OVMF.fd))
 
@@ -383,7 +395,11 @@ endif
 	        -drive format=raw,file=$(DATA_IMG),index=1,media=disk \
 	        -device bochs-display,vgamem=$(VGAMEM) \
 	        $(QEMU_SB16) \
-	        -m 128M -serial stdio -net none
+	        -m 512M -serial stdio -net none
+
+# Kill leftover FOS QEMU guests (smoke/shot often fail to terminate) and /tmp junk.
+qemu-clean:
+	scripts/qemu_cleanup.sh
 
 clean:
 	rm -f $(BOOT_BIN) $(KERNEL_BIN) $(SHELL_BIN) $(ECHO_BIN) $(ECHO_COM) \

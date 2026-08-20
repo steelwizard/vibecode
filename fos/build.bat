@@ -48,4 +48,4 @@ bash scripts/mkdata.sh %DATA%
 echo OK: %IMG% %DATA%
 
 if /i not "%1"=="run" goto :eof
-qemu-system-x86_64 -drive format=raw,file=%IMG%,index=0,media=disk -drive format=raw,file=%DATA%,index=1,media=disk -m 128M -serial stdio -display none
+qemu-system-x86_64 -drive format=raw,file=%IMG%,index=0,media=disk -drive format=raw,file=%DATA%,index=1,media=disk -m 512M -serial stdio -display none

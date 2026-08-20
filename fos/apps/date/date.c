@@ -7,6 +7,14 @@
 
 #include "fos_api.h"
 
+static void date_error(fos_api_t *api, const char *msg) {
+    if (api->show_error) {
+        api->show_error(msg);
+    } else {
+        api->write_line(msg);
+    }
+}
+
 static int is_digit(char c) {
     return c >= '0' && c <= '9';
 }
@@ -156,7 +164,7 @@ void com_main(void) {
     fos_rtc_t t;
 
     if (!api->rtc_read || !api->rtc_write) {
-        api->write_line("DATE: RTC API missing — rebuild the kernel");
+        date_error(api, "DATE: RTC API missing — rebuild the kernel");
         return;
     }
 
@@ -167,13 +175,13 @@ void com_main(void) {
             return;
         }
         if (api->rtc_write(&t) != 0) {
-            api->write_line("DATE: invalid date/time");
+            date_error(api, "DATE: invalid date/time");
             return;
         }
     }
 
     if (api->rtc_read(&t) != 0) {
-        api->write_line("DATE: RTC read failed");
+        date_error(api, "DATE: RTC read failed");
         return;
     }
     print_rtc(api, &t);

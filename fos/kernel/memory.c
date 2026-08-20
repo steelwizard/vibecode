@@ -28,16 +28,13 @@ typedef struct {
 } e820_map_t;
 
 /*
- * Page pool: [POOL_BASE, POOL_LIMIT), minus whatever E820 says is not RAM.
- *
- * Everything the system pins lives below 16 MiB — low memory and the SB16 DMA
- * buffer, the kernel image and its BSS, .COM images, the program stacks, and
- * the API block at 0xFF0000 — so a pool starting at 16 MiB needs no per-region
- * carve-outs. The top is the identity map limit: the bootloader maps 32 × 2 MiB
- * and nothing above that is addressable yet.
+ * Page pool: [MEM_POOL_BASE, MEM_POOL_LIMIT), minus whatever E820 says is
+ * not RAM. That window sits above the kernel, the .COM image, and the
+ * program stacks, and below the framebuffer virtual address, so the
+ * bitmap needs no extra carve-outs.
  */
-#define POOL_BASE      0x1000000ULL
-#define POOL_LIMIT     0x4000000ULL
+#define POOL_BASE      MEM_POOL_BASE
+#define POOL_LIMIT     MEM_POOL_LIMIT
 #define POOL_MAX_PAGES ((POOL_LIMIT - POOL_BASE) / MEM_PAGE_SIZE)
 
 static const e820_map_t *map;
@@ -151,10 +148,19 @@ void memory_pages_stats(uint64_t *total_bytes, uint64_t *used_bytes) {
 }
 
 void memory_init(void) {
+    volatile uint64_t *pd = (volatile uint64_t *)(uintptr_t)MEM_PD_ADDR;
+    uint64_t i;
+
     map = (const e820_map_t *)(uintptr_t)MEM_MAP_ADDR;
     if (!map_valid()) {
         map = 0;
     }
+
+    /* Cover the whole RAM window even if an older bootloader only mapped 64 MiB. */
+    for (i = 0; i < MEM_IDENTITY_PAGES; i++) {
+        pd[i] = (i << 21) | 0x83ULL;
+    }
+    __asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
 }
 
 void memory_set_kernel_size(uint64_t size) {

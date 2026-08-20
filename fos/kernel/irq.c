@@ -5,6 +5,7 @@
 #include "irq.h"
 #include "timer.h"
 #include "string.h"
+#include "console.h"
 
 #define PIC1_CMD  0x20
 #define PIC1_DATA 0x21
@@ -14,7 +15,36 @@
 #define CODE64_SEL 0x18
 #define IDT_IRQ0   32
 
-extern void exc_halt_stub(void);
+extern void irq_stub_0(void);
+
+/* Called from per-vector exception stubs. Never returns. */
+void exception_panic(uint64_t vector, uint64_t err, uint64_t rip, uint64_t cr2) {
+    static const char *names[32] = {
+        "#DE", "#DB", "NMI", "#BP", "#OF", "#BR", "#UD", "#NM",
+        "#DF", "CSO", "#TS", "#NP", "#SS", "#GP", "#PF", "res",
+        "#MF", "#AC", "#MC", "#XM", "#VE", "#CP", "res", "res",
+        "res", "res", "res", "res", "res", "res", "#SX", "res"
+    };
+    console_set_color(15, 4);
+    console_write_line("");
+    console_write("*** CPU EXCEPTION ");
+    if (vector < 32) {
+        console_write(names[vector]);
+    }
+    console_write(" vec=");
+    console_write_dec(vector);
+    console_write(" err=");
+    console_write_hex64(err);
+    console_write_line("");
+    console_write("RIP=");
+    console_write_hex64(rip);
+    console_write("  CR2=");
+    console_write_hex64(cr2);
+    console_write_line("");
+    for (;;) {
+        __asm__ volatile("cli; hlt");
+    }
+}
 extern void irq_stub_0(void);
 extern void irq_stub_1(void);
 extern void irq_stub_2(void);
@@ -31,6 +61,57 @@ extern void irq_stub_12(void);
 extern void irq_stub_13(void);
 extern void irq_stub_14(void);
 extern void irq_stub_15(void);
+
+extern void exc_stub_0(void);
+extern void exc_stub_1(void);
+extern void exc_stub_2(void);
+extern void exc_stub_3(void);
+extern void exc_stub_4(void);
+extern void exc_stub_5(void);
+extern void exc_stub_6(void);
+extern void exc_stub_7(void);
+extern void exc_stub_8(void);
+extern void exc_stub_9(void);
+extern void exc_stub_10(void);
+extern void exc_stub_11(void);
+extern void exc_stub_12(void);
+extern void exc_stub_13(void);
+extern void exc_stub_14(void);
+extern void exc_stub_15(void);
+extern void exc_stub_16(void);
+extern void exc_stub_17(void);
+extern void exc_stub_18(void);
+extern void exc_stub_19(void);
+extern void exc_stub_20(void);
+extern void exc_stub_21(void);
+extern void exc_stub_22(void);
+extern void exc_stub_23(void);
+extern void exc_stub_24(void);
+extern void exc_stub_25(void);
+extern void exc_stub_26(void);
+extern void exc_stub_27(void);
+extern void exc_stub_28(void);
+extern void exc_stub_29(void);
+extern void exc_stub_30(void);
+extern void exc_stub_31(void);
+
+static void (*const irq_stubs[IRQ_COUNT])(void) = {
+    irq_stub_0, irq_stub_1, irq_stub_2, irq_stub_3,
+    irq_stub_4, irq_stub_5, irq_stub_6, irq_stub_7,
+    irq_stub_8, irq_stub_9, irq_stub_10, irq_stub_11,
+    irq_stub_12, irq_stub_13, irq_stub_14, irq_stub_15
+};
+
+static void (*const exc_stubs[32])(void) = {
+    exc_stub_0, exc_stub_1, exc_stub_2, exc_stub_3,
+    exc_stub_4, exc_stub_5, exc_stub_6, exc_stub_7,
+    exc_stub_8, exc_stub_9, exc_stub_10, exc_stub_11,
+    exc_stub_12, exc_stub_13, exc_stub_14, exc_stub_15,
+    exc_stub_16, exc_stub_17, exc_stub_18, exc_stub_19,
+    exc_stub_20, exc_stub_21, exc_stub_22, exc_stub_23,
+    exc_stub_24, exc_stub_25, exc_stub_26, exc_stub_27,
+    exc_stub_28, exc_stub_29, exc_stub_30, exc_stub_31
+};
 
 struct idt_entry {
     uint16_t offset_low;
@@ -53,13 +134,6 @@ static volatile uint32_t pending;
 static int in_handler;
 static uint8_t master_mask = 0xFE; /* IRQ0 (timer) always unmasked */
 static uint8_t slave_mask = 0xFF;
-
-static void (*const irq_stubs[IRQ_COUNT])(void) = {
-    irq_stub_0, irq_stub_1, irq_stub_2, irq_stub_3,
-    irq_stub_4, irq_stub_5, irq_stub_6, irq_stub_7,
-    irq_stub_8, irq_stub_9, irq_stub_10, irq_stub_11,
-    irq_stub_12, irq_stub_13, irq_stub_14, irq_stub_15,
-};
 
 static inline void outb(uint16_t port, uint8_t value) {
     __asm__ volatile("outb %0, %1" : : "a"(value), "Nd"(port));
@@ -134,7 +208,10 @@ void irq_init(void) {
     in_handler = 0;
 
     for (i = 0; i < 256; i++) {
-        idt_set(i, exc_halt_stub, 0x8E);
+        idt_set(i, exc_stub_31, 0x8E); /* unused vectors share a reserved stub */
+    }
+    for (i = 0; i < 32; i++) {
+        idt_set(i, exc_stubs[i], 0x8E);
     }
     for (i = 0; i < IRQ_COUNT; i++) {
         idt_set(IDT_IRQ0 + i, irq_stubs[i], 0x8E);
