@@ -22,6 +22,7 @@ qemu-system-x86_64 \
   -drive format=raw,file=boot.img,index=0,media=disk \
   -drive format=raw,file=data.img,index=1,media=disk \
   -device bochs-display \
+  -device vmmouse,i8042=i8042 \
   -audiodev pipewire,id=snd0 -device sb16,audiodev=snd0 \
   -m 512M \
   -serial stdio
@@ -63,6 +64,8 @@ Audio backend defaults to **PipeWire** when that session socket exists, otherwis
 | `\FOS\MEM.COM` | RAM map, heap stats (`mem test` stress-tests the allocator) |
 | `\FOS\BEEP.COM` | Tone (`beep`, `beep 880 300`) |
 | `\FOS\PLAY.COM` | WAV/MP3 player TUI (`play DEMO.WAV`, q stops) |
+| `\FOS\PAINT.COM` | Mouse paint (`paint [file.pnt]`; S save, O open, Q quit) |
+| `\FOS\GREP.COM` | Fixed-string search (`grep [-inv] PATTERN [FILE …]`) |
 | `README.TXT` | Full project README (copy of `README.md` from the repo) |
 
 Programs under `\FOS` are found via `$PATH` (seeded from `[shell] path=` in `SYSTEM.INI`).
@@ -82,15 +85,17 @@ A `.COM` can be 32 MiB of code+data+BSS at `0x300000`, with an 8 MiB stack. Larg
 | `del` / `erase <path>` | Delete file or empty folder (FAT32, confirms Y/N) |
 | `copy <src> <dst>` | Copy file (FAT32) — progress window |
 | `move` / `ren <src> <dst>` | Move or rename file (FAT32) — same window |
-| `type <path>` | Print file (or piped input) |
+| `type` / `cat <path>` | Print file (or piped input) |
 | `drives` / `df` | List physical disks and mounted volumes |
 | `edit [file]` | Run the text editor |
-| `less [file]` / `more` | Page through a file (`type file \| less`) |
+| `less [file]` / `more` | Page through a file (`cat file \| less`) |
 | `fm` | Run the file manager |
 | `date [stamp]` | RTC via `date.com` |
 | `mem` | RAM map via `mem.com` |
 | `beep [hz [ms]]` | SB16 tone via `beep.com` |
 | `play <file>` | WAV/MP3 player (`play DEMO.MP3`; q quits) |
+| `paint [file]` | Cell paint (`paint SKETCH.PNT`; left draw, right erase) |
+| `grep [-inv] PAT [file]` | Find lines (`grep Flash README.TXT`; `-i` case, `-n` numbers, `-v` invert) |
 | `echo …` / `*.com` | Run a FOSCOM program |
 | `demo` / `*.bat` | Run a `.BAT` script (`call name` also works) |
 | `NAME=value` | Set `$NAME` (`export NAME=value` is the same) |
@@ -106,7 +111,11 @@ A `.COM` can be 32 MiB of code+data+BSS at `0x300000`, with an 8 MiB stack. Larg
 | `true` / `false` | Set `$ERRORLEVEL` to 0 or 1 |
 | `break` / `continue` | Leave or restart the innermost `for`/`while` |
 
-Prompt shows the current path, e.g. `0:\>` or `0:\docs>`.
+Prompt shows the current path, e.g. `0:\>` or `0:\docs>`. It is green after a successful command and red after a failure (`false`, unknown command, `ERRORLEVEL` ≠ 0).
+
+### Mouse
+
+A yellow arrow follows the host mouse in QEMU (no grab — `make run` adds `-device vmmouse`). Left-drag selects text; right-click copies the selection, or pastes if nothing is selected. Left-click activates `[ OK ]` / Y/N buttons, moves the caret in the shell and editor, opens FM entries on double-click, and pages `less` (upper/lower half). Click the bottom row in `play` to quit. In `paint`, left-drag draws, right-drag erases, and the bottom swatches pick a colour.
 
 ### Scripts (`if` / `for` / `while` / `.BAT`)
 
@@ -226,7 +235,7 @@ boot.img (drive 0, 64 MiB)
   LBA 9+      kernel.bin (BIOS load; UEFI reads KERNEL.BIN from FAT)
   LBA 2048+   FAT32 ESP (type 0xEF, ≥65525 clusters so OVMF accepts it):
               KERNEL.BIN, \EFI\BOOT\BOOTX64.EFI, SHELL.COM,
-              \FOS\*.COM (ECHO, EDIT, LESS, FM, DATE, MEM, BEEP, PLAY),
+              \FOS\*.COM (ECHO, EDIT, LESS, FM, DATE, MEM, BEEP, PLAY, PAINT, GREP),
               DEMO.WAV, DEMO.MP3 (if ffmpeg at build),
               README.TXT, SYSTEM.INI, …
 
@@ -261,6 +270,7 @@ fos/
 │   ├── mem/    mem.com
 │   ├── beep/   beep.com
 │   ├── play/   play.com (WAV/MP3 TUI, minimp3)
+│   ├── grep/   grep.com
 │   └── fm/     fm.com
 ├── scripts/                   # mkdisk.sh, foscom_pack.py, …
 ├── system.ini                 # Template → 0:\SYSTEM.INI

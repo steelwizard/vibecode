@@ -87,6 +87,35 @@ static uint16_t cursor_under;
 static uint64_t cursor_blink_at;
 static uint16_t screen_cell[CONSOLE_MAX_ROWS][CONSOLE_MAX_COLS];
 
+#define CLIP_MAX 512
+#define HIT_MAX  8
+#define HIT_ENTER 1
+#define HIT_ESC   2
+#define HIT_Y     3
+#define HIT_N     4
+
+static int mouse_on;
+static int mouse_cx;
+static int mouse_cy;
+static int mouse_px = -1;
+static int mouse_py = -1;
+static int spr_saved;
+static int spr_defer;
+static int spr_sx = -1;
+static int spr_sy = -1;
+static int sel_on;
+static int sel_ax;
+static int sel_ay;
+static int sel_bx;
+static int sel_by;
+static char clip[CLIP_MAX];
+static int clip_n;
+
+static struct {
+    int x, y, w, h, action;
+} hits[HIT_MAX];
+static int hit_n;
+
 static uint16_t scrollback[SCROLLBACK_MAX][CONSOLE_MAX_COLS];
 static int scroll_lines = 1;
 static int scroll_view_top = 0;
@@ -111,6 +140,25 @@ static uint16_t blank_cell(void) {
 }
 
 static void fb_draw_cell(int col, int row, uint16_t cell);
+static void paint_cell(int x, int y);
+static void mouse_spr_restore(void);
+static void mouse_spr_redraw(void);
+
+static int spr_cell_hit(int col, int row, int px, int py) {
+    int x0;
+    int y0;
+    int x1;
+    int y1;
+
+    if (px < 0 || py < 0) {
+        return 0;
+    }
+    x0 = px / 8;
+    y0 = py / 16;
+    x1 = (px + 11) / 8;
+    y1 = (py + 17) / 16;
+    return col >= x0 && col <= x1 && row >= y0 && row <= y1;
+}
 
 static void serial_init(void) {
     outb(COM1 + 1, 0x00);
@@ -163,12 +211,8 @@ static void hide_soft_cursor(void) {
     if (!cursor_painted) {
         return;
     }
-    if (fb_active) {
-        fb_draw_cell(cursor_px, cursor_py, cursor_under);
-    } else {
-        VGA_MEM[cursor_py * term_cols + cursor_px] = cursor_under;
-    }
     cursor_painted = 0;
+    paint_cell(cursor_px, cursor_py);
 }
 
 static void show_soft_cursor(void) {
@@ -205,6 +249,7 @@ static void show_soft_cursor(void) {
     }
     cursor_under = (uint16_t)((uint8_t)ch | (cell & 0xFF00));
     cell = (uint16_t)((uint8_t)ch | ((uint16_t)((CURSOR_BG << 4) | CURSOR_FG) << 8));
+    mouse_spr_restore();
     if (fb_active) {
         fb_draw_cell(x, y, cell);
     } else {
@@ -213,6 +258,10 @@ static void show_soft_cursor(void) {
     cursor_px = x;
     cursor_py = y;
     cursor_painted = 1;
+    if (mouse_on && x == mouse_cx && y == mouse_cy) {
+        paint_cell(x, y);
+    }
+    mouse_spr_redraw();
 }
 
 static void sync_hw_cursor(void) {
@@ -241,6 +290,133 @@ void console_tick_cursor(void) {
     } else {
         show_soft_cursor();
     }
+    mouse_spr_redraw();
+}
+
+static uint16_t invert_attr(uint16_t cell) {
+    uint8_t a = (uint8_t)(cell >> 8);
+    uint8_t fg = a & 0x0F;
+    uint8_t bg = (a >> 4) & 0x07;
+    return (uint16_t)((cell & 0xFF) | ((uint16_t)((fg << 4) | bg) << 8));
+}
+
+static int cell_in_sel(int x, int y) {
+    int x0 = sel_ax;
+    int y0 = sel_ay;
+    int x1 = sel_bx;
+    int y1 = sel_by;
+
+    if (!sel_on) {
+        return 0;
+    }
+    if (y0 > y1 || (y0 == y1 && x0 > x1)) {
+        int t;
+        t = x0; x0 = x1; x1 = t;
+        t = y0; y0 = y1; y1 = t;
+    }
+    if (y < y0 || y > y1) {
+        return 0;
+    }
+    if (y0 == y1) {
+        return x >= x0 && x <= x1;
+    }
+    if (y == y0) {
+        return x >= x0;
+    }
+    if (y == y1) {
+        return x <= x1;
+    }
+    return 1;
+}
+
+static uint16_t vis_cell(int x, int y) {
+    uint16_t cell = screen_cell[y][x];
+    if (cell_in_sel(x, y)) {
+        cell = invert_attr(cell);
+    }
+    if (mouse_on && !capture_buf && !fb_active && x == mouse_cx && y == mouse_cy) {
+        cell = (uint16_t)(0xDB | ((uint16_t)((4 << 4) | 14) << 8));
+    }
+    return cell;
+}
+
+static void paint_cell(int x, int y) {
+    uint16_t cell;
+    if (x < 0 || y < 0 || x >= term_cols || y >= term_rows) {
+        return;
+    }
+    cell = vis_cell(x, y);
+    if (!spr_defer && fb_active && mouse_on &&
+        ((spr_saved && spr_cell_hit(x, y, spr_sx, spr_sy)) ||
+         spr_cell_hit(x, y, mouse_px, mouse_py))) {
+        mouse_spr_restore();
+        if (fb_active) {
+            fb_draw_cell(x, y, cell);
+        } else {
+            VGA_MEM[y * term_cols + x] = cell;
+        }
+        mouse_spr_redraw();
+        return;
+    }
+    if (fb_active) {
+        fb_draw_cell(x, y, cell);
+    } else {
+        VGA_MEM[y * term_cols + x] = cell;
+    }
+}
+
+static void clip_add(char c) {
+    if (clip_n + 1 < CLIP_MAX) {
+        clip[clip_n++] = c;
+        clip[clip_n] = 0;
+    }
+}
+
+static void selection_copy(void) {
+    int x0 = sel_ax, y0 = sel_ay, x1 = sel_bx, y1 = sel_by;
+    int y;
+
+    clip_n = 0;
+    clip[0] = 0;
+    if (!sel_on) {
+        return;
+    }
+    if (y0 > y1 || (y0 == y1 && x0 > x1)) {
+        int t;
+        t = x0; x0 = x1; x1 = t;
+        t = y0; y0 = y1; y1 = t;
+    }
+    for (y = y0; y <= y1; y++) {
+        int xs = (y == y0) ? x0 : 0;
+        int xe = (y == y1) ? x1 : term_cols - 1;
+        int x;
+        int end = xs;
+        if (y < 0 || y >= term_rows) {
+            continue;
+        }
+        if (xs < 0) {
+            xs = 0;
+        }
+        if (xe >= term_cols) {
+            xe = term_cols - 1;
+        }
+        for (x = xs; x <= xe; x++) {
+            char ch = (char)(screen_cell[y][x] & 0xFF);
+            if (ch != ' ' && ch != 0) {
+                end = x + 1;
+            }
+        }
+        for (x = xs; x < end; x++) {
+            char ch = (char)(screen_cell[y][x] & 0xFF);
+            if (ch == 0) {
+                ch = ' ';
+            }
+            clip_add(ch);
+        }
+        if (y != y1) {
+            clip_add('\n');
+        }
+    }
 }
 
 static void stamp_cell(int x, int y, uint16_t cell) {
@@ -249,11 +425,7 @@ static void stamp_cell(int x, int y, uint16_t cell) {
     }
     hide_soft_cursor();
     screen_cell[y][x] = cell;
-    if (fb_active) {
-        fb_draw_cell(x, y, cell);
-    } else {
-        VGA_MEM[y * term_cols + x] = cell;
-    }
+    paint_cell(x, y);
 }
 
 static void scroll_drop_oldest(void) {
@@ -338,8 +510,104 @@ static void fb_clear_screen(uint8_t bg) {
     }
 }
 
+#define SPR_W 12
+#define SPR_H 18
+#define SPR_FILL 0xFFFF55u
+#define SPR_EDGE 0x000000u
+
+/* 0 = skip, 1 = black outline, 2 = yellow fill */
+static const uint8_t spr_map[SPR_H][SPR_W] = {
+    {1,2,0,0,0,0,0,0,0,0,0,0},
+    {1,2,2,0,0,0,0,0,0,0,0,0},
+    {1,2,2,2,0,0,0,0,0,0,0,0},
+    {1,2,2,2,2,0,0,0,0,0,0,0},
+    {1,2,2,2,2,2,0,0,0,0,0,0},
+    {1,2,2,2,2,2,2,0,0,0,0,0},
+    {1,2,2,2,2,2,2,2,0,0,0,0},
+    {1,2,2,2,2,2,2,2,2,0,0,0},
+    {1,2,2,2,2,2,2,2,2,2,0,0},
+    {1,2,2,2,2,2,1,1,1,1,1,0},
+    {1,2,2,1,2,2,1,0,0,0,0,0},
+    {1,2,1,0,1,2,2,1,0,0,0,0},
+    {1,1,0,0,1,2,2,1,0,0,0,0},
+    {1,0,0,0,0,1,2,2,1,0,0,0},
+    {0,0,0,0,0,1,2,2,1,0,0,0},
+    {0,0,0,0,0,0,1,2,2,1,0,0},
+    {0,0,0,0,0,0,1,2,2,1,0,0},
+    {0,0,0,0,0,0,0,1,1,0,0,0},
+};
+
+static uint32_t spr_under[SPR_H][SPR_W];
+
+static void mouse_spr_restore(void) {
+    int dy;
+    int dx;
+
+    if (!spr_saved || !framebuffer) {
+        spr_saved = 0;
+        return;
+    }
+    for (dy = 0; dy < SPR_H; dy++) {
+        int y = spr_sy + dy;
+        if (y < 0 || y >= (int)fb_height) {
+            continue;
+        }
+        volatile uint32_t *line = (volatile uint32_t *)((uintptr_t)framebuffer +
+                                                        (uint32_t)y * fb_pitch);
+        for (dx = 0; dx < SPR_W; dx++) {
+            int x = spr_sx + dx;
+            if (x >= 0 && x < (int)fb_width) {
+                line[x] = spr_under[dy][dx];
+            }
+        }
+    }
+    spr_saved = 0;
+}
+
+static void mouse_spr_redraw(void) {
+    int dy;
+    int dx;
+    int x0;
+    int y0;
+
+    if (spr_defer || !fb_active || !framebuffer || !mouse_on || capture_buf ||
+        mouse_px < 0) {
+        return;
+    }
+    x0 = mouse_px;
+    y0 = mouse_py;
+    mouse_spr_restore();
+    for (dy = 0; dy < SPR_H; dy++) {
+        int y = y0 + dy;
+        if (y < 0 || y >= (int)fb_height) {
+            continue;
+        }
+        volatile uint32_t *line = (volatile uint32_t *)((uintptr_t)framebuffer +
+                                                        (uint32_t)y * fb_pitch);
+        for (dx = 0; dx < SPR_W; dx++) {
+            int x = x0 + dx;
+            uint8_t p;
+            if (x < 0 || x >= (int)fb_width) {
+                continue;
+            }
+            spr_under[dy][dx] = line[x];
+            p = spr_map[dy][dx];
+            if (p == 2) {
+                line[x] = SPR_FILL;
+            } else if (p == 1) {
+                line[x] = SPR_EDGE;
+            }
+        }
+    }
+    spr_sx = x0;
+    spr_sy = y0;
+    spr_saved = 1;
+}
+
 static void console_redraw(void) {
     cursor_painted = 0;
+    spr_saved = 0;
+    spr_defer = 1;
     for (int y = 0; y < term_rows; y++) {
         int sl = scroll_view_top + y;
         for (int x = 0; x < term_cols; x++) {
@@ -348,14 +616,12 @@ static void console_redraw(void) {
                 cell = scrollback[sl][x];
             }
             screen_cell[y][x] = cell;
-            if (fb_active && framebuffer) {
-                fb_draw_cell(x, y, cell);
-            } else {
-                VGA_MEM[y * term_cols + x] = cell;
-            }
+            paint_cell(x, y);
         }
     }
+    spr_defer = 0;
     sync_hw_cursor();
+    mouse_spr_redraw();
 }
 
 static void scroll_write_cell(int abs_line, int x, uint16_t cell) {
@@ -396,6 +662,7 @@ static void direct_scroll(void) {
         return;
     }
     hide_soft_cursor();
+    mouse_spr_restore();
     for (int y = 0; y < term_rows - 1; y++) {
         memcpy(screen_cell[y], screen_cell[y + 1], (size_t)term_cols * sizeof(uint16_t));
     }
@@ -424,6 +691,7 @@ static void direct_scroll(void) {
     }
     cursor_y = term_rows - 1;
     sync_hw_cursor();
+    mouse_spr_redraw();
 }
 
 static void putchar_at(char c, int x, int y) {
@@ -501,6 +769,7 @@ void console_init_framebuffer(const video_mode_t *mode) {
         scrollback[0][i] = blank_cell();
     }
     fb_clear_screen((color >> 4) & 0x0F);
+    spr_saved = 0;
     console_redraw();
 }
 
@@ -514,6 +783,181 @@ void console_get_size(int *cols, int *rows) {
     }
     if (rows) {
         *rows = term_rows;
+    }
+}
+
+void console_get_cursor(int *x, int *y) {
+    if (x) {
+        *x = cursor_x;
+    }
+    if (y) {
+        *y = cursor_y;
+    }
+}
+
+void console_hit_clear(void) {
+    hit_n = 0;
+}
+
+void console_hit_add(int x, int y, int w, int h, int action) {
+    if (hit_n >= HIT_MAX || w < 1 || h < 1) {
+        return;
+    }
+    hits[hit_n].x = x;
+    hits[hit_n].y = y;
+    hits[hit_n].w = w;
+    hits[hit_n].h = h;
+    hits[hit_n].action = action;
+    hit_n++;
+}
+
+int console_hit_click(int x, int y) {
+    int i;
+    for (i = 0; i < hit_n; i++) {
+        if (x >= hits[i].x && x < hits[i].x + hits[i].w &&
+            y >= hits[i].y && y < hits[i].y + hits[i].h) {
+            if (hits[i].action == HIT_ENTER) {
+                keyboard_inject(KEY_ENTER, 0);
+            } else if (hits[i].action == HIT_ESC) {
+                keyboard_inject(KEY_CHAR, 27);
+            } else if (hits[i].action == HIT_Y) {
+                keyboard_inject(KEY_CHAR, 'y');
+            } else if (hits[i].action == HIT_N) {
+                keyboard_inject(KEY_CHAR, 'n');
+            } else {
+                continue;
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void console_mouse_move(int x, int y) {
+    int ox = mouse_cx;
+    int oy = mouse_cy;
+
+    if (x < 0) {
+        x = 0;
+    }
+    if (y < 0) {
+        y = 0;
+    }
+    if (x >= term_cols) {
+        x = term_cols - 1;
+    }
+    if (y >= term_rows) {
+        y = term_rows - 1;
+    }
+    mouse_cx = x;
+    mouse_cy = y;
+    mouse_on = 1;
+    if (capture_buf) {
+        return;
+    }
+    if (ox != x || oy != y) {
+        paint_cell(ox, oy);
+        if (cursor_painted && ox == cursor_px && oy == cursor_py) {
+            show_soft_cursor();
+        }
+    }
+    paint_cell(x, y);
+    mouse_spr_redraw();
+}
+
+void console_mouse_pixel(int px, int py) {
+    if (px < 0) {
+        px = 0;
+    }
+    if (py < 0) {
+        py = 0;
+    }
+    mouse_spr_restore();
+    mouse_px = px;
+    mouse_py = py;
+    console_mouse_move(px / 8, py / 16);
+}
+
+void console_mouse_left(int phase, int x, int y) {
+    static int cover0;
+    static int cover1 = -1;
+    int y0;
+    int y1;
+    int a;
+    int b;
+    int row;
+    int col;
+
+    if (capture_buf || direct_vga) {
+        return;
+    }
+    if (phase == 1) {
+        if (sel_on) {
+            sel_on = 0;
+            if (cover1 >= 0) {
+                for (row = cover0; row <= cover1; row++) {
+                    for (col = 0; col < term_cols; col++) {
+                        paint_cell(col, row);
+                    }
+                }
+            }
+            cover1 = -1;
+        }
+        sel_ax = x;
+        sel_ay = y;
+        sel_bx = x;
+        sel_by = y;
+        return;
+    }
+    if (phase != 2) {
+        return;
+    }
+    sel_bx = x;
+    sel_by = y;
+    if (x == sel_ax && y == sel_ay) {
+        return;
+    }
+    sel_on = 1;
+    y0 = sel_ay < sel_by ? sel_ay : sel_by;
+    y1 = sel_ay < sel_by ? sel_by : sel_ay;
+    a = y0;
+    b = y1;
+    if (cover1 >= 0) {
+        if (cover0 < a) {
+            a = cover0;
+        }
+        if (cover1 > b) {
+            b = cover1;
+        }
+    }
+    if (a < 0) {
+        a = 0;
+    }
+    if (b >= term_rows) {
+        b = term_rows - 1;
+    }
+    for (row = a; row <= b; row++) {
+        for (col = 0; col < term_cols; col++) {
+            paint_cell(col, row);
+        }
+    }
+    cover0 = y0;
+    cover1 = y1;
+    paint_cell(mouse_cx, mouse_cy);
+}
+
+void console_mouse_right(int x, int y) {
+    (void)x;
+    (void)y;
+    if (direct_vga) {
+        return;
+    }
+    if (sel_on) {
+        selection_copy();
+        return;
+    }
+    if (clip_n > 0) {
+        keyboard_inject_str(clip);
     }
 }
 
@@ -552,6 +996,7 @@ void console_clear(void) {
         }
         if (fb_active) {
             fb_clear_screen((color >> 4) & 0x0F);
+            spr_saved = 0;
         } else {
             for (i = 0; i < term_cols * term_rows; i++) {
                 VGA_MEM[i] = blank;
@@ -560,6 +1005,7 @@ void console_clear(void) {
         cursor_x = 0;
         cursor_y = 0;
         sync_hw_cursor();
+        mouse_spr_redraw();
         return;
     }
 
@@ -1224,7 +1670,10 @@ void console_error(const char *msg) {
     err_puts(btn_x + 1, btn_y, btn, ERR_BTN_FG, ERR_BTN_BG);
     err_cell(btn_x + 1 + btn_w, btn_y, ']', ERR_EDGE_FG, ERR_BOX_BG);
 
+    console_hit_clear();
+    console_hit_add(btn_x, btn_y, btn_w + 2, 1, HIT_ENTER);
     err_wait_ok();
+    console_hit_clear();
 
     console_end_direct();
     color = (uint8_t)saved_color;

@@ -6,20 +6,25 @@ between chunks, which is what glitching sounds like.
 Fidelity: DEMO.MP3 is a synthesized 440 Hz sine, so its captured spectrum
 should peak at 440 Hz with negligible harmonics.
 
-    python3 scripts/audio_check.py            # DEMO.MP3 (tone)
+    python3 scripts/audio_check.py            # DEMO.MP3 + a 44.1 kHz stereo song
     python3 scripts/audio_check.py FILE.MP3 10
 """
 
 import math
 import os
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 import wave
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qemu_console import Machine, image_copy  # noqa: E402
 
 WINDOW_MS = 10
+PART_LBA = 2048
+SONG_SECONDS = 12
 
 
 def capture(image, target, seconds):
@@ -99,7 +104,20 @@ def goertzel(x, freq, rate):
     return math.sqrt(max(s1 * s1 + s2 * s2 - coeff * s1 * s2, 0.0)) / len(x)
 
 
+def loud_samples(rate, samples):
+    rms = envelope(rate, samples)
+    if not rms or max(rms) == 0:
+        return samples
+    thresh = max(max(rms) * 0.02, 30.0)
+    loud = [i for i, r in enumerate(rms) if r > thresh]
+    if not loud:
+        return samples
+    win = max(1, rate * WINDOW_MS // 1000)
+    return samples[loud[0] * win: (loud[-1] + 1) * win]
+
+
 def check_tone(rate, samples, expect=440.0):
+    samples = loud_samples(rate, samples)
     mid = len(samples) // 2
     half = min(rate // 2, mid)
     seg = samples[mid - half:mid + half]
@@ -121,16 +139,48 @@ def check_tone(rate, samples, expect=440.0):
     return ok
 
 
+def make_song(path, seconds=SONG_SECONDS):
+    subprocess.check_call([
+        "ffmpeg", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i",
+        f"anoisesrc=color=pink:duration={seconds}:sample_rate=44100",
+        "-f", "lavfi", "-i",
+        f"sine=frequency=440:duration={seconds}:sample_rate=44100",
+        "-filter_complex", "amix=inputs=2:duration=longest,aformat=channel_layouts=stereo",
+        "-c:a", "libmp3lame", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+        path,
+    ])
+
+
+def add_fat_file(image, host_path, fat_name):
+    fat = f"{image}@@{PART_LBA}s"
+    if shutil.which("mcopy"):
+        subprocess.check_call(["mcopy", "-o", "-i", fat, host_path, f"::{fat_name}"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fat32_add.py")
+    subprocess.check_call(["python3", script, image, str(PART_LBA), fat_name, host_path])
+
+
 def main():
     if len(sys.argv) > 1:
         jobs = [(sys.argv[1], float(sys.argv[2]) if len(sys.argv) > 2 else 10.0,
                  False)]
+        song = None
     else:
         jobs = [("DEMO.MP3", 5.0, True)]
+        song = None
+        if shutil.which("ffmpeg"):
+            fd, song = tempfile.mkstemp(prefix="fos-song-", suffix=".mp3")
+            os.close(fd)
+            make_song(song)
+            jobs.append(("SONG.MP3", 10.0, False))
 
     image = image_copy()
     ok = True
     try:
+        if song:
+            add_fat_file(image, song, "SONG.MP3")
         for target, seconds, tone in jobs:
             print(f"{target}:")
             path = capture(image, target, seconds)
@@ -141,6 +191,8 @@ def main():
                 ok &= check_tone(rate, samples)
     finally:
         os.unlink(image)
+        if song:
+            os.unlink(song)
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

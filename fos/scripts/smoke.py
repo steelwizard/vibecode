@@ -18,13 +18,17 @@ from qemu_console import Machine, cpu_exceptions, image_copy  # noqa: E402
 CASES = [
     ("ver", 10, None, None, "FOS"),
     ("dir", 10, None, None, "SYSTEM.INI"),
-    ("dir FOS", 10, None, None, "PLAY.COM"),
+    ("dir FOS", 10, None, None, "GREP.COM"),
     ("mem", 15, None, None, "image max"),
     ("mem test", 30, None, None, "RESULT: PASS"),
     ("mem leak", 15, None, None, None),
     ("mem", 15, None, None, "0 B across 0 block(s)"),  # leak reclaimed on exit
     ("date", 10, None, None, None),
     ("echo hello", 10, None, None, "hello"),
+    ("grep Flash README.TXT", 10, None, None, "Flash Operating System"),
+    ("grep -n Flash README.TXT", 10, None, None, "1:# FOS"),
+    ("grep -i operating README.TXT", 10, None, None, "Flash Operating"),
+    ("type SYSTEM.INI | grep keyboard", 10, None, None, "[keyboard]"),
     ("echo $PATH", 10, None, None, "\\FOS"),
     ("echo $(1+5)", 10, None, None, "6"),
     ("echo $((2*3+1))", 10, None, None, "7"),

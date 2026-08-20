@@ -21,6 +21,10 @@ BEEP_BIN    = apps/beep/beep.bin
 BEEP_COM    = apps/beep/beep.com
 PLAY_BIN    = apps/play/play.bin
 PLAY_COM    = apps/play/play.com
+PAINT_BIN   = apps/paint/paint.bin
+PAINT_COM   = apps/paint/paint.com
+GREP_BIN    = apps/grep/grep.bin
+GREP_COM    = apps/grep/grep.com
 EFI_EFI     = efi/BOOTX64.EFI
 DATA_IMG    = data.img
 
@@ -55,7 +59,7 @@ KERNEL_C   = kernel/kernel.c kernel/shell.c kernel/vfs.c kernel/block.c \
              kernel/cpu.c kernel/boot_report.c kernel/exec.c kernel/fos_api.c \
              kernel/config.c kernel/video.c kernel/font8x16.c \
              kernel/timer.c kernel/rtc.c kernel/memory.c kernel/heap.c \
-             kernel/irq.c kernel/sb16.c kernel/env.c
+             kernel/irq.c kernel/sb16.c kernel/env.c kernel/mouse.c
 
 SHELL_ASM  = shell/entry.asm
 SHELL_C    = kernel/shell.c kernel/vfs.c kernel/block.c \
@@ -103,6 +107,16 @@ PLAY_ASM   = apps/play/entry.asm
 PLAY_C     = apps/play/play.c apps/play/minimp3_impl.c
 PLAY_OBJ   = apps/play/entry.o apps/play/play.o apps/play/minimp3_impl.o
 PLAY_ELF   = apps/play/play.elf
+
+PAINT_ASM  = apps/paint/entry.asm
+PAINT_C    = apps/paint/paint.c
+PAINT_OBJ  = $(PAINT_ASM:.asm=.o) $(PAINT_C:.c=.o)
+PAINT_ELF  = apps/paint/paint.elf
+
+GREP_ASM   = apps/grep/entry.asm
+GREP_C     = apps/grep/grep.c
+GREP_OBJ   = $(GREP_ASM:.asm=.o) $(GREP_C:.c=.o)
+GREP_ELF   = apps/grep/grep.elf
 
 KERNEL_OBJ = $(KERNEL_ASM:.asm=.o) $(KERNEL_C:.c=.o)
 
@@ -189,6 +203,18 @@ apps/play/minimp3_impl.o: apps/play/minimp3_impl.c apps/play/minimp3.h apps/play
 	      -mno-red-zone -mstackrealign -Os -Wall -I apps/play -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
 	      -Wno-unused-function -Wno-unused-variable -c $< -o $@
 
+apps/paint/%.o: apps/paint/%.asm
+	$(NASM) -f elf64 $< -o $@
+
+apps/paint/%.o: apps/paint/%.c $(KERNEL_HDRS)
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+apps/grep/%.o: apps/grep/%.asm
+	$(NASM) -f elf64 $< -o $@
+
+apps/grep/%.o: apps/grep/%.c $(KERNEL_HDRS)
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
 $(KERNEL_ELF): $(KERNEL_OBJ) kernel/linker.ld
 	$(LD) -m elf_x86_64 -T kernel/linker.ld -nostdlib -o $@ $(KERNEL_OBJ)
 
@@ -204,12 +230,12 @@ $(KERNEL_BIN): $(KERNEL_ELF)
 
 SHELL_ELF = shell/shell.elf
 
-$(SHELL_ELF): $(SHELL_OBJ) kernel/exec.o kernel/fos_api.o kernel/font8x16.o kernel/timer.o kernel/rtc.o kernel/memory.o kernel/heap.o kernel/sb16.o kernel/config.o kernel/env.o kernel/irqvec.o kernel/comcall.o kernel/irq.o shell/linker.ld
+$(SHELL_ELF): $(SHELL_OBJ) kernel/exec.o kernel/fos_api.o kernel/font8x16.o kernel/timer.o kernel/rtc.o kernel/memory.o kernel/heap.o kernel/sb16.o kernel/config.o kernel/env.o kernel/mouse.o kernel/irqvec.o kernel/comcall.o kernel/irq.o shell/linker.ld
 	$(LD) -m elf_x86_64 -T shell/linker.ld -nostdlib -o $@ shell/entry.o \
 		kernel/shell.o kernel/vfs.o kernel/block.o kernel/partition.o \
 		kernel/fat32.o kernel/exfat.o kernel/console.o kernel/keyboard.o \
 		kernel/string.o kernel/boot_report.o kernel/exec.o kernel/fos_api.o \
-		kernel/font8x16.o kernel/timer.o kernel/rtc.o kernel/irqvec.o kernel/comcall.o kernel/irq.o kernel/memory.o kernel/heap.o kernel/sb16.o kernel/config.o kernel/env.o
+		kernel/font8x16.o kernel/timer.o kernel/rtc.o kernel/irqvec.o kernel/comcall.o kernel/irq.o kernel/memory.o kernel/heap.o kernel/sb16.o kernel/config.o kernel/env.o kernel/mouse.o
 
 $(SHELL_BIN): $(SHELL_ELF)
 	$(OBJCOPY) -O binary $< $@
@@ -325,6 +351,32 @@ $(PLAY_COM): $(PLAY_BIN) $(PLAY_ELF) scripts/foscom_pack.py
 		--mem-size 0x$$(nm -n $(PLAY_ELF) | awk '$$3=="_end"{print $$1; exit}') \
 		--stack $(COM_STACK) --name PLAY
 
+$(PAINT_ELF): $(PAINT_OBJ) apps/paint/linker.ld
+	$(LD) -m elf_x86_64 -T apps/paint/linker.ld -nostdlib -o $@ $(PAINT_OBJ)
+
+$(PAINT_BIN): $(PAINT_ELF)
+	$(OBJCOPY) -O binary $< $@
+
+$(PAINT_COM): $(PAINT_BIN) $(PAINT_ELF) scripts/foscom_pack.py
+	$(PYTHON) scripts/foscom_pack.py $(PAINT_BIN) $@ \
+		--load $(COM_LOAD) \
+		--entry 0x$$(nm -n $(PAINT_ELF) | awk '$$3=="_start"{print $$1; exit}') \
+		--mem-size 0x$$(nm -n $(PAINT_ELF) | awk '$$3=="_end"{print $$1; exit}') \
+		--stack $(COM_STACK) --name PAINT
+
+$(GREP_ELF): $(GREP_OBJ) apps/grep/linker.ld
+	$(LD) -m elf_x86_64 -T apps/grep/linker.ld -nostdlib -o $@ $(GREP_OBJ)
+
+$(GREP_BIN): $(GREP_ELF)
+	$(OBJCOPY) -O binary $< $@
+
+$(GREP_COM): $(GREP_BIN) $(GREP_ELF) scripts/foscom_pack.py
+	$(PYTHON) scripts/foscom_pack.py $(GREP_BIN) $@ \
+		--load $(COM_LOAD) \
+		--entry 0x$$(nm -n $(GREP_ELF) | awk '$$3=="_start"{print $$1; exit}') \
+		--mem-size 0x$$(nm -n $(GREP_ELF) | awk '$$3=="_end"{print $$1; exit}') \
+		--stack $(COM_STACK) --name GREP
+
 EFI_CFLAGS = -m64 -mabi=ms -fshort-wchar -ffreestanding -fno-stack-protector \
              -fno-builtin -fpie -mno-red-zone -fno-ident \
              -fno-asynchronous-unwind-tables -Wall -Wextra -O2 -I efi
@@ -348,8 +400,8 @@ $(EFI_EFI): efi/efi_main.o efi/efi.ld
 	      --image-base 0x140000000 --disable-auto-import \
 	      -o $@ efi/efi_main.o
 
-$(IMG): $(BOOT_BIN) $(KERNEL_BIN) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(BEEP_COM) $(PLAY_COM) $(EFI_EFI) system.ini demo.bat scripts/mkdisk.sh scripts/fat32_add.py
-	scripts/mkdisk.sh $(IMG) $(BOOT_BIN) $(KERNEL_BIN) $(KERNEL_LBA) $(PART_START) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(EFI_EFI) $(BEEP_COM) $(PLAY_COM)
+$(IMG): $(BOOT_BIN) $(KERNEL_BIN) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(BEEP_COM) $(PLAY_COM) $(PAINT_COM) $(GREP_COM) $(EFI_EFI) system.ini demo.bat scripts/mkdisk.sh scripts/fat32_add.py
+	scripts/mkdisk.sh $(IMG) $(BOOT_BIN) $(KERNEL_BIN) $(KERNEL_LBA) $(PART_START) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(EFI_EFI) $(BEEP_COM) $(PLAY_COM) $(PAINT_COM) $(GREP_COM)
 
 $(DATA_IMG): scripts/mkdata.sh
 	scripts/mkdata.sh $(DATA_IMG)
@@ -370,6 +422,8 @@ else
 QEMU_AUDIODEV = -audiodev $(QEMU_AUDIO),id=snd0
 endif
 QEMU_SB16 = $(QEMU_AUDIODEV) -device sb16,audiodev=snd0,iobase=0x220,irq=5,dma=1
+# vmmouse = QEMU/VMware absolute pointer (no grab). Still works as PS/2 fallback.
+QEMU_MOUSE = -device vmmouse,i8042=i8042
 
 run: $(IMG) $(DATA_IMG)
 ifndef QEMU
@@ -378,6 +432,7 @@ endif
 	$(QEMU) -drive format=raw,file=$(IMG),index=0,media=disk \
 	        -drive format=raw,file=$(DATA_IMG),index=1,media=disk \
 	        -device bochs-display,vgamem=$(VGAMEM) \
+	        $(QEMU_MOUSE) \
 	        $(QEMU_SB16) \
 	        -m 512M -serial stdio
 
@@ -394,6 +449,7 @@ endif
 	        -drive format=raw,file=$(IMG),index=0,media=disk \
 	        -drive format=raw,file=$(DATA_IMG),index=1,media=disk \
 	        -device bochs-display,vgamem=$(VGAMEM) \
+	        $(QEMU_MOUSE) \
 	        $(QEMU_SB16) \
 	        -m 512M -serial stdio -net none
 
@@ -409,6 +465,8 @@ clean:
 	      $(MEM_BIN) $(MEM_COM) $(MEM_ELF) \
 	      $(BEEP_BIN) $(BEEP_COM) $(BEEP_ELF) \
 	      $(PLAY_BIN) $(PLAY_COM) $(PLAY_ELF) \
+	      $(PAINT_BIN) $(PAINT_COM) $(PAINT_ELF) \
+	      $(GREP_BIN) $(GREP_COM) $(GREP_ELF) \
 	      $(EFI_EFI) efi/efi_main.o efi/enter_kernel.bin efi/enter_kernel_bin.h \
 	      $(KERNEL_ELF) shell/shell.elf $(ECHO_ELF) \
-	      $(IMG) $(DATA_IMG) fos-sb16.wav $(KERNEL_OBJ) $(SHELL_OBJ) $(ECHO_OBJ) $(EDIT_OBJ) $(FM_OBJ) $(LESS_OBJ) $(DATE_OBJ) $(MEM_OBJ) $(BEEP_OBJ) $(PLAY_OBJ)
+	      $(IMG) $(DATA_IMG) fos-sb16.wav $(KERNEL_OBJ) $(SHELL_OBJ) $(ECHO_OBJ) $(EDIT_OBJ) $(FM_OBJ) $(LESS_OBJ) $(DATE_OBJ) $(MEM_OBJ) $(BEEP_OBJ) $(PLAY_OBJ) $(PAINT_OBJ) $(GREP_OBJ)

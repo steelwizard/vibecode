@@ -3,7 +3,8 @@
  *
  * QEMU: -device sb16,audiodev=snd0  (iobase=0x220 irq=5 dma=1)
  * Playback is 8-bit unsigned mono through DMA channel 1. The DMA buffer sits
- * at 0x20000 so it is 64K-aligned and below the ISA 16 MiB limit.
+ * at 0x20000 so it is 64K-aligned and below the ISA 16 MiB limit. Auto-init
+ * uses the whole 64 KiB page as two 32 KiB halves (~0.74 s at 44.1 kHz).
  */
 
 #include "sb16.h"
@@ -29,9 +30,10 @@
 #define DMA_CH1_PAGE  0x83
 
 #define DMA_BUF_ADDR  0x20000ULL
-#define DMA_HALF      4096u
+/* 8-bit ISA DMA cannot cross a 64 KiB page. 0x20000..0x2FFFF is one page. */
+#define DMA_HALF      32768u
 #define DMA_FULL      (DMA_HALF * 2u)
-#define DMA_BUF_SIZE  DMA_HALF
+#define BEEP_CHUNK    4096u
 #define BEEP_RATE     8000u
 
 #define DSP_CMD_SPEAKER_ON  0xD1
@@ -55,10 +57,11 @@ static volatile int dma_done;
 static volatile int playing;
 static volatile int half_filled[2];
 static volatile int play_half;
-static volatile int irq_tick;
+static volatile int auto_stream;
 static int queued_half;
+static int primed;
+static int underrun_streak;
 static uint32_t play_rate;
-static uint64_t play_deadline_ms;
 
 static inline void outb(uint16_t port, uint8_t value) {
     __asm__ volatile("outb %0, %1" : : "a"(value), "Nd"(port));
@@ -129,7 +132,12 @@ static int dsp_reset(void) {
 static void on_irq(uint8_t irq) {
     (void)irq;
     dsp_ack();
-    irq_tick = 1;
+    if (auto_stream) {
+        half_complete();
+    } else {
+        dma_done = 1;
+        playing = 0;
+    }
 }
 
 static void dma_mask(int masked) {
@@ -192,38 +200,28 @@ static int dsp_start_output(uint32_t length, uint32_t rate, int auto_init) {
 }
 
 static void silence_dma(void) {
-    uint8_t *p = (uint8_t *)(uintptr_t)DMA_BUF_ADDR;
-    uint32_t i;
-    for (i = 0; i < DMA_FULL; i++) {
-        p[i] = 0x80;
-    }
+    memset((void *)(uintptr_t)DMA_BUF_ADDR, 0x80, DMA_FULL);
+}
+
+static void silence_half(int half) {
+    uint8_t *dst = (uint8_t *)(uintptr_t)DMA_BUF_ADDR + (uint32_t)half * DMA_HALF;
+    memset(dst, 0x80, DMA_HALF);
 }
 
 static void copy_half(int half, const uint8_t *src, uint32_t n) {
     uint8_t *dst = (uint8_t *)(uintptr_t)DMA_BUF_ADDR + (uint32_t)half * DMA_HALF;
-    uint32_t i;
     if (n > DMA_HALF) {
         n = DMA_HALF;
     }
     memcpy(dst, src, (size_t)n);
-    for (i = n; i < DMA_HALF; i++) {
-        dst[i] = 0x80;
+    if (n < DMA_HALF) {
+        memset(dst + n, 0x80, DMA_HALF - n);
     }
-}
-
-static uint32_t half_ms(uint32_t rate) {
-    uint32_t ms;
-    if (rate == 0) {
-        rate = 8000;
-    }
-    ms = (DMA_HALF * 1000u) / rate + 20u;
-    if (ms < 30) {
-        ms = 30;
-    }
-    return ms;
 }
 
 static void stream_halt(void) {
+    auto_stream = 0;
+    primed = 0;
     (void)dsp_write(DSP_CMD_EXIT_AI8);
     (void)dsp_write(DSP_CMD_HALT8);
     (void)dsp_write(DSP_CMD_SPEAKER_OFF);
@@ -231,47 +229,44 @@ static void stream_halt(void) {
     dsp_ack();
     playing = 0;
     dma_done = 1;
-    irq_tick = 0;
     half_filled[0] = 0;
     half_filled[1] = 0;
-    play_deadline_ms = 0;
+    underrun_streak = 0;
 }
 
 static void half_complete(void) {
-    irq_tick = 0;
+    int done;
     if (!playing) {
         return;
     }
-    half_filled[play_half] = 0;
+    done = play_half;
+    half_filled[done] = 0;
     play_half ^= 1;
+    queued_half = done;
     if (!half_filled[play_half]) {
-        stream_halt();
-        return;
-    }
-    play_deadline_ms = timer_ticks_ms() + half_ms(play_rate);
-}
-
-static void pump(void) {
-    if (!playing) {
-        return;
-    }
-    if (irq_tick || (play_deadline_ms && timer_ticks_ms() >= play_deadline_ms)) {
-        if (!irq_tick) {
-            dsp_ack();
+        /* DMA already wrapped into this half. Play silence instead of
+         * stopping — a restart click is worse than a brief dropout. */
+        silence_half(play_half);
+        half_filled[play_half] = 1;
+        underrun_streak++;
+        if (underrun_streak >= 2) {
+            stream_halt();
         }
-        half_complete();
+        return;
     }
+    underrun_streak = 0;
 }
 
 static int play_stream_start(uint32_t rate) {
     irq_register(sb_irq, on_irq);
     irq_enable(sb_irq);
     dma_done = 0;
-    irq_tick = 0;
+    auto_stream = 1;
+    primed = 0;
     playing = 1;
     play_rate = rate;
     play_half = 0;
-    play_deadline_ms = timer_ticks_ms() + half_ms(rate);
+    underrun_streak = 0;
     dma_program((uint32_t)DMA_BUF_ADDR, DMA_FULL, 1);
     if (dsp_start_output(DMA_HALF, rate, 1) != 0) {
         stream_halt();
@@ -280,15 +275,21 @@ static int play_stream_start(uint32_t rate) {
     return 0;
 }
 
-static int wait_done(uint32_t timeout_ms) {
+static void commit_prime(void) {
+    if (!primed || playing) {
+        return;
+    }
+    half_filled[1] = 1;
+    queued_half = 0;
+    primed = 0;
+    (void)play_stream_start(play_rate);
+}
+
+static int wait_irq_done(uint32_t timeout_ms) {
     uint64_t start = timer_ticks_ms();
 
     __asm__ volatile("sti");
     while (playing) {
-        pump();
-        if (!playing) {
-            return 0;
-        }
         if (timer_ticks_ms() - start > (uint64_t)timeout_ms) {
             return -1;
         }
@@ -365,7 +366,6 @@ int sb16_present(void) {
 }
 
 int sb16_can_queue(void) {
-    pump();
     if (!found) {
         return 0;
     }
@@ -376,15 +376,17 @@ int sb16_can_queue(void) {
 }
 
 int sb16_playing(void) {
-    pump();
-    if (playing && play_deadline_ms &&
-        timer_ticks_ms() > play_deadline_ms + 250u) {
-        stream_halt();
-    }
+    commit_prime();
     return playing;
 }
 
+uint32_t sb16_buf_size(void) {
+    return DMA_HALF;
+}
+
 int sb16_start(const uint8_t *pcm, uint32_t bytes, uint32_t rate_hz) {
+    int half;
+
     if (!found || !pcm || bytes == 0) {
         return -1;
     }
@@ -398,24 +400,40 @@ int sb16_start(const uint8_t *pcm, uint32_t bytes, uint32_t rate_hz) {
         bytes = DMA_HALF;
     }
 
-    pump();
     if (playing && play_rate != rate_hz) {
         stream_halt();
     }
-    if (!playing) {
+
+    __asm__ volatile("cli");
+    if (!playing && !primed) {
         silence_dma();
         copy_half(0, pcm, bytes);
         half_filled[0] = 1;
         half_filled[1] = 0;
         queued_half = 1;
-        return play_stream_start(rate_hz);
+        play_rate = rate_hz;
+        primed = 1;
+        __asm__ volatile("sti");
+        return 0;
+    }
+    if (primed && !playing) {
+        copy_half(1, pcm, bytes);
+        half_filled[1] = 1;
+        queued_half = 0;
+        primed = 0;
+        __asm__ volatile("sti");
+        return play_stream_start(play_rate);
     }
     if (half_filled[queued_half]) {
+        __asm__ volatile("sti");
         return -1;
     }
-    copy_half(queued_half, pcm, bytes);
-    half_filled[queued_half] = 1;
-    queued_half ^= 1;
+    half = queued_half;
+    copy_half(half, pcm, bytes);
+    half_filled[half] = 1;
+    queued_half = half ^ 1;
+    underrun_streak = 0;
+    __asm__ volatile("sti");
     return 0;
 }
 
@@ -432,40 +450,40 @@ int sb16_play(const uint8_t *pcm, uint32_t bytes, uint32_t rate_hz) {
         rate_hz = 44100;
     }
 
+    /* One-shot DMA at the true length so a 200 ms beep is not padded to a
+     * 32 KiB auto-init half (~4 s of silence at 8 kHz). */
+    stream_halt();
+    irq_register(sb_irq, on_irq);
+    irq_enable(sb_irq);
+    auto_stream = 0;
+
     for (off = 0; off < bytes; ) {
         uint32_t n = bytes - off;
-        if (n > DMA_BUF_SIZE) {
-            n = DMA_BUF_SIZE;
+        uint32_t timeout;
+        if (n > DMA_FULL) {
+            n = DMA_FULL;
         }
-        {
-            uint64_t start = timer_ticks_ms();
-            uint32_t timeout = (n * 1000u) / rate_hz + 80u;
-            while (!sb16_can_queue()) {
-                if (timer_ticks_ms() - start > (uint64_t)timeout) {
-                    stream_halt();
-                    break;
-                }
-                __asm__ volatile("pause");
-            }
+        memcpy((void *)(uintptr_t)DMA_BUF_ADDR, pcm + off, (size_t)n);
+        dma_done = 0;
+        playing = 1;
+        dma_program((uint32_t)DMA_BUF_ADDR, n, 0);
+        if (dsp_start_output(n, rate_hz, 0) != 0) {
+            stream_halt();
+            return -1;
         }
-        if (sb16_start(pcm + off, n, rate_hz) != 0) {
-            sb16_stop();
+        timeout = (n * 1000u) / rate_hz + 200u;
+        if (wait_irq_done(timeout) != 0) {
+            stream_halt();
             return -1;
         }
         off += n;
     }
-    if (playing) {
-        uint32_t timeout = (DMA_FULL * 1000u) / rate_hz + 80u;
-        (void)wait_done(timeout);
-        if (playing) {
-            stream_halt();
-        }
-    }
+    stream_halt();
     return 0;
 }
 
 int sb16_beep(uint32_t freq_hz, uint32_t ms) {
-    uint8_t buf[DMA_BUF_SIZE];
+    uint8_t buf[BEEP_CHUNK];
     uint32_t samples;
     uint32_t period;
     uint32_t i;
@@ -497,14 +515,14 @@ int sb16_beep(uint32_t freq_hz, uint32_t ms) {
     }
     half = period / 2u;
 
-    for (i = 0; i < samples && i < DMA_BUF_SIZE; i++) {
+    for (i = 0; i < samples && i < BEEP_CHUNK; i++) {
         buf[i] = ((i / half) & 1u) ? 0xE0 : 0x20;
     }
-    if (samples > DMA_BUF_SIZE) {
+    if (samples > BEEP_CHUNK) {
         /* Repeat the pattern in chunks for long beeps. */
         uint32_t left = samples;
         while (left) {
-            uint32_t n = left > DMA_BUF_SIZE ? DMA_BUF_SIZE : left;
+            uint32_t n = left > BEEP_CHUNK ? BEEP_CHUNK : left;
             for (i = 0; i < n; i++) {
                 buf[i] = (( (samples - left + i) / half) & 1u) ? 0xE0 : 0x20;
             }
@@ -526,13 +544,14 @@ void sb16_init(void) {
     found = 0;
     playing = 0;
     dma_done = 1;
-    irq_tick = 0;
+    auto_stream = 0;
+    primed = 0;
+    underrun_streak = 0;
     half_filled[0] = 0;
     half_filled[1] = 0;
     play_half = 0;
     queued_half = 0;
     play_rate = 0;
-    play_deadline_ms = 0;
     sb_irq = 5;
     sb_dma = 1;
 

@@ -10,3 +10,4 @@ int  sb16_start(const uint8_t *pcm, uint32_t bytes, uint32_t rate_hz);
 void sb16_stop(void);
 int  sb16_playing(void);
 int  sb16_can_queue(void);
+uint32_t sb16_buf_size(void);

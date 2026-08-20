@@ -286,6 +286,10 @@ int irq_unregister(uint8_t irq) {
 }
 
 void irq_enable(uint8_t irq) {
+    /* Slave PIC IRQs never fire unless cascade IRQ2 is unmasked. */
+    if (irq >= 8 && irq < IRQ_COUNT) {
+        pic_set_masked(FOS_IRQ_CASCADE, 0);
+    }
     pic_set_masked(irq, 0);
 }
 

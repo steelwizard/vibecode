@@ -17,6 +17,7 @@
 #include "irq.h"
 #include "heap.h"
 #include "memory.h"
+#include "mouse.h"
 
 extern void com_call(void (*entry)(void), uint64_t stack_top);
 
@@ -182,6 +183,7 @@ static int load_and_run(int drive, const char *path, const foscom_hdr_t *hdr) {
      * the load address, so a leftover handler would jump into the restored
      * outer image. Kernel timer IRQ0 is dispatched separately. */
     irq_clear_handlers();
+    mouse_irq_restore();
     heap_set_owner(caller_owner);
     rc = 0;
     return rc;

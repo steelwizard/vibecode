@@ -29,6 +29,8 @@ void keyboard_init(void);
 int  keyboard_has_key(void);
 char keyboard_read(void);
 key_event_t keyboard_read_event(void);
+void keyboard_inject(key_type_t type, char ch);
+void keyboard_inject_str(const char *s);
 
 /* Non-blocking: drain pending keys; return 1 if Ctrl+C (0x03) was seen. */
 int  keyboard_check_ctrl_c(void);

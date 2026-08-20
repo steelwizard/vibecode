@@ -40,6 +40,16 @@ int  console_at_bottom(void);
 void console_init_framebuffer(const video_mode_t *mode);
 int  console_is_framebuffer(void);
 void console_get_size(int *cols, int *rows);
+void console_get_cursor(int *x, int *y);
+
+/* Mouse pointer / text selection / button hit-rects. */
+void console_mouse_move(int x, int y);
+void console_mouse_pixel(int px, int py);
+void console_mouse_left(int phase, int x, int y); /* 1=down 2=drag 0=up */
+void console_mouse_right(int x, int y);
+int  console_hit_click(int x, int y);
+void console_hit_clear(void);
+void console_hit_add(int x, int y, int w, int h, int action);
 
 /* Modal error: red screen, blue box, bomb + [ OK ]. Enter/Space dismisses.
  * Restores the previous screen afterwards. While capturing (pipes/redirects)

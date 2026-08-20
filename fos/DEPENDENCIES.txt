@@ -1,0 +1,72 @@
+FOS host dependencies
+=====================
+
+Python 3 is required. Scripts use the standard library only
+(no pip packages, no venv).
+
+Install on Debian/Ubuntu (typical):
+
+  sudo apt install make gcc binutils nasm python3 \
+    util-linux dosfstools qemu-system-x86
+
+  # recommended
+  sudo apt install mtools ffmpeg ovmf exfatprogs
+
+  # audio for `make run` (one of these)
+  sudo apt install pipewire-pulse
+  # or: pulseaudio
+
+
+Required to build (`make`)
+--------------------------
+make            GNU Make
+gcc             x86-64 gcc (freestanding kernel + .COM apps + UEFI loader)
+ld, objcopy, nm binutils (elf_x86_64; ld -m i386pep for BOOTX64.EFI)
+nasm            bootloader, kernel entry, IRQ stubs, UEFI trampoline
+python3         foscom_pack.py, fat32_add.py, mkdisk.sh BPB patch,
+                efi/enter_kernel_bin.h
+bash            scripts/mkdisk.sh, scripts/mkdata.sh
+sfdisk          partition tables (package: util-linux)
+mkfs.vfat       FAT32 ESP (package: dosfstools)
+dd, cat, awk    coreutils / gawk (image assembly, symbol addresses)
+
+
+Required to run (`make run`)
+----------------------------
+qemu-system-x86_64    package: qemu-system-x86
+                      needs -device bochs-display, sb16, vmmouse
+
+Audio backend (first match wins unless QEMU_AUDIO= is set):
+  pipewire    default when $XDG_RUNTIME_DIR/pipewire-0 exists
+  pa          PulseAudio fallback
+  also valid: alsa, sdl, none, wav
+
+
+Optional
+--------
+mcopy, mmd          mtools — copy files into the FAT32 image
+                    (python3 scripts/fat32_add.py is the fallback)
+mkfs.exfat          exfatprogs (or exfat-utils) — drive 1: as exFAT
+                    (otherwise data.img is FAT32)
+ffmpeg              DEMO.MP3 on the boot volume (needs libmp3lame)
+                    also scripts/audio_check.py stress files
+OVMF.fd             ovmf — `make run-uefi`
+                    /usr/share/ovmf/OVMF.fd (or set OVMF=)
+vgabios.bin         qemu/seabios ROM — scripts/genfont.py
+                    /usr/share/qemu/vgabios.bin
+Lat15-VGA16.psf.gz  console-setup / kbd — extra check in genfont.py
+
+
+Tests and helpers (python3 + qemu)
+----------------------------------
+scripts/smoke.py         boot + command smoke test
+scripts/audio_check.py   SB16 wavcapture (ffmpeg optional for SONG.MP3)
+scripts/shot.py          headless screendump
+scripts/qemu_cleanup.sh  leftover QEMU processes /tmp junk
+
+
+Windows (`build.bat`)
+---------------------
+Same tools on PATH: nasm, gcc, ld, objcopy, qemu-system-x86_64.
+Disk images still go through bash scripts/mkdisk.sh and mkdata.sh
+(Git Bash / WSL). That path is thinner than `make` on Linux.

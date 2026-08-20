@@ -19,6 +19,7 @@
 #include "heap.h"
 #include "env.h"
 #include "shell.h"
+#include "mouse.h"
 
 #define api ((fos_api_t *)FOS_API_ADDR)
 
@@ -201,6 +202,10 @@ static int api_run_bat(const char *path, const char *args) {
     return shell_run_bat(path, args ? args : "");
 }
 
+static int api_mouse_poll(fos_mouse_t *out) {
+    return mouse_get((mouse_state_t *)out);
+}
+
 void fos_api_init(void) {
     memset((void *)FOS_API_ADDR, 0, sizeof(fos_api_t));
     api->magic = FOS_API_MAGIC;
@@ -262,6 +267,10 @@ void fos_api_init(void) {
     api->begin_capture = console_begin_capture;
     api->end_capture = console_end_capture;
     api->run_bat = api_run_bat;
+    api->sound_buf_size = sb16_buf_size;
+    api->mouse_poll = api_mouse_poll;
+    api->hit_clear = console_hit_clear;
+    api->hit_add = console_hit_add;
     api->cmdline[0] = 0;
     api->pipe_in_len = 0;
 }

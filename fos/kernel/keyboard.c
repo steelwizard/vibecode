@@ -15,6 +15,7 @@
 
 #include "keyboard.h"
 #include "console.h"
+#include "mouse.h"
 #include "string.h"
 
 #define PS2_DATA    0x60   /* data port (read scancodes, write device commands) */
@@ -62,6 +63,13 @@ static int ctrl_count;
 static int altgr_down;     /* right Alt, not left Alt (0x38 vs E0 38) */
 static int serial_esc_state; /* 0=normal, 1=ESC, 2=[/O, 3=digits before ~ */
 static int serial_esc_num;
+
+#define INJ_MAX 64
+static key_type_t inj_type[INJ_MAX];
+static char inj_ch[INJ_MAX];
+static int inj_r;
+static int inj_w;
+static int inj_n;
 
 static void layout_clear(kbd_layout_t *layout, const char *name) {
     memset(layout, 0, sizeof(*layout));
@@ -367,9 +375,47 @@ const char *keyboard_get_layout(void) {
     return current_layout ? current_layout->name : "de";
 }
 
+void keyboard_inject(key_type_t type, char ch) {
+    if (inj_n >= INJ_MAX || type == KEY_NONE) {
+        return;
+    }
+    inj_type[inj_w] = type;
+    inj_ch[inj_w] = ch;
+    inj_w = (inj_w + 1) % INJ_MAX;
+    inj_n++;
+}
+
+void keyboard_inject_str(const char *s) {
+    if (!s) {
+        return;
+    }
+    while (*s) {
+        if (*s == '\n' || *s == '\r') {
+            if (*s == '\n' || s[1] != '\n') {
+                keyboard_inject(KEY_ENTER, 0);
+            }
+        } else if (*s == '\b') {
+            keyboard_inject(KEY_BACKSPACE, 0);
+        } else if ((unsigned char)*s >= 32) {
+            keyboard_inject(KEY_CHAR, *s);
+        }
+        s++;
+    }
+}
+
+static void ps2_drain_mouse(void) {
+    mouse_poll_hw();
+}
+
+static int ps2_kbd_ready(void) {
+    uint8_t st = inb(PS2_STATUS);
+    return (st & 0x01) != 0 && (st & 0x20) == 0;
+}
+
 int keyboard_has_key(void) {
     console_tick_cursor();
-    return serial_has_byte() || ((inb(PS2_STATUS) & 0x01) != 0);
+    ps2_drain_mouse();
+    return inj_n > 0 || serial_has_byte() || ps2_kbd_ready();
 }
 
 static key_event_t key_from_scancode(uint8_t sc) {
@@ -614,12 +660,21 @@ normal_char:
 }
 
 key_event_t keyboard_read_event(void) {
+    ps2_drain_mouse();
+    if (inj_n > 0) {
+        key_event_t ev;
+        ev.type = inj_type[inj_r];
+        ev.ch = inj_ch[inj_r];
+        inj_r = (inj_r + 1) % INJ_MAX;
+        inj_n--;
+        return ev;
+    }
     /* Serial first: `make run` types on COM1. PS/2 status can sit full of
      * break codes and starve q if we always drain the keyboard first. */
     if (serial_has_byte()) {
         return serial_read_event();
     }
-    if ((inb(PS2_STATUS) & 0x01) != 0) {
+    if (ps2_kbd_ready()) {
         return ps2_read_event();
     }
     return (key_event_t){KEY_NONE, 0};

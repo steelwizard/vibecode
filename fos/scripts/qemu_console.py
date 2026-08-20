@@ -34,6 +34,7 @@ class Machine:
             "qemu-system-x86_64",
             "-drive", f"format=raw,file={image},index=0,media=disk",
             "-device", "bochs-display",
+            "-device", "vmmouse,i8042=i8042",
             "-audiodev", f"{audiodev},id=snd0",
             "-device", "sb16,audiodev=snd0,iobase=0x220,irq=5,dma=1",
             "-m", "512M", "-display", "none",

@@ -2,7 +2,7 @@
  * shell.c — DOS-style shell with .COM programs, pipes (|), and redirect (>).
  *
  * Features:
- *   Built-in commands (help, dir, cd, type, drives, ...)
+ *   Built-in commands (help, dir, cd, type/cat, drives, ...)
  *   $NAME / ${NAME} expansion, NAME=value, env / set / unset
  *   External .COM programs via FOSCOM loader (echo.com, etc.)
  *   Pipelines: capture stdout of stage N, feed as pipe_in to stage N+1
@@ -21,6 +21,7 @@
 #include "fos_api.h"
 #include "env.h"
 #include "heap.h"
+#include "mouse.h"
 #include "string.h"
 
 #define LINE_MAX       256
@@ -55,6 +56,7 @@ static char script_lines[SCRIPT_MAX][LINE_MAX];
 static int script_n;
 static int script_depth;
 static int bat_depth;
+static int prompt_cols;
 
 static void set_status(int st);
 static void script_reset(void);
@@ -105,7 +107,9 @@ static void print_prompt(void) {
         return;
     }
     vfs_format_prompt(prompt, sizeof(prompt));
-    console_set_color(10, 0);
+    prompt_cols = (int)strlen(prompt);
+    /* Light green on success, light red after a failed command. */
+    console_set_color(last_status ? 12 : 10, 0);
     console_write(prompt);
     console_set_color(15, 0);
 }
@@ -420,7 +424,7 @@ static void cmd_help(void) {
     console_write_line("  del / erase <path>   Delete file or empty folder");
     console_write_line("  copy <src> <dst>     Copy file");
     console_write_line("  move / ren <src> <dst>  Move or rename file");
-    console_write_line("  type <path>          Print file (or piped text)");
+    console_write_line("  type / cat <path>    Print file (or piped text)");
     console_write_line("  drives / df          List drives");
     console_write_line("  <n>:                 Switch drive");
     console_write_line("  reboot               Reboot");
@@ -433,13 +437,15 @@ static void cmd_help(void) {
     console_write_line("  mem                  RAM map and usage (mem.com)");
     console_write_line("  beep [hz [ms]|file]  Sound Blaster beep (beep.com)");
     console_write_line("  play <file>          WAV/MP3 player (q quits)");
+    console_write_line("  paint [file]         Mouse paint (s save, o open, q quit)");
+    console_write_line("  grep [-inv] PAT [file]  Find lines (fixed string)");
     console_write_line("  cmd1 | cmd2          Pipe stdout to stdin");
     console_write_line("  cmd > file           Redirect stdout to file");
     console_write_line("  Up/Down/Left/Right  Edit command line");
     console_write_line("  PgUp/PgDn            Scroll terminal output");
     console_write_line("  | and >              Pipe / redirect (DE: AltGr+< is |, Shift+< is >)");
     console_write_line("  Tab                  Filename completion");
-    console_write_line("  Ctrl+C               Cancel line / stop dir&type");
+    console_write_line("  Ctrl+C               Cancel line / stop dir&type/cat");
     console_write_line("  NAME=value            Set $NAME (also: export NAME=value)");
     console_write_line("  env / set             List environment");
     console_write_line("  unset NAME            Remove variable");
@@ -624,7 +630,7 @@ static void cmd_type(const char *args) {
 
     if (*args == 0) {
         set_status(1);
-        console_error("TYPE: file required");
+        console_error("TYPE/CAT: file required");
         return;
     }
 
@@ -638,7 +644,7 @@ static void cmd_type(const char *args) {
         if (vfs_read_at(vfs_get_drive(), args, off, chunk, sizeof(chunk), &got) != 0) {
             if (!any) {
                 set_status(1);
-                console_error("TYPE failed");
+                console_error("TYPE/CAT failed");
             }
             return;
         }
@@ -893,6 +899,11 @@ static void cmd_play(const char *args) {
                    "PLAY failed (missing or corrupt PLAY.COM — run: make clean && make)");
 }
 
+static void cmd_paint(const char *args) {
+    run_direct_com("PAINT", args,
+                   "PAINT failed (missing or corrupt PAINT.COM — run: make clean && make)");
+}
+
 static int copy_ident(const char *p, char *name, size_t name_sz, const char **rest) {
     size_t n = 0;
 
@@ -1004,7 +1015,7 @@ static int run_builtin(char *line) {
     } else if (match_cmd(line, "MOVE") || match_cmd(line, "REN") ||
                match_cmd(line, "RENAME")) {
         cmd_move(cmd_arg(line));
-    } else if (match_cmd(line, "TYPE")) {
+    } else if (match_cmd(line, "TYPE") || match_cmd(line, "CAT")) {
         cmd_type(cmd_arg(line));
     } else if (match_cmd(line, "DRIVES") || match_cmd(line, "DF")) {
         cmd_drives();
@@ -1019,6 +1030,8 @@ static int run_builtin(char *line) {
         cmd_less(cmd_arg(line));
     } else if (match_cmd(line, "PLAY")) {
         cmd_play(cmd_arg(line));
+    } else if (match_cmd(line, "PAINT")) {
+        cmd_paint(cmd_arg(line));
     } else if (match_cmd(line, "TRUE")) {
         set_status(0);
     } else if (match_cmd(line, "FALSE")) {
@@ -2145,6 +2158,30 @@ void shell_run(void) {
     print_prompt();
 
     for (;;) {
+        mouse_state_t m;
+
+        (void)keyboard_has_key();
+        if (mouse_get(&m) && (m.pending & MOUSE_CLICK_L)) {
+            int cx;
+            int cy;
+            console_get_cursor(&cx, &cy);
+            if (m.y == cy && m.x >= prompt_cols) {
+                int dest = (int)m.x - prompt_cols;
+                if (dest > line_len) {
+                    dest = line_len;
+                }
+                if (dest < 0) {
+                    dest = 0;
+                }
+                while (line_cursor > dest) {
+                    line_cursor_left();
+                }
+                while (line_cursor < dest) {
+                    line_cursor_right();
+                }
+            }
+        }
+
         if (!keyboard_has_key()) {
             __asm__ volatile("pause");
             continue;

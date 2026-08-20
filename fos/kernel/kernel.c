@@ -26,6 +26,7 @@
 #include "heap.h"
 #include "sb16.h"
 #include "env.h"
+#include "mouse.h"
 
 void kmain(void) {
     /* --- Phase 1: console and CPU --- */
@@ -56,8 +57,15 @@ void kmain(void) {
 
     /* Keyboard HW init; layout comes from SYSTEM.INI after VFS is up. */
     keyboard_init();
+    mouse_init();
     fos_api_init();
-    boot_line("[boot] Input ready (PS/2 keyboard + COM1 serial)");
+    if (mouse_is_absolute()) {
+        boot_line("[boot] Input ready (PS/2 keyboard + absolute mouse + COM1 serial)");
+    } else if (mouse_present()) {
+        boot_line("[boot] Input ready (PS/2 keyboard + mouse + COM1 serial)");
+    } else {
+        boot_line("[boot] Input ready (PS/2 keyboard + COM1 serial; no mouse)");
+    }
     boot_line("");
 
     /* --- Phase 2: disks and config --- */
@@ -77,6 +85,7 @@ void kmain(void) {
     if (video_is_framebuffer()) {
         console_clear_color(15, 1);
     }
+    mouse_on_resize();
     sb16_init();
     boot_line("");
 

@@ -17,6 +17,8 @@ MEM=${12:-}
 EFI=${13:-}
 BEEP=${14:-}
 PLAY=${15:-}
+PAINT=${16:-}
+GREP=${17:-}
 
 TOTAL_SECTORS=131072
 PART_SECTORS=$((TOTAL_SECTORS - PART_START))
@@ -119,6 +121,12 @@ if [ -n "$BEEP" ] && [ -f "$BEEP" ]; then
 fi
 if [ -n "$PLAY" ] && [ -f "$PLAY" ]; then
     add_one FOS/PLAY.COM "$PLAY"
+fi
+if [ -n "$PAINT" ] && [ -f "$PAINT" ]; then
+    add_one FOS/PAINT.COM "$PAINT"
+fi
+if [ -n "$GREP" ] && [ -f "$GREP" ]; then
+    add_one FOS/GREP.COM "$GREP"
 fi
 if [ -f "$SCRIPT_DIR/../demo.bat" ]; then
     add_one FOS/DEMO.BAT "$SCRIPT_DIR/../demo.bat"

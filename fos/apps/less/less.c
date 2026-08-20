@@ -694,6 +694,14 @@ void com_main(void) {
 
     for (;;) {
         while (!api->has_key()) {
+            fos_mouse_t m;
+            if (api->mouse_poll && api->mouse_poll(&m) && (m.pending & 1)) {
+                if (m.y < page_rows / 2) {
+                    scroll_page_up(api);
+                } else {
+                    scroll_page_down(api);
+                }
+            }
             __asm__ volatile("pause");
         }
 

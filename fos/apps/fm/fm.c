@@ -2,8 +2,8 @@
  * fm.c — Directory browser (ncurses-style TUI).
  *
  *   Up/Dn/PgUp/PgDn/Home/End  move selection
- *   Enter                     open directory, or run a .COM / .BAT (line
- *                             output is shown on a grey screen with an OK button)
+ *   Enter                     open directory, run a .COM / .BAT, or open
+ *                             a .PNT in paint
  *   e                         edit file
  *   v                         view file
  *   n                         new empty file
@@ -765,6 +765,13 @@ static int confirm_delete(fos_api_t *api, const char *name) {
     paint_text(api, dlg_x + 2, dlg_y + 1, C_ALERT_BR, C_ALERT_BG, "Delete this file?", dlg_w - 4);
     paint_text(api, dlg_x + 2, dlg_y + 3, C_ALERT_FG, C_ALERT_BG, name, dlg_w - 4);
     paint_text(api, dlg_x + 2, dlg_y + 5, C_ALERT_FG, C_ALERT_BG, "y delete  n cancel", dlg_w - 4);
+    if (api->hit_clear) {
+        api->hit_clear();
+    }
+    if (api->hit_add) {
+        api->hit_add(dlg_x + 2, dlg_y + 5, 8, 1, FOS_HIT_Y);
+        api->hit_add(dlg_x + 12, dlg_y + 5, 8, 1, FOS_HIT_N);
+    }
 
     for (;;) {
         wait_key(api);
@@ -1142,6 +1149,12 @@ static void show_com_output(fos_api_t *api, const char *title, const char *text)
         paint_ch(api, btn_x, btn_y, C_OUT_BR, C_OUT_BG, '[');
         paint_text(api, btn_x + 1, btn_y, C_OUT_BTN_FG, C_OUT_BTN_BG, btn, btn_n);
         paint_ch(api, btn_x + 1 + btn_n, btn_y, C_OUT_BR, C_OUT_BG, ']');
+        if (api->hit_clear) {
+            api->hit_clear();
+        }
+        if (api->hit_add) {
+            api->hit_add(btn_x, btn_y, btn_n + 2, 1, FOS_HIT_ENTER);
+        }
 
         wait_key(api);
         {
@@ -1257,10 +1270,62 @@ static void open_selected(fos_api_t *api) {
     } else if (!pick_mode && is_runnable_name(e->name)) {
         run_selected_prog(api);
         return;
+    } else if (!pick_mode && is_ext_name(e->name, ".PNT")) {
+        char path[256];
+        char args[256];
+        char saved_cwd[256];
+        int saved_drive;
+
+        join_path(path, sizeof(path), cwd, e->name);
+        if (path[0] == '\\') {
+            my_strcpy(args, path + 1);
+        } else {
+            my_strcpy(args, path);
+        }
+        saved_drive = api->get_drive ? api->get_drive() : 0;
+        my_strcpy(saved_cwd, cwd);
+        api->run_com("\\FOS\\PAINT.COM", args);
+        resume_after_com(api, saved_drive, saved_cwd);
+        draw(api);
+        return;
     } else {
         return;
     }
     reload_entries(api);
+}
+
+static uint64_t fm_click_ms;
+static int fm_click_sel = -1;
+
+static int handle_fm_mouse(fos_api_t *api) {
+    fos_mouse_t m;
+
+    if (!api->mouse_poll || !api->mouse_poll(&m) || !(m.pending & 1)) {
+        return 0;
+    }
+    if (m.x >= list_x && m.x < list_x + list_w &&
+        m.y >= list_y && m.y < list_y + list_rows) {
+        int idx = list_scroll + (m.y - list_y);
+        if (idx >= 0 && idx < entry_count) {
+            if (idx == selection && fm_click_sel == idx && api->get_ticks_ms) {
+                uint64_t now = api->get_ticks_ms();
+                if (now - fm_click_ms < 400ull) {
+                    fm_click_sel = -1;
+                    open_selected(api);
+                    draw(api);
+                    return 1;
+                }
+            }
+            selection = idx;
+            fm_click_sel = idx;
+            if (api->get_ticks_ms) {
+                fm_click_ms = api->get_ticks_ms();
+            }
+            draw(api);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void edit_selected(fos_api_t *api) {
@@ -1380,8 +1445,13 @@ void com_main(void) {
     draw(api);
 
     for (;;) {
-        while (!api->has_key()) {
+        (void)api->has_key();
+        if (handle_fm_mouse(api)) {
+            continue;
+        }
+        if (!api->has_key()) {
             __asm__ volatile("pause");
+            continue;
         }
 
         fos_key_event_t ev = api->read_key();

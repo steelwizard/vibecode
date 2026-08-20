@@ -515,6 +515,13 @@ void com_main(void) {
 
     for (;;) {
         while (!api->has_key()) {
+            fos_mouse_t m;
+            if (api->mouse_poll && api->mouse_poll(&m) && (m.pending & 1)) {
+                if (m.y >= 0 && m.y < edit_rows) {
+                    row_col_to_cursor(scroll_line + m.y, m.x);
+                    draw(api);
+                }
+            }
             __asm__ volatile("pause");
         }
 

@@ -52,25 +52,116 @@ void boot_print_drive_table(void) {
     vfs_print_drive_table();
 }
 
-static void boot_print_color_strip(void) {
-    int c;
+static void boot_print_color_strip(int width) {
+    int i;
+    int run;
 
-    for (c = 0; c < 16; c++) {
-        /* 13×5 + 3×4 = 77 — stay under 80 cols to avoid wrap + extra newline */
-        console_write_color(15, (uint8_t)c, (c < 13) ? "     " : "    ");
+    if (width < 16) {
+        width = 16;
+    }
+    run = width / 16;
+    if (run < 1) {
+        run = 1;
+    }
+    for (i = 0; i < 16; i++) {
+        int n;
+        for (n = 0; n < run; n++) {
+            console_write_color(15, (uint8_t)i, " ");
+        }
     }
     console_write_color(15, 4, "\n");
 }
 
 void boot_print_logo(void) {
-    /* White on dark red (VGA fg=15, bg=4). Block letters — F has no bottom bar. */
+    /* 5×5 bitmaps (MSB = left). F has no bottom bar. */
+    static const uint8_t glyphs[3][5] = {
+        { 0x1F, 0x10, 0x1E, 0x10, 0x10 },
+        { 0x1F, 0x11, 0x11, 0x11, 0x1F },
+        { 0x1F, 0x10, 0x0F, 0x01, 0x1F }
+    };
+    const char *tag = "Flash Operating System";
+    char line[256];
+    int cols = 80;
+    int rows = 25;
+    int scale;
+    int gap;
+    int width;
+    int indent;
+    int row;
+    int rep;
+    int i;
+    int n;
+
+    console_get_size(&cols, &rows);
+    /* About half the old splash: 3× on 720p, 2× on VGA 80×25. */
+    scale = (rows - 12) / 10;
+    if (scale < 2) {
+        scale = 2;
+    }
+    if (scale > 3) {
+        scale = 3;
+    }
+    gap = scale;
+    width = 15 * scale + 2 * gap;
+    while (width + 2 > cols && scale > 1) {
+        scale--;
+        gap = scale;
+        width = 15 * scale + 2 * gap;
+    }
+    indent = (cols - width) / 2;
+    if (indent < 0) {
+        indent = 0;
+    }
+
     console_write_line_color(15, 4, "");
-    console_write_line_color(15, 4, "  #####    #####    ##### ");
-    console_write_line_color(15, 4, "  #        #   #    #     ");
-    console_write_line_color(15, 4, "  ####     #   #     #### ");
-    console_write_line_color(15, 4, "  #        #   #        # ");
-    console_write_line_color(15, 4, "  #        #####    ##### ");
-    boot_print_color_strip();
-    console_write_line_color(15, 4, "      Flash Operating System");
+    for (row = 0; row < 5; row++) {
+        for (rep = 0; rep < scale; rep++) {
+            n = 0;
+            for (i = 0; i < indent && n < (int)sizeof(line) - 2; i++) {
+                line[n++] = ' ';
+            }
+            for (i = 0; i < 3; i++) {
+                int bit;
+                if (i > 0) {
+                    int g;
+                    for (g = 0; g < gap && n < (int)sizeof(line) - 2; g++) {
+                        line[n++] = ' ';
+                    }
+                }
+                for (bit = 4; bit >= 0; bit--) {
+                    char ch = (glyphs[i][row] & (uint8_t)(1u << bit)) ? (char)0xDB : ' ';
+                    int s;
+                    for (s = 0; s < scale && n < (int)sizeof(line) - 2; s++) {
+                        line[n++] = ch;
+                    }
+                }
+            }
+            line[n] = 0;
+            console_write_line_color(15, 4, line);
+        }
+    }
+    n = 0;
+    for (i = 0; i < indent && n < (int)sizeof(line) - 2; i++) {
+        line[n++] = ' ';
+    }
+    line[n] = 0;
+    console_write_color(15, 4, line);
+    boot_print_color_strip(width);
+    n = 0;
+    {
+        int tag_len = (int)strlen(tag);
+        int pad = indent + (width - tag_len) / 2;
+        if (pad < 0) {
+            pad = 0;
+        }
+        for (i = 0; i < pad && n < (int)sizeof(line) - 2; i++) {
+            line[n++] = ' ';
+        }
+    }
+    for (i = 0; tag[i] && n < (int)sizeof(line) - 2; i++) {
+        line[n++] = tag[i];
+    }
+    line[n] = 0;
+    console_write_line_color(15, 4, line);
     console_write_line_color(15, 4, "");
 }

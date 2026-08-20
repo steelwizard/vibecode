@@ -5,7 +5,7 @@
  *   play FILE.MP3
  *
  * Full-screen TUI: purple desktop, grey player window, progress bar.
- * q / Esc / Ctrl+C quit immediately while audio plays.
+ * ← → seek 5s, ↑ ↓ 30s, Home / End, q / Esc / Ctrl+C quit.
  */
 
 #include "fos_api.h"
@@ -13,6 +13,8 @@
 
 #define IN_MAX     4096
 #define PCM8_MAX   4096
+#define RING_CAP   (256u * 1024u)
+#define FILE_CAP   (64u * 1024u)
 
 #define BG_DESK    5  /* purple */
 #define FG_DESK    13
@@ -41,6 +43,21 @@
 #define WIN_H      13
 #define BAR_W      (WIN_W - 8)
 
+#define PLAY_OK    0
+#define PLAY_QUIT  1
+#define PLAY_SEEK  2
+#define PLAY_ERR   (-1)
+
+#define SEEK_STEP_MS   5000u
+#define SEEK_JUMP_MS   30000u
+#define SEEK_PAGE_MS   60000u
+#define SEEK_TAIL      0xFFFFFFFFu
+
+#define CH_LEFT    0x1Bu /* ← */
+#define CH_RIGHT   0x1Au /* → */
+#define CH_UP      0x18u /* ↑ */
+#define CH_DOWN    0x19u /* ↓ */
+
 /* Window origin, centred on the real console at startup. */
 static int win_x = (80 - WIN_W) / 2;
 static int win_y = 5;
@@ -62,9 +79,21 @@ static void init_geometry(fos_api_t *api) {
     }
 }
 
-static uint8_t inbuf[IN_MAX];
-static uint8_t pcm8[PCM8_MAX];
+static uint8_t inbuf_fallback[IN_MAX];
+static uint8_t pcm_fallback[PCM8_MAX];
+static uint8_t chunk_fallback[PCM8_MAX];
 static int16_t mp3pcm[FOS_MP3_MAX_SAMPLES];
+
+static uint8_t *filebuf;
+static uint32_t file_cap;
+static uint8_t *ring;
+static uint32_t ring_cap;
+static uint32_t ring_r, ring_w, ring_n;
+static uint8_t *chunkbuf;
+static uint32_t dma_chunk;
+static int prefilled;
+static int have_seek;
+static uint32_t seek_to_ms;
 
 typedef struct {
     const char *path;
@@ -129,6 +158,126 @@ static const char *base_name(const char *path) {
 
 static int ui_available(fos_api_t *api) {
     return api->clear_screen && api->goto_xy && api->set_color && api->putchar;
+}
+
+static void copy_mem(void *dst, const void *src, uint32_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        d[i] = s[i];
+    }
+}
+
+static void setup_bufs(fos_api_t *api) {
+    dma_chunk = PCM8_MAX;
+    if (api->sound_buf_size) {
+        uint32_t n = api->sound_buf_size();
+        if (n >= 1024u && n <= 65536u) {
+            dma_chunk = n;
+        }
+    }
+    file_cap = FILE_CAP;
+    ring_cap = RING_CAP;
+    filebuf = 0;
+    ring = 0;
+    chunkbuf = 0;
+    if (api->mem_alloc) {
+        filebuf = (uint8_t *)api->mem_alloc(file_cap);
+        ring = (uint8_t *)api->mem_alloc(ring_cap);
+        chunkbuf = (uint8_t *)api->mem_alloc(dma_chunk);
+    }
+    if (!filebuf) {
+        filebuf = inbuf_fallback;
+        file_cap = IN_MAX;
+    }
+    if (!ring) {
+        ring = pcm_fallback;
+        ring_cap = PCM8_MAX;
+    }
+    if (!chunkbuf) {
+        if (ring && ring_cap > dma_chunk) {
+            ring_cap -= dma_chunk;
+            chunkbuf = ring + ring_cap;
+        } else {
+            chunkbuf = chunk_fallback;
+            dma_chunk = PCM8_MAX;
+        }
+    }
+    ring_r = ring_w = ring_n = 0;
+    prefilled = 0;
+    have_seek = 0;
+}
+
+static void ring_reset(void) {
+    ring_r = ring_w = ring_n = 0;
+    prefilled = 0;
+}
+
+static void audio_cut(fos_api_t *api) {
+    if (api->sound_stop) {
+        api->sound_stop();
+    }
+    ring_reset();
+    ui.live = 0;
+}
+
+static uint32_t clamp_ms(int64_t ms, uint32_t total) {
+    if (ms < 0) {
+        return 0;
+    }
+    if (total && (uint64_t)ms > (uint64_t)total) {
+        return total;
+    }
+    if ((uint64_t)ms >= (uint64_t)SEEK_TAIL) {
+        return SEEK_TAIL;
+    }
+    return (uint32_t)ms;
+}
+
+/* Decode position minus PCM still sitting in the ring, so seek matches the bar. */
+static uint32_t playhead_ms(void) {
+    uint32_t ms = ui.pos_ms;
+    uint32_t buf;
+    if (ui.rate && ring_n) {
+        buf = (uint32_t)(((uint64_t)ring_n * 1000ull) / ui.rate);
+        if (ms > buf) {
+            ms -= buf;
+        } else {
+            ms = 0;
+        }
+    }
+    return ms;
+}
+
+static void ring_push(const uint8_t *src, uint32_t n) {
+    while (n) {
+        uint32_t space = ring_cap - ring_w;
+        uint32_t m = n < space ? n : space;
+        copy_mem(ring + ring_w, src, m);
+        ring_w += m;
+        if (ring_w == ring_cap) {
+            ring_w = 0;
+        }
+        ring_n += m;
+        src += m;
+        n -= m;
+    }
+}
+
+static void ring_pop(uint8_t *dst, uint32_t n) {
+    while (n) {
+        uint32_t avail = ring_cap - ring_r;
+        uint32_t m = n < avail ? n : avail;
+        copy_mem(dst, ring + ring_r, m);
+        ring_r += m;
+        if (ring_r == ring_cap) {
+            ring_r = 0;
+        }
+        ring_n -= m;
+        dst += m;
+        n -= m;
+    }
 }
 
 static void put_xy(fos_api_t *api, int x, int y, uint8_t fg, uint8_t bg, unsigned char c) {
@@ -224,7 +373,12 @@ static void draw_frame(fos_api_t *api) {
     put_str(api, title_x, win_y + 1, FG_TITLE, BG_TITLE, title, title_len);
 
     inner_fill(api, WIN_H - 2, FG_MUTED, BG_WIN);
-    put_str(api, win_x + 2, win_y + WIN_H - 2, FG_MUTED, BG_WIN, "q  quit", 0);
+    put_xy(api, win_x + 2, win_y + WIN_H - 2, FG_MUTED, BG_WIN, CH_LEFT);
+    put_xy(api, win_x + 3, win_y + WIN_H - 2, FG_MUTED, BG_WIN, CH_RIGHT);
+    put_str(api, win_x + 4, win_y + WIN_H - 2, FG_MUTED, BG_WIN, " 5s  ", 0);
+    put_xy(api, win_x + 9, win_y + WIN_H - 2, FG_MUTED, BG_WIN, CH_UP);
+    put_xy(api, win_x + 10, win_y + WIN_H - 2, FG_MUTED, BG_WIN, CH_DOWN);
+    put_str(api, win_x + 11, win_y + WIN_H - 2, FG_MUTED, BG_WIN, " 30s  q quit", 0);
 
     /* Park the cursor on the help line. */
     x = win_x + 2;
@@ -423,22 +577,87 @@ static int is_quit_key(fos_key_event_t ev) {
     return 0;
 }
 
-static int poll_quit(fos_api_t *api) {
-    int n = 0;
-    if (!api->has_key || !api->read_key) {
+static int apply_seek_key(fos_key_event_t ev, int64_t *t) {
+    switch (ev.type) {
+    case FOS_KEY_LEFT:
+        *t -= (int64_t)SEEK_STEP_MS;
+        return 1;
+    case FOS_KEY_RIGHT:
+        *t += (int64_t)SEEK_STEP_MS;
+        return 1;
+    case FOS_KEY_UP:
+        *t -= (int64_t)SEEK_JUMP_MS;
+        return 1;
+    case FOS_KEY_DOWN:
+        *t += (int64_t)SEEK_JUMP_MS;
+        return 1;
+    case FOS_KEY_PAGEUP:
+        *t -= (int64_t)SEEK_PAGE_MS;
+        return 1;
+    case FOS_KEY_PAGEDOWN:
+        *t += (int64_t)SEEK_PAGE_MS;
+        return 1;
+    case FOS_KEY_HOME:
+        *t = 0;
+        return 1;
+    case FOS_KEY_END:
+        *t = ui.total_ms ? (int64_t)ui.total_ms : (int64_t)SEEK_TAIL;
+        return 1;
+    default:
         return 0;
     }
-    while (n < 8 && api->has_key()) {
+}
+
+static int poll_cmd(fos_api_t *api) {
+    int n = 0;
+    int got_seek = 0;
+    int64_t t = 0;
+
+    if (!api->has_key || !api->read_key) {
+        return PLAY_OK;
+    }
+    while (n < 16 && api->has_key()) {
         fos_key_event_t ev = api->read_key();
         n++;
         if (is_quit_key(ev)) {
-            return 1;
+            return PLAY_QUIT;
         }
         if (ev.type == FOS_KEY_NONE) {
-            break;
+            continue;
+        }
+        if (!got_seek) {
+            t = (int64_t)playhead_ms();
+        }
+        if (apply_seek_key(ev, &t)) {
+            got_seek = 1;
         }
     }
-    return 0;
+    if (got_seek) {
+        seek_to_ms = clamp_ms(t, ui.total_ms);
+        have_seek = 1;
+        return PLAY_SEEK;
+    }
+    /* Drain PS/2 even when no keys are waiting so the pointer keeps moving. */
+    if (api->has_key) {
+        (void)api->has_key();
+    }
+    if (got_seek) {
+        seek_to_ms = clamp_ms(t, ui.total_ms);
+        have_seek = 1;
+        return PLAY_SEEK;
+    }
+    if (api->mouse_poll) {
+        fos_mouse_t m;
+        int cols = 80;
+        int rows = 25;
+        if (api->get_term_size) {
+            api->get_term_size(&cols, &rows);
+        }
+        if (api->mouse_poll(&m) && (m.pending & 1) && m.y >= rows - 1) {
+            return PLAY_QUIT;
+        }
+    }
+    return PLAY_OK;
 }
 
 static void ui_live_tick(fos_api_t *api) {
@@ -456,38 +675,54 @@ static void ui_live_tick(fos_api_t *api) {
     ui_progress(api, ui.pos, ui.total, pos_ms, ui.total_ms);
 }
 
-/* The driver holds at most two buffers, so nothing should take longer than a
- * couple of chunks. Anything beyond that means the card stopped reporting and
- * we drop the tail rather than lock up the machine. */
-static uint32_t wait_budget_ms(void) {
-    uint32_t budget = ui.live_chunk_ms * 2u + 1000u;
-    return budget < 1000u ? 1000u : budget;
-}
-
+/* Wait for a DMA slot, or for the stream to finish. Never kill a live
+ * stream on a short timer — a CD-quality song is minutes long. */
 static int wait_audio(fos_api_t *api, int for_slot) {
     uint64_t start;
-    uint32_t budget = wait_budget_ms();
 
     __asm__ volatile("sti");
     start = api->get_ticks_ms ? api->get_ticks_ms() : 0;
     for (;;) {
         if (for_slot) {
-            if (api->sound_can_queue()) {
+            if (!api->sound_can_queue || api->sound_can_queue()) {
                 return 0;
             }
         } else if (!api->sound_playing || !api->sound_playing()) {
             break;
         }
-        if (poll_quit(api)) {
+        int cmd = poll_cmd(api);
+        if (cmd == PLAY_QUIT) {
             api->sound_stop();
             ui.live = 0;
             ui_set_status(api, "Stopped", FG_MUTED);
-            return 1;
+            return PLAY_QUIT;
+        }
+        if (cmd == PLAY_SEEK) {
+            api->sound_stop();
+            ui.live = 0;
+            return PLAY_SEEK;
         }
         ui_live_tick(api);
-        if (api->get_ticks_ms && api->get_ticks_ms() - start > budget) {
-            api->sound_stop();
-            break;
+        if (api->get_ticks_ms) {
+            uint64_t now = api->get_ticks_ms();
+            if (for_slot) {
+                /* Do not call sound_playing() here: that starts a primed
+                 * single half before the second DMA buffer is full. */
+                if (now - start > 30000ull) {
+                    if (api->sound_stop) {
+                        api->sound_stop();
+                    }
+                    break;
+                }
+            } else {
+                int live = api->sound_playing && api->sound_playing();
+                if (!live && now - start > 8000ull) {
+                    if (api->sound_stop) {
+                        api->sound_stop();
+                    }
+                    break;
+                }
+            }
         }
         __asm__ volatile("pause");
     }
@@ -506,14 +741,11 @@ static int wait_slot(fos_api_t *api) {
     return wait_idle(api);
 }
 
-static int queue_pcm(fos_api_t *api, const uint8_t *pcm, uint32_t n, uint32_t rate) {
+static int queue_direct(fos_api_t *api, const uint8_t *pcm, uint32_t n, uint32_t rate) {
     uint32_t chunk_ms;
 
     if (n == 0) {
         return 0;
-    }
-    if (wait_slot(api)) {
-        return 1;
     }
     if (api->sound_start) {
         if (api->sound_start(pcm, n, rate) != 0) {
@@ -530,11 +762,87 @@ static int queue_pcm(fos_api_t *api, const uint8_t *pcm, uint32_t n, uint32_t ra
     return 0;
 }
 
-static int finish_playback(fos_api_t *api) {
-    if (wait_idle(api)) {
-        return 1;
+/* block: 0 = don't wait, 1 = wait for one DMA slot, 2 = flush a short tail. */
+static int feed_card(fos_api_t *api, uint32_t rate, int block) {
+    int fed = 0;
+
+    if (!prefilled && block != 2) {
+        if (ring_n < dma_chunk * 2u && ring_n < ring_cap) {
+            return 0;
+        }
+        prefilled = 1;
+    }
+    for (;;) {
+        uint32_t n;
+        int q;
+        if (ring_n == 0) {
+            return 0;
+        }
+        if (ring_n < dma_chunk) {
+            if (block != 2) {
+                return 0;
+            }
+            n = ring_n;
+        } else {
+            n = dma_chunk;
+        }
+        if (api->sound_can_queue && !api->sound_can_queue()) {
+            int w;
+            if (block == 0 || (block == 1 && fed)) {
+                return 0;
+            }
+            w = wait_slot(api);
+            if (w != PLAY_OK) {
+                return w;
+            }
+        }
+        ring_pop(chunkbuf, n);
+        q = queue_direct(api, chunkbuf, n, rate);
+        if (q != 0) {
+            return q;
+        }
+        fed = 1;
+    }
+}
+
+static int queue_pcm(fos_api_t *api, const uint8_t *pcm, uint32_t n, uint32_t rate) {
+    uint32_t off = 0;
+
+    if (n == 0) {
+        return 0;
+    }
+    while (off < n) {
+        uint32_t space = ring_cap - ring_n;
+        uint32_t m;
+        if (space == 0) {
+            int f = feed_card(api, rate, 1);
+            if (f != PLAY_OK) {
+                return f;
+            }
+            continue;
+        }
+        m = n - off;
+        if (m > space) {
+            m = space;
+        }
+        ring_push(pcm + off, m);
+        off += m;
+        {
+            int f = feed_card(api, rate, 0);
+            if (f != PLAY_OK) {
+                return f;
+            }
+        }
     }
     return 0;
+}
+
+static int finish_playback(fos_api_t *api) {
+    int f = feed_card(api, ui.rate ? ui.rate : 44100, 2);
+    if (f != PLAY_OK) {
+        return f;
+    }
+    return wait_idle(api);
 }
 
 static uint32_t bytes_to_ms(uint32_t bytes, uint32_t frame, uint32_t rate) {
@@ -666,6 +974,42 @@ static int parse_wav(fos_api_t *api, const char *path, uint32_t file_size,
     return 0;
 }
 
+static void wav_apply_seek(fos_api_t *api, uint32_t *pos, uint32_t data_len,
+                           uint32_t frame, uint32_t rate) {
+    uint64_t samples;
+    uint32_t ms;
+
+    audio_cut(api);
+    have_seek = 0;
+    ms = seek_to_ms;
+    if (ms == SEEK_TAIL || frame == 0 || rate == 0) {
+        *pos = data_len;
+    } else {
+        samples = ((uint64_t)ms * rate) / 1000ull;
+        if (samples > (uint64_t)(data_len / frame)) {
+            *pos = data_len;
+        } else {
+            *pos = (uint32_t)(samples * frame);
+            *pos -= *pos % frame;
+        }
+    }
+    ms = bytes_to_ms(*pos, frame, rate);
+    ui.status = "Playing";
+    ui.status_fg = FG_OK;
+    ui_progress(api, *pos, data_len, ms, bytes_to_ms(data_len, frame, rate));
+}
+
+static int wait_done_keys(fos_api_t *api) {
+    __asm__ volatile("sti");
+    for (;;) {
+        int cmd = poll_cmd(api);
+        if (cmd != PLAY_OK) {
+            return cmd;
+        }
+        __asm__ volatile("pause");
+    }
+}
+
 static int play_wav(fos_api_t *api, const char *path, uint32_t file_size) {
     uint32_t data_off = 0, data_len = 0, rate = 8000, pos = 0;
     uint16_t ch = 1, bits = 8;
@@ -699,57 +1043,99 @@ static int play_wav(fos_api_t *api, const char *path, uint32_t file_size) {
     draw_meta(api);
     ui_progress(api, 0, data_len, 0, bytes_to_ms(data_len, frame, rate));
     drain_keys(api);
+    __asm__ volatile("sti");
 
-    while (pos < data_len) {
-        uint32_t want = data_len - pos;
-        uint32_t got = 0;
-        uint32_t n8;
-        int q;
+    for (;;) {
+        int cmd;
 
-        if (poll_quit(api)) {
-            api->sound_stop();
-            ui_set_status(api, "Stopped", FG_MUTED);
+        ui.status = "Playing";
+        ui.status_fg = FG_OK;
+        while (pos < data_len) {
+            uint32_t want = data_len - pos;
+            uint32_t got = 0;
+            uint32_t src_off;
+            int q;
+            int jumped = 0;
+
+            cmd = poll_cmd(api);
+            if (cmd == PLAY_QUIT) {
+                api->sound_stop();
+                ui_set_status(api, "Stopped", FG_MUTED);
+                return 0;
+            }
+            if (cmd == PLAY_SEEK) {
+                wav_apply_seek(api, &pos, data_len, frame, rate);
+                continue;
+            }
+            if (want > file_cap) {
+                want = file_cap;
+            }
+            want -= want % frame;
+            if (want == 0) {
+                break;
+            }
+            if (api->read_at(path, data_off + pos, filebuf, want, &got) != 0 || got == 0) {
+                break;
+            }
+            got -= got % frame;
+            src_off = 0;
+            while (src_off < got) {
+                uint8_t tmp[2048];
+                uint32_t n8;
+                uint32_t take = got - src_off;
+                if (bits == 8) {
+                    n8 = u8_to_mono(filebuf + src_off, take, ch, tmp, 2048);
+                    src_off += n8 * (uint32_t)ch;
+                } else {
+                    n8 = s16le_to_u8_mono(filebuf + src_off, take, ch, tmp, 2048);
+                    src_off += n8 * (uint32_t)ch * 2u;
+                }
+                if (n8 == 0) {
+                    break;
+                }
+                q = queue_pcm(api, tmp, n8, rate);
+                if (q == PLAY_QUIT) {
+                    return 0;
+                }
+                if (q == PLAY_SEEK) {
+                    wav_apply_seek(api, &pos, data_len, frame, rate);
+                    jumped = 1;
+                    break;
+                }
+                if (q != PLAY_OK) {
+                    ui_set_status(api, "Playback failed", FG_ERR);
+                    ui_wait_key(api);
+                    return -1;
+                }
+            }
+            if (jumped) {
+                continue;
+            }
+            pos += got;
+            ui_progress(api, pos, data_len,
+                        bytes_to_ms(pos, frame, rate),
+                        bytes_to_ms(data_len, frame, rate));
+        }
+
+        cmd = finish_playback(api);
+        if (cmd == PLAY_QUIT) {
             return 0;
         }
-        if (want > IN_MAX) {
-            want = IN_MAX;
+        if (cmd == PLAY_SEEK) {
+            wav_apply_seek(api, &pos, data_len, frame, rate);
+            continue;
         }
-        want -= want % frame;
-        if (want == 0) {
-            break;
-        }
-        if (api->read_at(path, data_off + pos, inbuf, want, &got) != 0 || got == 0) {
-            break;
-        }
-        got -= got % frame;
-        if (bits == 8) {
-            n8 = u8_to_mono(inbuf, got, ch, pcm8, PCM8_MAX);
-        } else {
-            n8 = s16le_to_u8_mono(inbuf, got, ch, pcm8, PCM8_MAX);
-        }
-        q = queue_pcm(api, pcm8, n8, rate);
-        if (q == 1) {
-            return 0;
-        }
-        if (q != 0) {
-            ui_set_status(api, "Playback failed", FG_ERR);
-            ui_wait_key(api);
-            return -1;
-        }
-        pos += got;
-        ui_progress(api, pos, data_len,
-                    bytes_to_ms(pos, frame, rate),
+        ui_progress(api, data_len, data_len,
+                    bytes_to_ms(data_len, frame, rate),
                     bytes_to_ms(data_len, frame, rate));
-    }
-
-    if (finish_playback(api)) {
+        ui_set_status(api, "Done", FG_OK);
+        cmd = wait_done_keys(api);
+        if (cmd == PLAY_SEEK) {
+            wav_apply_seek(api, &pos, data_len, frame, rate);
+            continue;
+        }
         return 0;
     }
-    ui_progress(api, data_len, data_len,
-                bytes_to_ms(data_len, frame, rate),
-                bytes_to_ms(data_len, frame, rate));
-    ui_set_status(api, "Done", FG_OK);
-    return 0;
 }
 
 static uint32_t skip_id3(fos_api_t *api, const char *path, uint32_t file_size) {
@@ -790,16 +1176,66 @@ static int looks_mp3(const uint8_t *p, uint32_t n) {
     return 0;
 }
 
+static void mp3_apply_seek(fos_api_t *api, uint32_t *file_off, uint32_t *in_off,
+                           uint32_t *fill, int *eof, uint64_t *played,
+                           uint32_t rate, uint32_t id3, uint32_t payload,
+                           int *skip_frame) {
+    uint32_t ms = seek_to_ms;
+    uint32_t body;
+
+    audio_cut(api);
+    have_seek = 0;
+    fos_mp3_init();
+    *in_off = 0;
+    *fill = 0;
+    *eof = 0;
+    *skip_frame = 0;
+
+    if (ms == SEEK_TAIL || (ui.total_ms && ms >= ui.total_ms)) {
+        *file_off = id3 + payload;
+        *eof = 1;
+        *played = (rate && ui.total_ms) ? ((uint64_t)ui.total_ms * rate) / 1000ull : *played;
+        ui.status = "Playing";
+        ui.status_fg = FG_OK;
+        ui_progress(api, payload, payload, ui.total_ms, ui.total_ms);
+        return;
+    }
+
+    if (ui.total_ms) {
+        body = (uint32_t)(((uint64_t)ms * payload) / ui.total_ms);
+    } else {
+        body = ms * 16u;
+        if (body > payload) {
+            body = payload;
+        }
+    }
+    *file_off = id3 + body;
+    if (*file_off < id3) {
+        *file_off = id3;
+    }
+    if (*file_off > id3 + payload) {
+        *file_off = id3 + payload;
+    }
+    if (rate) {
+        *played = ((uint64_t)ms * rate) / 1000ull;
+    }
+    *skip_frame = (*file_off > id3);
+    ui.status = "Playing";
+    ui.status_fg = FG_OK;
+    ui_progress(api, body, payload, ms, ui.total_ms);
+}
+
 static int play_mp3(fos_api_t *api, const char *path, uint32_t file_size) {
     uint32_t file_off;
     uint32_t id3;
     uint32_t payload;
+    uint32_t in_off = 0;
     uint32_t fill = 0;
     int eof = 0;
     int started = 0;
+    int skip_frame = 0;
     uint32_t rate = 44100;
     uint64_t played = 0;
-    uint32_t acc = 0;
 
     id3 = skip_id3(api, path, file_size);
     file_off = id3;
@@ -815,137 +1251,155 @@ static int play_mp3(fos_api_t *api, const char *path, uint32_t file_size) {
     draw_meta(api);
     ui_progress(api, 0, payload, 0, 0);
     drain_keys(api);
+    __asm__ volatile("sti");
 
-    while (!eof || fill > 16) {
-        int samples;
-        uint32_t n8;
-        int frame_bytes = 0;
-        int channels = 1;
-        int hz = 44100;
-        uint32_t consumed;
-        uint32_t pos_ms;
-        uint32_t tot_ms;
-        int q;
+    for (;;) {
+        int cmd;
 
-        if (poll_quit(api)) {
-            api->sound_stop();
-            ui_set_status(api, "Stopped", FG_MUTED);
-            return 0;
-        }
+        ui.status = "Playing";
+        ui.status_fg = FG_OK;
+        while (!eof || fill - in_off > 16) {
+            int samples;
+            uint32_t n8;
+            int frame_bytes = 0;
+            int channels = 1;
+            int hz = 44100;
+            uint32_t consumed;
+            uint32_t pos_ms;
+            uint32_t tot_ms;
+            int q;
+            uint32_t avail;
 
-        if (!eof && fill < IN_MAX / 2) {
-            uint32_t got = 0;
-            uint32_t want = IN_MAX - fill;
-            if (api->read_at(path, file_off, inbuf + fill, want, &got) != 0) {
-                ui_set_status(api, "Read failed", FG_ERR);
-                ui_wait_key(api);
-                return -1;
+            cmd = poll_cmd(api);
+            if (cmd == PLAY_QUIT) {
+                api->sound_stop();
+                ui_set_status(api, "Stopped", FG_MUTED);
+                return 0;
             }
-            if (got == 0) {
-                eof = 1;
-            } else {
-                fill += got;
-                file_off += got;
+            if (cmd == PLAY_SEEK) {
+                mp3_apply_seek(api, &file_off, &in_off, &fill, &eof, &played,
+                               rate, id3, payload, &skip_frame);
+                continue;
             }
-        }
 
-        if (fill < 4) {
-            break;
-        }
-
-        samples = fos_mp3_decode(inbuf, (int)fill, mp3pcm, &frame_bytes, &channels, &hz);
-        if (frame_bytes <= 0) {
-            if (eof) {
-                break;
-            }
-            if (fill == IN_MAX) {
-                uint32_t i;
-                for (i = 1; i < fill; i++) {
-                    inbuf[i - 1] = inbuf[i];
+            avail = fill - in_off;
+            if (!eof && avail < file_cap / 4) {
+                uint32_t got = 0;
+                uint32_t want;
+                if (in_off > 0 && avail > 0) {
+                    copy_mem(filebuf, filebuf + in_off, avail);
                 }
-                fill--;
-            }
-            continue;
-        }
-
-        if ((uint32_t)frame_bytes > fill) {
-            break;
-        }
-        {
-            uint32_t i;
-            uint32_t rest = fill - (uint32_t)frame_bytes;
-            for (i = 0; i < rest; i++) {
-                inbuf[i] = inbuf[i + (uint32_t)frame_bytes];
-            }
-            fill = rest;
-        }
-
-        if (samples <= 0) {
-            continue;
-        }
-        if (!started) {
-            rate = (uint32_t)hz;
-            if (rate < 4000) {
-                rate = 4000;
-            }
-            ui.rate = rate;
-            ui.ch = (uint16_t)channels;
-            draw_meta(api);
-            started = 1;
-        }
-        {
-            uint8_t tmp[2304];
-            uint32_t i;
-            n8 = s16_to_u8_mono(mp3pcm, samples, channels, tmp, 2304);
-            for (i = 0; i < n8; i++) {
-                pcm8[acc++] = tmp[i];
-                if (acc == PCM8_MAX) {
-                    q = queue_pcm(api, pcm8, PCM8_MAX, rate);
-                    if (q == 1) {
-                        return 0;
-                    }
-                    if (q != 0) {
-                        ui_set_status(api, "Playback failed", FG_ERR);
+                fill = avail;
+                in_off = 0;
+                want = file_cap - fill;
+                if (want > 0) {
+                    if (api->read_at(path, file_off, filebuf + fill, want, &got) != 0) {
+                        ui_set_status(api, "Read failed", FG_ERR);
                         ui_wait_key(api);
                         return -1;
                     }
-                    acc = 0;
+                    if (got == 0) {
+                        eof = 1;
+                    } else {
+                        fill += got;
+                        file_off += got;
+                    }
+                }
+                avail = fill - in_off;
+            }
+
+            if (avail < 4) {
+                break;
+            }
+
+            samples = fos_mp3_decode(filebuf + in_off, (int)avail, mp3pcm,
+                                     &frame_bytes, &channels, &hz);
+            if (frame_bytes <= 0) {
+                if (eof) {
+                    break;
+                }
+                in_off++;
+                continue;
+            }
+
+            if ((uint32_t)frame_bytes > avail) {
+                break;
+            }
+            in_off += (uint32_t)frame_bytes;
+
+            if (samples <= 0) {
+                continue;
+            }
+            if (!started) {
+                rate = (uint32_t)hz;
+                if (rate < 4000) {
+                    rate = 4000;
+                }
+                if (rate > 44100) {
+                    rate = 44100;
+                }
+                ui.rate = rate;
+                ui.ch = (uint16_t)channels;
+                draw_meta(api);
+                started = 1;
+            }
+            if (skip_frame) {
+                skip_frame = 0;
+                continue;
+            }
+            {
+                uint8_t tmp[2304];
+                n8 = s16_to_u8_mono(mp3pcm, samples, channels, tmp, 2304);
+                q = queue_pcm(api, tmp, n8, rate);
+                if (q == PLAY_QUIT) {
+                    return 0;
+                }
+                if (q == PLAY_SEEK) {
+                    mp3_apply_seek(api, &file_off, &in_off, &fill, &eof, &played,
+                                   rate, id3, payload, &skip_frame);
+                    continue;
+                }
+                if (q != PLAY_OK) {
+                    ui_set_status(api, "Playback failed", FG_ERR);
+                    ui_wait_key(api);
+                    return -1;
                 }
             }
+            played += (uint32_t)samples;
+            consumed = file_off > id3 ? file_off - id3 : 0;
+            if (consumed > payload) {
+                consumed = payload;
+            }
+            pos_ms = rate ? (uint32_t)((played * 1000ull) / rate) : 0;
+            tot_ms = 0;
+            if (consumed > 0 && pos_ms > 0) {
+                tot_ms = (uint32_t)(((uint64_t)pos_ms * payload) / consumed);
+            }
+            ui_progress(api, consumed, payload, pos_ms, tot_ms);
         }
-        played += (uint32_t)samples;
-        consumed = file_off > id3 ? file_off - id3 : 0;
-        if (consumed > payload) {
-            consumed = payload;
-        }
-        pos_ms = rate ? (uint32_t)((played * 1000ull) / rate) : 0;
-        tot_ms = 0;
-        if (consumed > 0 && pos_ms > 0) {
-            tot_ms = (uint32_t)(((uint64_t)pos_ms * payload) / consumed);
-        }
-        ui_progress(api, consumed, payload, pos_ms, tot_ms);
-    }
 
-    if (acc > 0) {
-        int fq = queue_pcm(api, pcm8, acc, rate);
-        if (fq == 1) {
+        cmd = finish_playback(api);
+        if (cmd == PLAY_QUIT) {
             return 0;
         }
-        if (fq != 0) {
-            ui_set_status(api, "Playback failed", FG_ERR);
-            ui_wait_key(api);
-            return -1;
+        if (cmd == PLAY_SEEK) {
+            mp3_apply_seek(api, &file_off, &in_off, &fill, &eof, &played,
+                           rate, id3, payload, &skip_frame);
+            continue;
         }
-    }
-    if (finish_playback(api)) {
+        {
+            uint32_t pos_ms = rate ? (uint32_t)((played * 1000ull) / rate) : 0;
+            ui_progress(api, payload, payload, pos_ms, pos_ms ? pos_ms : ui.total_ms);
+        }
+        ui_set_status(api, "Done", FG_OK);
+        cmd = wait_done_keys(api);
+        if (cmd == PLAY_SEEK) {
+            mp3_apply_seek(api, &file_off, &in_off, &fill, &eof, &played,
+                           rate, id3, payload, &skip_frame);
+            continue;
+        }
         return 0;
     }
-    {
-        uint32_t pos_ms = rate ? (uint32_t)((played * 1000ull) / rate) : 0;
-        ui_progress(api, payload, payload, pos_ms, pos_ms);
-    }
-    ui_set_status(api, "Done", FG_OK);
-    return 0;
 }
 
 void com_main(void) {
@@ -966,6 +1420,7 @@ void com_main(void) {
         api->begin_direct();
     }
     ui_begin(api, path);
+    setup_bufs(api);
 
     if (!api->sound_present || !api->sound_play || !api->read_at || !api->stat_file) {
         if (api->show_error) {

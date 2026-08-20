@@ -98,6 +98,18 @@ typedef struct {
 } fos_rtc_t;
 
 typedef struct {
+    int16_t x;
+    int16_t y;
+    uint8_t buttons; /* 1=left 2=right 4=middle */
+    uint8_t pending; /* 1=left click 2=right click */
+} fos_mouse_t;
+
+#define FOS_HIT_ENTER 1
+#define FOS_HIT_ESC   2
+#define FOS_HIT_Y     3
+#define FOS_HIT_N     4
+
+typedef struct {
     uint32_t magic;
     void (*write)(const char *s);
     void (*write_n)(const char *s, size_t n);
@@ -170,6 +182,14 @@ typedef struct {
     size_t (*end_capture)(void);
     /* Run a .BAT by path (same language as the shell). 0 = ran, -1 = missing. */
     int (*run_bat)(const char *path, const char *args);
+    /* ISA DMA half-buffer size in bytes (8-bit unsigned mono). Queue this
+     * much at a time; shorter blocks are padded with silence. */
+    uint32_t (*sound_buf_size)(void);
+    /* Mouse: cell coords, button bits (1=left 2=right 4=middle), pending
+     * click bits (1=left 2=right). Returns 1 if a mouse is present. */
+    int (*mouse_poll)(fos_mouse_t *out);
+    void (*hit_clear)(void);
+    void (*hit_add)(int x, int y, int w, int h, int action);
 } fos_api_t;
 
 void fos_api_init(void);
