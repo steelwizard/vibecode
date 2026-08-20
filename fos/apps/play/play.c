@@ -4,7 +4,7 @@
  *   play FILE.WAV
  *   play FILE.MP3
  *
- * Full-screen TUI: purple desktop, grey player window, progress bar.
+ * Full-screen TUI: purple desktop, grey player, blue title bar.
  * ← → seek 5s, ↑ ↓ 30s, Home / End, q / Esc / Ctrl+C quit.
  */
 
@@ -22,8 +22,8 @@
 #define BG_WIN     7  /* light grey */
 #define FG_WIN     0  /* black */
 #define FG_MUTED   8
-#define FG_TITLE   15
-#define BG_TITLE   5
+#define FG_TITLE   15 /* white on blue, like PAINT */
+#define BG_TITLE   1
 #define FG_BAR     5
 #define FG_EMPTY   8
 #define FG_ERR     4

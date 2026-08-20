@@ -3,7 +3,7 @@
  *
  * Features:
  *   Built-in commands (help, dir, cd, type/cat, drives, ...)
- *   $NAME / ${NAME} expansion, NAME=value, env / set / unset
+ *   $NAME / ${NAME} expansion, NAME=value, i++ / i=i+1, env / set / unset
  *   External .COM programs via FOSCOM loader (echo.com, etc.)
  *   Pipelines: capture stdout of stage N, feed as pipe_in to stage N+1
  *   Redirect: capture stdout and write to a file on FAT32
@@ -317,13 +317,7 @@ static int path_join(char *out, size_t out_sz, const char *dir, const char *file
 }
 
 static int com_exists(const char *path) {
-    uint32_t size = 0;
-    int is_dir = 0;
-
-    if (vfs_stat(vfs_get_drive(), path, &size, &is_dir) != 0) {
-        return 0;
-    }
-    return !is_dir;
+    return vfs_locate_file(vfs_get_drive(), path) >= 0;
 }
 
 /*
@@ -446,11 +440,11 @@ static void cmd_help(void) {
     console_write_line("  | and >              Pipe / redirect (DE: AltGr+< is |, Shift+< is >)");
     console_write_line("  Tab                  Filename completion");
     console_write_line("  Ctrl+C               Cancel line / stop dir&type/cat");
-    console_write_line("  NAME=value            Set $NAME (also: export NAME=value)");
+    console_write_line("  NAME=value            Set $NAME (i++ i=i+1 i+=n)");
     console_write_line("  env / set             List environment");
     console_write_line("  unset NAME            Remove variable");
     console_write_line("  echo $PATH            Expand $NAME or ${NAME} (not in 'quotes')");
-    console_write_line("  echo $(1+5)           Integer math (+ - * / % and parentheses)");
+    console_write_line("  echo $(1+5)           Integer math (+ - * / %; names ok)");
     console_write_line("  PATH                  $PATH for .COM / .BAT lookup (default \\FOS)");
     console_write_line("  echo %1 / %PATH%      .BAT args %0..%9 %* and %NAME%");
     console_write_line("  if exist f then cmd   Also: errorlevel N, true/false, A == B");
@@ -921,12 +915,16 @@ static int copy_ident(const char *p, char *name, size_t name_sz, const char **re
     return n > 0;
 }
 
-/* NAME=value, export NAME[=value], unset NAME, env, set. */
+/* NAME=value, export NAME[=value], unset NAME, env, set.
+ * Also: i++ / ++i / i-- / --i, i+=n (and -= *= /= %=), and i=i+1. */
 static int try_env_command(char *line) {
     const char *p = skip_spaces(line);
     char name[ENV_NAME_MAX];
     const char *rest;
     int exporting = 0;
+    int64_t n;
+    int64_t cur;
+    char op;
 
     if (match_cmd(p, "ENV") || (match_cmd(p, "SET") && cmd_arg(p)[0] == 0)) {
         env_print();
@@ -961,13 +959,80 @@ static int try_env_command(char *line) {
         }
     }
 
+    /* ++i / --i */
+    if ((p[0] == '+' || p[0] == '-') && p[1] == p[0] &&
+        copy_ident(skip_spaces(p + 2), name, sizeof(name), &rest) &&
+        *skip_spaces(rest) == 0) {
+        if (env_get_i64(name, &cur) != 0 ||
+            env_set_i64(name, cur + (p[0] == '+' ? 1 : -1)) != 0) {
+            console_error("not a number");
+            set_status(1);
+        }
+        return 1;
+    }
+
     if (!copy_ident(p, name, sizeof(name), &rest)) {
         return 0;
     }
     rest = skip_spaces(rest);
+
+    /* i++ / i-- */
+    if ((rest[0] == '+' || rest[0] == '-') && rest[1] == rest[0] &&
+        *skip_spaces(rest + 2) == 0) {
+        if (env_get_i64(name, &cur) != 0 ||
+            env_set_i64(name, cur + (rest[0] == '+' ? 1 : -1)) != 0) {
+            console_error("not a number");
+            set_status(1);
+        }
+        return 1;
+    }
+
+    /* i+=n i-=n i*=n i/=n i%=n */
+    op = rest[0];
+    if ((op == '+' || op == '-' || op == '*' || op == '/' || op == '%') &&
+        rest[1] == '=') {
+        rest = skip_spaces(rest + 2);
+        if (env_arith_eval(rest, &n) != 0) {
+            console_error("bad arithmetic");
+            set_status(1);
+            return 1;
+        }
+        if (env_get_i64(name, &cur) != 0) {
+            console_error("not a number");
+            set_status(1);
+            return 1;
+        }
+        if ((op == '/' || op == '%') && n == 0) {
+            console_error("division by zero");
+            set_status(1);
+            return 1;
+        }
+        if (op == '+') {
+            cur += n;
+        } else if (op == '-') {
+            cur -= n;
+        } else if (op == '*') {
+            cur *= n;
+        } else if (op == '/') {
+            cur /= n;
+        } else {
+            cur %= n;
+        }
+        if (env_set_i64(name, cur) != 0) {
+            console_error("Cannot set variable");
+            set_status(1);
+        }
+        return 1;
+    }
+
     if (*rest == '=') {
         rest++;
-        if (env_set(name, rest) != 0) {
+        if (env_try_arith(rest, &n) == 0) {
+            if (env_set_i64(name, n) != 0) {
+                console_error("Cannot set variable");
+                set_status(1);
+            }
+        } else if (env_set(name, rest) != 0) {
             console_error("Cannot set variable");
             set_status(1);
         }

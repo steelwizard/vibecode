@@ -82,6 +82,9 @@ static void utf16le_append_ascii(const uint16_t *src, int chars, char *dst, size
     size_t n = strlen(dst);
     for (int i = 0; i < chars && n + 1 < sz; i++) {
         uint16_t ch = src[i];
+        if (ch == 0) {
+            break;
+        }
         if (ch < 128) {
             dst[n++] = (char)ch;
         } else {
@@ -121,8 +124,7 @@ static int walk_dir_cluster(exfat_vol_t *vol, uint32_t cluster, exfat_dir_cb cb,
                             first_cluster = rd32(se + 20);
                             got |= 1;
                         } else if (se[0] == 0xC1) {
-                            uint8_t nchars = se[1];
-                            utf16le_append_ascii((const uint16_t *)(se + 2), nchars,
+                            utf16le_append_ascii((const uint16_t *)(se + 2), 15,
                                                  name, sizeof(name));
                             got |= 2;
                         }
@@ -186,8 +188,7 @@ static int find_in_dir(exfat_vol_t *vol, uint32_t cluster, const char *comp,
                             first_cluster = rd32(se + 20);
                             got |= 1;
                         } else if (se[0] == 0xC1) {
-                            uint8_t nchars = se[1];
-                            utf16le_append_ascii((const uint16_t *)(se + 2), nchars,
+                            utf16le_append_ascii((const uint16_t *)(se + 2), 15,
                                                  name, sizeof(name));
                             got |= 2;
                         }

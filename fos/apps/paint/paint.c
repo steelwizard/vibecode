@@ -3,8 +3,8 @@
  *
  *   paint [file.pnt]
  *
- * S / Ctrl+S save, O open, C clear, Q / Ctrl+X quit.
- * Click a swatch on the bottom row to change colour (or 0-9 / a-f).
+ * S / Ctrl+S save, O open, C clear, B fill tool, Q / Ctrl+X quit.
+ * Click a swatch on the bottom row to change colour (or 0-9 / a-e).
  *
  * .PNT is a tiny binary: "FOSP" + cols + rows + paper + cells.
  */
@@ -37,7 +37,11 @@ static int btn_c;
 static int btn_s;
 static int btn_o;
 static int btn_q;
+static int btn_f;
 static int request_quit;
+static int tool; /* 0 = draw, 1 = fill */
+static int16_t fill_qx[MAX_COLS * MAX_ROWS];
+static int16_t fill_qy[MAX_COLS * MAX_ROWS];
 
 static size_t slen(const char *s) {
     size_t n = 0;
@@ -245,7 +249,8 @@ static void paint_chrome(fos_api_t *api) {
     put_str(api, cols > 40 ? cols - 22 : 20, 0, FG_UI, BG_TITLE, "ink ");
     cell(api, cols > 40 ? cols - 18 : 24, 0, color == 0 ? 15 : 0, color, ' ');
     cell(api, cols > 40 ? cols - 17 : 25, 0, color == 0 ? 15 : 0, color, ' ');
-    put_str(api, cols > 40 ? cols - 15 : 28, 0, 11, BG_TITLE, "L draw R erase");
+    put_str(api, cols > 40 ? cols - 15 : 28, 0, 11, BG_TITLE,
+            tool ? "L fill  R erase" : "L draw  R erase");
 
     hfill(api, rows - 1, FG_UI, BG_BAR, ' ');
     for (i = 0; i < 16; i++) {
@@ -254,6 +259,9 @@ static void paint_chrome(fos_api_t *api) {
         cell(api, i * 2 + 1, rows - 1, fg, (uint8_t)i, ' ');
     }
     x = 33;
+    btn_f = x;
+    put_str(api, x, rows - 1, tool ? 0 : FG_UI, tool ? 14 : BG_BAR, "Fill ");
+    x += 6;
     btn_c = x;
     put_str(api, x, rows - 1, 14, BG_BAR, "C");
     put_str(api, x + 1, rows - 1, FG_UI, BG_BAR, "lear ");
@@ -541,6 +549,50 @@ static int on_canvas(int x, int y) {
     return x >= 0 && x < can_w && y >= 1 && y <= can_h;
 }
 
+static void flood_fill(fos_api_t *api, int x, int y, uint8_t nc) {
+    uint8_t oc;
+    int head = 0;
+    int tail = 0;
+    int maxq = can_w * can_h;
+
+    if (!on_canvas(x, y)) {
+        return;
+    }
+    oc = canvas[y][x];
+    if (oc == nc) {
+        return;
+    }
+    fill_qx[tail] = (int16_t)x;
+    fill_qy[tail] = (int16_t)y;
+    tail++;
+    canvas[y][x] = nc;
+    dirty = 1;
+    while (head < tail) {
+        int cx = fill_qx[head];
+        int cy = fill_qy[head];
+        int k;
+        static const int dx[4] = {1, -1, 0, 0};
+        static const int dy[4] = {0, 0, 1, -1};
+        head++;
+        for (k = 0; k < 4; k++) {
+            int nx = cx + dx[k];
+            int ny = cy + dy[k];
+            if (!on_canvas(nx, ny) || canvas[ny][nx] != oc) {
+                continue;
+            }
+            if (tail >= maxq) {
+                break;
+            }
+            canvas[ny][nx] = nc;
+            fill_qx[tail] = (int16_t)nx;
+            fill_qy[tail] = (int16_t)ny;
+            tail++;
+        }
+    }
+    paint_canvas(api);
+    paint_chrome(api);
+}
+
 static void handle_mouse(fos_api_t *api) {
     fos_mouse_t m;
     uint8_t ink;
@@ -554,6 +606,10 @@ static void handle_mouse(fos_api_t *api) {
         if (m.y == rows - 1) {
             if (m.x < 32) {
                 color = (uint8_t)(m.x / 2);
+                paint_chrome(api);
+            } else if (m.x >= btn_f && m.x < btn_f + 5) {
+                tool = !tool;
+                drawing = 0;
                 paint_chrome(api);
             } else if (m.x >= btn_c && m.x < btn_c + 6) {
                 if (confirm_yes(api, "Clear canvas? Y/N")) {
@@ -575,6 +631,17 @@ static void handle_mouse(fos_api_t *api) {
     }
 
     ink = (m.buttons & 2) ? PAPER : color;
+    if (tool) {
+        if ((m.buttons & 1) || (m.buttons & 2)) {
+            if (on_canvas(m.x, m.y) && !drawing) {
+                flood_fill(api, m.x, m.y, ink);
+                drawing = 1;
+            }
+        } else {
+            drawing = 0;
+        }
+        return;
+    }
     if ((m.buttons & 1) || (m.buttons & 2)) {
         if (on_canvas(m.x, m.y)) {
             was = dirty;
@@ -638,6 +705,7 @@ void com_main(void) {
     can_h = rows - 2;
     filename[0] = 0;
     color = 0;
+    tool = 0;
     dirty = 0;
     drawing = 0;
     request_quit = 0;
@@ -692,6 +760,12 @@ void com_main(void) {
                 if (confirm_discard(api)) {
                     do_open(api);
                 }
+                continue;
+            }
+            if (ev.ch == 'b' || ev.ch == 'B') {
+                tool = !tool;
+                drawing = 0;
+                paint_chrome(api);
                 continue;
             }
             if (ev.ch == 'c' || ev.ch == 'C') {

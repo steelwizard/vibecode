@@ -403,7 +403,7 @@ $(EFI_EFI): efi/efi_main.o efi/efi.ld
 $(IMG): $(BOOT_BIN) $(KERNEL_BIN) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(BEEP_COM) $(PLAY_COM) $(PAINT_COM) $(GREP_COM) $(EFI_EFI) system.ini demo.bat scripts/mkdisk.sh scripts/fat32_add.py
 	scripts/mkdisk.sh $(IMG) $(BOOT_BIN) $(KERNEL_BIN) $(KERNEL_LBA) $(PART_START) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(EFI_EFI) $(BEEP_COM) $(PLAY_COM) $(PAINT_COM) $(GREP_COM)
 
-$(DATA_IMG): scripts/mkdata.sh
+$(DATA_IMG): scripts/mkdata.sh scripts/exfat_add.py data/LOREM.TXT data/IPSUM.TXT data/CICERO.TXT
 	scripts/mkdata.sh $(DATA_IMG)
 
 # Host audio for SB16. pipewire / pa / alsa / sdl / none / wav

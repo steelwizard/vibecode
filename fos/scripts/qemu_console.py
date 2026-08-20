@@ -15,6 +15,12 @@ import time
 PROMPT = "0:\\>"
 
 
+def at_prompt(text):
+    """True when the serial output ends at a drive prompt (0:\\>, 1:\\>, …)."""
+    t = text.rstrip()
+    return len(t) >= 4 and t.endswith(":\\>") and t[-4].isdigit()
+
+
 def image_copy(src="boot.img"):
     fd, path = tempfile.mkstemp(prefix="fos-test-", suffix=".img")
     os.close(fd)
@@ -25,7 +31,7 @@ def image_copy(src="boot.img"):
 class Machine:
     """A booted FOS instance with serial and monitor sockets."""
 
-    def __init__(self, image, intlog=None, audiodev="none"):
+    def __init__(self, image, intlog=None, audiodev="none", data=None):
         self.dir = tempfile.mkdtemp(prefix="fos-qemu-")
         self.serial_path = os.path.join(self.dir, "serial.sock")
         self.monitor_path = os.path.join(self.dir, "monitor.sock")
@@ -42,6 +48,8 @@ class Machine:
             "-monitor", f"unix:{self.monitor_path},server=on,wait=off",
             "-no-reboot",
         ]
+        if data:
+            cmd += ["-drive", f"format=raw,file={data},index=1,media=disk"]
         if intlog:
             cmd += ["-d", "int,guest_errors", "-D", intlog]
         self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
@@ -98,7 +106,7 @@ class Machine:
                 sent_key = True
             self.pump()
             out = self.buf[mark:].decode("latin1", "replace")
-            if out.rstrip().endswith(PROMPT):
+            if at_prompt(out):
                 return time.time() - start
         return None
 

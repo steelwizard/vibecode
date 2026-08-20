@@ -12,6 +12,7 @@ dd if=/dev/zero of="$IMG" bs=512 count=$TOTAL_SECTORS status=none
 printf 'label: dos\nstart=%s,size=%s,type=7\n' "$PART_START" "$PART_SECTORS" | sfdisk "$IMG" >/dev/null
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+DATA_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/../data" && pwd)
 FAT_TMP=$(mktemp)
 FS_KIND=
 
@@ -29,21 +30,24 @@ if [ -z "$FS_KIND" ]; then
     echo "Built $IMG — drive 1: FAT32 (install mkfs.exfat for exFAT)"
 fi
 
+add_sample() {
+    dest=$1
+    src=$2
+    [ -f "$src" ] || return 0
+    if [ "$FS_KIND" = fat32 ]; then
+        if command -v mcopy >/dev/null 2>&1; then
+            mcopy -i "$FAT_TMP" -s "$src" "::$dest" 2>/dev/null || true
+        elif command -v python3 >/dev/null 2>&1; then
+            python3 "$SCRIPT_DIR/fat32_add.py" "$FAT_TMP" 0 "$dest" "$src" || true
+        fi
+    else
+        python3 "$SCRIPT_DIR/exfat_add.py" "$FAT_TMP" 0 "$dest" "$src"
+    fi
+}
+
+add_sample LOREM.TXT "$DATA_DIR/LOREM.TXT"
+add_sample IPSUM.TXT "$DATA_DIR/IPSUM.TXT"
+add_sample CICERO.TXT "$DATA_DIR/CICERO.TXT"
+
 dd if="$FAT_TMP" of="$IMG" bs=512 seek="$PART_START" conv=notrunc status=none
 rm -f "$FAT_TMP"
-
-echo "Drive 1 test file." > /tmp/fos_d1.txt
-if [ "$FS_KIND" = fat32 ]; then
-    if command -v mcopy >/dev/null 2>&1; then
-        mcopy -i "$IMG"@@${PART_START}s -s /tmp/fos_d1.txt ::TEST.TXT 2>/dev/null || true
-    elif command -v python3 >/dev/null 2>&1; then
-        python3 "$SCRIPT_DIR/fat32_add.py" "$IMG" "$PART_START" TEST.TXT /tmp/fos_d1.txt || true
-    fi
-elif [ "$FS_KIND" = exfat ]; then
-    # Offset-aware mcopy works for FAT; for exFAT use a loop mount when root,
-    # otherwise leave the volume empty (read-only FS in FOS anyway).
-    if command -v mcopy >/dev/null 2>&1; then
-        mcopy -i "$IMG"@@${PART_START}s -s /tmp/fos_d1.txt ::TEST.TXT 2>/dev/null || true
-    fi
-fi
-rm -f /tmp/fos_d1.txt

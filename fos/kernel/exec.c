@@ -196,6 +196,13 @@ int exec_run(int drive, const char *path, const char *cmdline) {
     static fos_api_io_t nest_io[COM_STACK_LEVELS];
     int slot;
     int rc;
+    int file_drive;
+
+    file_drive = vfs_locate_file(drive, path);
+    if (file_drive < 0) {
+        return -1;
+    }
+    drive = file_drive;
 
     if (vfs_read_at(drive, path, 0, raw, (uint32_t)sizeof(raw), &got) != 0 ||
         got < sizeof(hdr)) {

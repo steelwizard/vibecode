@@ -23,6 +23,9 @@ int  vfs_list_dir(int drive, const char *path);
 int  vfs_read_file(int drive, const char *path, char *buf, size_t buf_sz, size_t *out_len);
 int  vfs_read_at(int drive, const char *path, uint32_t offset, void *buf, uint32_t cap, uint32_t *out_len);
 int  vfs_stat(int drive, const char *path, uint32_t *size, int *is_dir);
+/* Drive that holds path: hint first, then other mounted volumes if the
+ * path has no drive letter. -1 if the file is not found. */
+int  vfs_locate_file(int hint, const char *path);
 int  vfs_write_file(int drive, const char *path, const void *data, size_t len);
 int  vfs_mkdir(int drive, const char *path);
 int  vfs_delete(int drive, const char *path);

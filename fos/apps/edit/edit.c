@@ -333,6 +333,10 @@ static int save_file(fos_api_t *api) {
         return -1;
     }
     if (api->write_file(filename, text, (size_t)text_len) != 0) {
+        if (api->show_error) {
+            api->show_error("Could not save file");
+        }
+        draw(api);
         return -1;
     }
     modified = 0;
@@ -460,36 +464,17 @@ static int prompt_save_as(fos_api_t *api) {
     return save_file(api);
 }
 
-static void normalize_path(fos_api_t *api, char *path, const char *arg) {
-    char cwd[256];
-    size_t n;
-
-    if (!arg || !arg[0]) {
+/* Pass the name through. vfs_resolve already joins cwd and parses 1:\file.
+ * Prepending cwd here turned drive-qualified names into \1:\file. */
+static void normalize_path(char *path, const char *arg) {
+    if (!arg) {
         path[0] = 0;
         return;
     }
     while (*arg == ' ' || *arg == '\t') {
         arg++;
     }
-    if (arg[0] == '\\') {
-        my_strcpy(path, arg);
-        return;
-    }
-    cwd[0] = '\\';
-    cwd[1] = 0;
-    if (api->get_cwd) {
-        api->get_cwd(cwd, sizeof(cwd));
-    }
-    my_strcpy(path, cwd);
-    n = my_strlen(path);
-    if (n > 0 && path[n - 1] != '\\' && n + 1 < 256) {
-        path[n++] = '\\';
-        path[n] = 0;
-    }
-    for (const char *p = arg; *p && n + 1 < 256; p++) {
-        path[n++] = *p;
-    }
-    path[n] = 0;
+    my_strcpy(path, arg);
 }
 
 void com_main(void) {
@@ -497,7 +482,7 @@ void com_main(void) {
     size_t loaded = 0;
 
     init_geometry(api);
-    normalize_path(api, filename, api->cmdline);
+    normalize_path(filename, api->cmdline);
 
     text_len = 0;
     cursor = 0;

@@ -360,97 +360,22 @@ int vfs_list_dir(int drive, const char *path) {
 }
 
 int vfs_read_file(int drive, const char *path, char *buf, size_t buf_sz, size_t *out_len) {
-    char resolved[VFS_PATH_MAX];
-    int d = drive;
-    if (vfs_resolve(drive, path, &d, resolved, sizeof(resolved)) != 0) {
+    uint32_t cap;
+    uint32_t got = 0;
+
+    if (!buf || buf_sz == 0) {
         return -1;
     }
-
-    drive_vol_t *dv = &drives[d];
-    if (!dv->mounted) {
+    cap = buf_sz > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)buf_sz;
+    cap--;
+    if (vfs_read_at(drive, path, 0, buf, cap, &got) != 0) {
         return -1;
     }
-
-    /* Split parent path and filename */
-    char parent[VFS_PATH_MAX];
-    char file[64];
-    strcpy(parent, resolved);
-    char *last = parent;
-    for (char *c = parent; *c; c++) {
-        if (*c == '\\') {
-            last = c + 1;
-        }
+    buf[got] = 0;
+    if (out_len) {
+        *out_len = got;
     }
-    if (last == parent && *parent == '\\' && parent[1] == 0) {
-        return -1;
-    }
-    strcpy(file, last);
-    if (last == parent + 1 && *parent == '\\') {
-        parent[1] = 0;
-    } else if (last > parent) {
-        *(last - 1) = 0;
-        if (parent[0] == 0) {
-            parent[0] = '\\';
-            parent[1] = 0;
-        }
-    }
-
-    if (dv->type == VFS_FS_FAT32) {
-        uint32_t dir_cluster;
-        int is_dir;
-        if (fat32_find_path(&dv->fs.fat32, dv->fs.fat32.root_cluster, parent,
-                            &dir_cluster, &is_dir) != 0 || !is_dir) {
-            return -1;
-        }
-        uint32_t cl;
-        uint8_t attr;
-        uint32_t fsize;
-        if (fat32_lookup(&dv->fs.fat32, dir_cluster, file, &cl, &attr, &fsize) != 0) {
-            return -1;
-        }
-        if (attr & FAT_ATTR_DIR) {
-            return -1;
-        }
-        size_t to_read = fsize < buf_sz - 1 ? fsize : buf_sz - 1;
-        if (fat32_read_file(&dv->fs.fat32, cl, 0, buf, (uint32_t)to_read, fsize) < 0) {
-            return -1;
-        }
-        buf[to_read] = 0;
-        if (out_len) {
-            *out_len = to_read;
-        }
-        return 0;
-    }
-
-    if (dv->type == VFS_FS_EXFAT) {
-        uint32_t dir_cluster;
-        int is_dir;
-        uint64_t dummy;
-        int no_fat = 0;
-        if (exfat_find_path(&dv->fs.exfat, dv->fs.exfat.root_cluster, parent,
-                            &dir_cluster, &is_dir, &dummy, NULL) != 0 || !is_dir) {
-            return -1;
-        }
-        uint32_t cl;
-        uint64_t fsize;
-        char comp[256];
-        strcpy(comp, file);
-        if (exfat_find_path(&dv->fs.exfat, dir_cluster, comp, &cl, &is_dir, &fsize, &no_fat) != 0 ||
-            is_dir) {
-            return -1;
-        }
-        size_t to_read = fsize < buf_sz - 1 ? (size_t)fsize : buf_sz - 1;
-        if (exfat_read_file(&dv->fs.exfat, cl, 0, buf, (uint32_t)to_read, fsize, no_fat) < 0) {
-            return -1;
-        }
-        buf[to_read] = 0;
-        if (out_len) {
-            *out_len = to_read;
-        }
-        return 0;
-    }
-
-    return -1;
+    return 0;
 }
 
 static int vfs_split_parent_file(const char *resolved, char *parent, char *file) {
@@ -558,6 +483,35 @@ int vfs_stat(int drive, const char *path, uint32_t *size, int *is_dir) {
         *is_dir = 0;
     }
     return 0;
+}
+
+int vfs_locate_file(int hint, const char *path) {
+    char resolved[VFS_PATH_MAX];
+    uint32_t size;
+    int is_dir;
+    int d = hint;
+    int i;
+
+    if (!path || !path[0]) {
+        return -1;
+    }
+    if (vfs_resolve(hint, path, &d, resolved, sizeof(resolved)) == 0 &&
+        vfs_stat(d, resolved, &size, &is_dir) == 0 && !is_dir) {
+        return d;
+    }
+    /* A drive-qualified path already named its volume. */
+    if (path[1] == ':') {
+        return -1;
+    }
+    for (i = 0; i < num_drives; i++) {
+        if (i == hint || !drives[i].mounted) {
+            continue;
+        }
+        if (vfs_stat(i, path, &size, &is_dir) == 0 && !is_dir) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 int vfs_read_at(int drive, const char *path, uint32_t offset, void *buf, uint32_t cap,

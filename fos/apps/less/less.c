@@ -97,36 +97,17 @@ static int my_strcasecmp(const char *a, const char *b) {
     return (unsigned char)*a - (unsigned char)*b;
 }
 
-static void normalize_path(fos_api_t *api, char *path, const char *arg) {
-    char cwd[256];
-    size_t n;
-
-    if (!arg || !arg[0]) {
+/* Pass the name through. vfs_resolve already joins cwd and parses 1:\file.
+ * Prepending cwd here turned drive-qualified names into \1:\file. */
+static void normalize_path(char *path, const char *arg) {
+    if (!arg) {
         path[0] = 0;
         return;
     }
     while (*arg == ' ' || *arg == '\t') {
         arg++;
     }
-    if (arg[0] == '\\') {
-        my_strcpy(path, arg);
-        return;
-    }
-    cwd[0] = '\\';
-    cwd[1] = 0;
-    if (api->get_cwd) {
-        api->get_cwd(cwd, sizeof(cwd));
-    }
-    my_strcpy(path, cwd);
-    n = my_strlen(path);
-    if (n > 0 && path[n - 1] != '\\' && n + 1 < 256) {
-        path[n++] = '\\';
-        path[n] = 0;
-    }
-    for (const char *p = arg; *p && n + 1 < 256; p++) {
-        path[n++] = *p;
-    }
-    path[n] = 0;
+    my_strcpy(path, arg);
 }
 
 static int line_start(int line) {
@@ -660,7 +641,7 @@ static int load_content(fos_api_t *api) {
         return 0;
     }
 
-    normalize_path(api, path, api->cmdline);
+    normalize_path(path, api->cmdline);
     if (path[0] == 0) {
         return -1;
     }

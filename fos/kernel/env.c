@@ -207,6 +207,7 @@ static void arith_skip(arith_t *a) {
 }
 
 static int64_t arith_expr(arith_t *a);
+static void i64_dec(int64_t v, char *buf);
 
 static int64_t arith_num(const char *s, int *ok) {
     uint64_t u = 0;
@@ -237,6 +238,44 @@ static int64_t arith_num(const char *s, int *ok) {
     return neg ? -(int64_t)u : (int64_t)u;
 }
 
+/* Whole string is an integer (optional sign/whitespace). Empty/NULL → 0. */
+static int i64_from_str(const char *s, int64_t *out) {
+    const char *p;
+    int ok = 0;
+    int64_t v;
+
+    if (!s) {
+        *out = 0;
+        return 0;
+    }
+    p = s;
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    if (*p == 0) {
+        *out = 0;
+        return 0;
+    }
+    v = arith_num(p, &ok);
+    if (!ok) {
+        return -1;
+    }
+    if (*p == '+' || *p == '-') {
+        p++;
+    }
+    while (*p >= '0' && *p <= '9') {
+        p++;
+    }
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    if (*p) {
+        return -1;
+    }
+    *out = v;
+    return 0;
+}
+
 static int64_t arith_primary(arith_t *a) {
     int64_t v;
 
@@ -261,7 +300,6 @@ static int64_t arith_primary(arith_t *a) {
         char nbuf[ENV_NAME_MAX];
         size_t nl = 0;
         const char *val;
-        int ok = 0;
 
         a->p++;
         if (*a->p == '(') {
@@ -286,7 +324,11 @@ static int64_t arith_primary(arith_t *a) {
             return 0;
         }
         val = env_get(nbuf);
-        return arith_num(val ? val : "", &ok);
+        if (i64_from_str(val, &v) != 0) {
+            a->err = 1;
+            return 0;
+        }
+        return v;
     }
     if (*a->p >= '0' && *a->p <= '9') {
         int ok = 0;
@@ -300,14 +342,17 @@ static int64_t arith_primary(arith_t *a) {
         char nbuf[ENV_NAME_MAX];
         size_t nl = 0;
         const char *val;
-        int ok = 0;
 
         while (env_name_char((unsigned char)*a->p) && nl + 1 < sizeof(nbuf)) {
             nbuf[nl++] = *a->p++;
         }
         nbuf[nl] = 0;
         val = env_get(nbuf);
-        return arith_num(val ? val : "", &ok);
+        if (i64_from_str(val, &v) != 0) {
+            a->err = 1;
+            return 0;
+        }
+        return v;
     }
     a->err = 1;
     return 0;
@@ -373,6 +418,84 @@ static int arith_eval(const char *s, int64_t *out) {
         return -1;
     }
     return 0;
+}
+
+int env_arith_eval(const char *expr, int64_t *out) {
+    if (!expr || !out) {
+        return -1;
+    }
+    return arith_eval(expr, out);
+}
+
+/*
+ * True when `s` is worth evaluating as integer math for NAME=s:
+ * a variable plus an operator (i=i+1), or + * / % / parentheses (5+1, 2*3).
+ * Bare minus (2020-01-01) stays a string.
+ */
+static int arith_looks_expr(const char *s) {
+    int has_name = 0;
+    int has_pm = 0;
+    int has_op = 0;
+    int has_paren = 0;
+
+    if (!s) {
+        return 0;
+    }
+    while (*s) {
+        if (*s == ' ' || *s == '\t') {
+            s++;
+            continue;
+        }
+        if (env_name_start((unsigned char)*s)) {
+            has_name = 1;
+            while (env_name_char((unsigned char)*s)) {
+                s++;
+            }
+            continue;
+        }
+        if (*s >= '0' && *s <= '9') {
+            while (*s >= '0' && *s <= '9') {
+                s++;
+            }
+            continue;
+        }
+        if (*s == '+' || *s == '*' || *s == '/' || *s == '%') {
+            has_pm = 1;
+            has_op = 1;
+            s++;
+            continue;
+        }
+        if (*s == '-') {
+            has_op = 1;
+            s++;
+            continue;
+        }
+        if (*s == '(' || *s == ')') {
+            has_paren = 1;
+            s++;
+            continue;
+        }
+        return 0;
+    }
+    return (has_name && has_op) || has_pm || has_paren;
+}
+
+int env_try_arith(const char *expr, int64_t *out) {
+    if (!arith_looks_expr(expr)) {
+        return -1;
+    }
+    return arith_eval(expr, out);
+}
+
+int env_get_i64(const char *name, int64_t *out) {
+    return i64_from_str(env_get(name), out);
+}
+
+int env_set_i64(const char *name, int64_t v) {
+    char buf[24];
+
+    i64_dec(v, buf);
+    return env_set(name, buf);
 }
 
 static void i64_dec(int64_t v, char *buf) {

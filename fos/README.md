@@ -64,7 +64,7 @@ Audio backend defaults to **PipeWire** when that session socket exists, otherwis
 | `\FOS\MEM.COM` | RAM map, heap stats (`mem test` stress-tests the allocator) |
 | `\FOS\BEEP.COM` | Tone (`beep`, `beep 880 300`) |
 | `\FOS\PLAY.COM` | WAV/MP3 player TUI (`play DEMO.WAV`, q stops) |
-| `\FOS\PAINT.COM` | Mouse paint (`paint [file.pnt]`; S save, O open, Q quit) |
+| `\FOS\PAINT.COM` | Mouse paint (`paint [file.pnt]`; B fill, S save, O open, Q quit) |
 | `\FOS\GREP.COM` | Fixed-string search (`grep [-inv] PATTERN [FILE …]`) |
 | `README.TXT` | Full project README (copy of `README.md` from the repo) |
 
@@ -94,15 +94,15 @@ A `.COM` can be 32 MiB of code+data+BSS at `0x300000`, with an 8 MiB stack. Larg
 | `mem` | RAM map via `mem.com` |
 | `beep [hz [ms]]` | SB16 tone via `beep.com` |
 | `play <file>` | WAV/MP3 player (`play DEMO.MP3`; q quits) |
-| `paint [file]` | Cell paint (`paint SKETCH.PNT`; left draw, right erase) |
+| `paint [file]` | Cell paint (`paint SKETCH.PNT`; left draw, right erase, `b` fill) |
 | `grep [-inv] PAT [file]` | Find lines (`grep Flash README.TXT`; `-i` case, `-n` numbers, `-v` invert) |
 | `echo …` / `*.com` | Run a FOSCOM program |
 | `demo` / `*.bat` | Run a `.BAT` script (`call name` also works) |
-| `NAME=value` | Set `$NAME` (`export NAME=value` is the same) |
+| `NAME=value` | Set `$NAME` (`i++`, `i=i+1`, `i+=n`; `export NAME=value` is the same) |
 | `env` / `set` | List environment variables |
 | `unset NAME` | Remove a variable |
 | `echo $PATH` | Expand `$NAME` or `${NAME}` (`'` quotes disable it) |
-| `echo $(1+5)` | Integer math (`+ - * / %`, parentheses); `$((2*3))` works too |
+| `echo $(1+5)` | Integer math (`+ - * / %`, parentheses, variable names); `$((2*3))` works too |
 | `0:` / `1:` | Switch current drive |
 | `cmd1 \| cmd2` | Pipe stdout to stdin |
 | `cmd > file` | Redirect stdout to a file |
@@ -115,7 +115,7 @@ Prompt shows the current path, e.g. `0:\>` or `0:\docs>`. It is green after a su
 
 ### Mouse
 
-A yellow arrow follows the host mouse in QEMU (no grab — `make run` adds `-device vmmouse`). Left-drag selects text; right-click copies the selection, or pastes if nothing is selected. Left-click activates `[ OK ]` / Y/N buttons, moves the caret in the shell and editor, opens FM entries on double-click, and pages `less` (upper/lower half). Click the bottom row in `play` to quit. In `paint`, left-drag draws, right-drag erases, and the bottom swatches pick a colour.
+A yellow arrow follows the host mouse in QEMU (no grab — `make run` adds `-device vmmouse`). Left-drag selects text; right-click copies the selection, or pastes if nothing is selected. Left-click activates `[ OK ]` / Y/N buttons, moves the caret in the shell and editor, opens FM entries on double-click, and pages `less` (upper/lower half). Click the bottom row in `play` to quit. In `paint`, left-drag draws, right-drag erases, `B` or **Fill** flood-fills, and the bottom swatches pick a colour.
 
 ### Scripts (`if` / `for` / `while` / `.BAT`)
 
@@ -137,6 +137,11 @@ for i = 1 to 3
 end
 
 while false do echo never
+
+i=0
+i=i+1
+i++
+echo $i
 ```
 
 Conditions: `exist PATH`, `not exist PATH`, `errorlevel N` (`$ERRORLEVEL` ≥ N), `true` / `false`, and `A == B` (or `A = B`). `$ERRORLEVEL` is 0 after a successful command and 1 after a failure. `;` and `&` separate commands on one line. Nested `if`/`for`/`while` work.
@@ -241,6 +246,7 @@ boot.img (drive 0, 64 MiB)
 
 data.img (drive 1)
   LBA 2048+   exFAT (or FAT32 if mkfs.exfat is unavailable)
+              Sample texts: LOREM.TXT, IPSUM.TXT, CICERO.TXT
 ```
 
 ## Source layout

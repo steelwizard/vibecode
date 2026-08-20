@@ -21,6 +21,12 @@ int env_expand(const char *in, char *out, size_t cap);
 int env_name_start(int c);
 int env_name_char(int c);
 
+/* Integer helpers for i++ / i=i+1 / i+=n. Unset variables read as 0. */
+int env_arith_eval(const char *expr, int64_t *out);
+int env_try_arith(const char *expr, int64_t *out);
+int env_get_i64(const char *name, int64_t *out);
+int env_set_i64(const char *name, int64_t v);
+
 /* %0..%9 / %* for .BAT arguments. Nested scripts save/restore this. */
 typedef struct {
     char arg[10][ENV_VALUE_MAX];

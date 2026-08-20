@@ -25,6 +25,20 @@ CASES = [
     ("mem", 15, None, None, "0 B across 0 block(s)"),  # leak reclaimed on exit
     ("date", 10, None, None, None),
     ("echo hello", 10, None, None, "hello"),
+    ("i=4", 10, None, None, None),
+    ("i=i+1", 10, None, None, None),
+    ("echo n$i", 10, None, None, "n5"),
+    ("i++", 10, None, None, None),
+    ("echo n$i", 10, None, None, "n6"),
+    ("i+=4", 10, None, None, None),
+    ("echo n$i", 10, None, None, "n10"),
+    ("i--", 10, None, None, None),
+    ("echo n$i", 10, None, None, "n9"),
+    ("++i", 10, None, None, None),
+    ("echo n$i", 10, None, None, "n10"),
+    ("echo $(i+1)", 10, None, None, "11"),
+    ("k=hello", 10, None, None, None),
+    ("echo z$k", 10, None, None, "zhello"),
     ("grep Flash README.TXT", 10, None, None, "Flash Operating System"),
     ("grep -n Flash README.TXT", 10, None, None, "1:# FOS"),
     ("grep -i operating README.TXT", 10, None, None, "Flash Operating"),
@@ -43,6 +57,14 @@ CASES = [
     ("call demo.bat world", 15, None, None, "arg1=world"),
     ("beep 440 100", 15, None, None, None),
     ("edit README.TXT", 20, 3.0, "\x18", None),  # Ctrl+X exits
+    ("less README.TXT", 20, 2.0, "q", None),
+    ("type 1:\\LOREM.TXT", 10, None, None, "Lorem ipsum"),
+    ("grep Lorem 1:\\LOREM.TXT", 10, None, None, "Lorem ipsum"),
+    ("less 1:\\LOREM.TXT", 20, 3.0, "q", None),
+    ("edit 1:\\IPSUM.TXT", 20, 3.0, "\x18", None),
+    ("1:", 10, None, None, None),
+    ("less LOREM.TXT", 20, 3.0, "q", None),
+    ("0:", 10, None, None, None),
     ("play DEMO.WAV", 25, 2.0, "q", "DEMO.WAV"),
     ("play DEMO.MP3", 25, 2.0, "q", "DEMO.MP3"),
     ("dir FOS", 10, None, None, "PLAY.COM"),  # shell alive after the audio runs
@@ -51,11 +73,12 @@ CASES = [
 
 def main():
     image = image_copy()
+    data = image_copy("data.img") if os.path.exists("data.img") else None
     intlog = "/tmp/fos-smoke-int.log"
     if os.path.exists(intlog):
         os.unlink(intlog)
     failures = []
-    m = Machine(image, intlog=intlog)
+    m = Machine(image, intlog=intlog, data=data)
     try:
         if not m.wait_boot():
             print("FAIL: never reached the shell prompt")
@@ -77,6 +100,8 @@ def main():
     finally:
         m.close()
         os.unlink(image)
+        if data:
+            os.unlink(data)
 
     exc = cpu_exceptions(intlog)
     if exc:
