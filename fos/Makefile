@@ -27,6 +27,8 @@ GREP_BIN    = apps/grep/grep.bin
 GREP_COM    = apps/grep/grep.com
 BENCH_BIN   = apps/bench/bench.bin
 BENCH_COM   = apps/bench/bench.com
+TETRIS_BIN  = games/tetris/tetris.bin
+TETRIS_COM  = games/tetris/tetris.com
 EFI_EFI     = efi/BOOTX64.EFI
 DATA_IMG    = data.img
 
@@ -124,6 +126,11 @@ BENCH_ASM  = apps/bench/entry.asm
 BENCH_C    = apps/bench/bench.c
 BENCH_OBJ  = $(BENCH_ASM:.asm=.o) $(BENCH_C:.c=.o)
 BENCH_ELF  = apps/bench/bench.elf
+
+TETRIS_ASM  = games/tetris/entry.asm
+TETRIS_C    = games/tetris/tetris.c
+TETRIS_OBJ  = $(TETRIS_ASM:.asm=.o) $(TETRIS_C:.c=.o)
+TETRIS_ELF  = games/tetris/tetris.elf
 
 KERNEL_OBJ = $(KERNEL_ASM:.asm=.o) $(KERNEL_C:.c=.o)
 
@@ -237,6 +244,12 @@ apps/bench/%.o: apps/bench/%.asm
 	$(NASM) -f elf64 $< -o $@
 
 apps/bench/%.o: apps/bench/%.c $(KERNEL_HDRS)
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+games/tetris/%.o: games/tetris/%.asm
+	$(NASM) -f elf64 $< -o $@
+
+games/tetris/%.o: games/tetris/%.c $(KERNEL_HDRS)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(KERNEL_ELF): $(KERNEL_OBJ) kernel/linker.ld
@@ -414,6 +427,19 @@ $(BENCH_COM): $(BENCH_BIN) $(BENCH_ELF) scripts/foscom_pack.py
 		--mem-size 0x$$(nm -n $(BENCH_ELF) | awk '$$3=="_end"{print $$1; exit}') \
 		--stack $(COM_STACK) --name BENCH
 
+$(TETRIS_ELF): $(TETRIS_OBJ) games/tetris/linker.ld
+	$(LD) -m elf_x86_64 -T games/tetris/linker.ld -nostdlib -o $@ $(TETRIS_OBJ)
+
+$(TETRIS_BIN): $(TETRIS_ELF)
+	$(OBJCOPY) -O binary $< $@
+
+$(TETRIS_COM): $(TETRIS_BIN) $(TETRIS_ELF) scripts/foscom_pack.py
+	$(PYTHON) scripts/foscom_pack.py $(TETRIS_BIN) $@ \
+		--load $(COM_LOAD) \
+		--entry 0x$$(nm -n $(TETRIS_ELF) | awk '$$3=="_start"{print $$1; exit}') \
+		--mem-size 0x$$(nm -n $(TETRIS_ELF) | awk '$$3=="_end"{print $$1; exit}') \
+		--stack $(COM_STACK) --name TETRIS
+
 EFI_CFLAGS = -m64 -mabi=ms -fshort-wchar -ffreestanding -fno-stack-protector \
              -fno-builtin -fpie -mno-red-zone -fno-ident \
              -fno-asynchronous-unwind-tables -Wall -Wextra -O2 -I efi
@@ -437,8 +463,8 @@ $(EFI_EFI): efi/efi_main.o efi/efi.ld
 	      --image-base 0x140000000 --disable-auto-import \
 	      -o $@ efi/efi_main.o
 
-$(IMG): $(BOOT_BIN) $(KERNEL_BIN) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(BEEP_COM) $(PLAY_COM) $(PAINT_COM) $(GREP_COM) $(BENCH_COM) $(EFI_EFI) system.ini demo.bat scripts/mkdisk.sh scripts/fat32_add.py
-	scripts/mkdisk.sh $(IMG) $(BOOT_BIN) $(KERNEL_BIN) $(KERNEL_LBA) $(PART_START) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(EFI_EFI) $(BEEP_COM) $(PLAY_COM) $(PAINT_COM) $(GREP_COM) $(BENCH_COM)
+$(IMG): $(BOOT_BIN) $(KERNEL_BIN) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(BEEP_COM) $(PLAY_COM) $(PAINT_COM) $(GREP_COM) $(BENCH_COM) $(TETRIS_COM) $(EFI_EFI) system.ini demo.bat scripts/mkdisk.sh scripts/fat32_add.py
+	scripts/mkdisk.sh $(IMG) $(BOOT_BIN) $(KERNEL_BIN) $(KERNEL_LBA) $(PART_START) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(EFI_EFI) $(BEEP_COM) $(PLAY_COM) $(PAINT_COM) $(GREP_COM) $(BENCH_COM) $(TETRIS_COM)
 
 $(DATA_IMG): scripts/mkdata.sh scripts/exfat_add.py data/LOREM.TXT data/IPSUM.TXT data/CICERO.TXT
 	scripts/mkdata.sh $(DATA_IMG)
@@ -505,6 +531,7 @@ clean:
 	      $(PAINT_BIN) $(PAINT_COM) $(PAINT_ELF) \
 	      $(GREP_BIN) $(GREP_COM) $(GREP_ELF) \
 	      $(BENCH_BIN) $(BENCH_COM) $(BENCH_ELF) \
+	      $(TETRIS_BIN) $(TETRIS_COM) $(TETRIS_ELF) \
 	      $(EFI_EFI) efi/efi_main.o efi/enter_kernel.bin efi/enter_kernel_bin.h \
 	      $(KERNEL_ELF) shell/shell.elf $(ECHO_ELF) \
-	      $(IMG) $(DATA_IMG) fos-sb16.wav $(KERNEL_OBJ) $(SHELL_OBJ) $(ECHO_OBJ) $(EDIT_OBJ) $(FM_OBJ) $(LESS_OBJ) $(DATE_OBJ) $(MEM_OBJ) $(BEEP_OBJ) $(PLAY_OBJ) $(PAINT_OBJ) $(GREP_OBJ) $(BENCH_OBJ)
+	      $(IMG) $(DATA_IMG) fos-sb16.wav $(KERNEL_OBJ) $(SHELL_OBJ) $(ECHO_OBJ) $(EDIT_OBJ) $(FM_OBJ) $(LESS_OBJ) $(DATE_OBJ) $(MEM_OBJ) $(BEEP_OBJ) $(PLAY_OBJ) $(PAINT_OBJ) $(GREP_OBJ) $(BENCH_OBJ) $(TETRIS_OBJ)

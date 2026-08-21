@@ -177,7 +177,7 @@ void env_init(void) {
     memset(vars, 0, sizeof(vars));
     memset(&params, 0, sizeof(params));
     path = config_get("shell", "path");
-    env_set("PATH", (path && path[0]) ? path : "\\FOS");
+    env_set("PATH", (path && path[0]) ? path : "\\FOS:\\GAMES");
     env_set("HOME", "\\");
     env_set("ERRORLEVEL", "0");
     env_sync_pwd();

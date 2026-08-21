@@ -20,6 +20,7 @@ PLAY=${15:-}
 PAINT=${16:-}
 GREP=${17:-}
 BENCH=${18:-}
+TETRIS=${19:-}
 
 TOTAL_SECTORS=131072
 PART_SECTORS=$((TOTAL_SECTORS - PART_START))
@@ -131,6 +132,9 @@ if [ -n "$GREP" ] && [ -f "$GREP" ]; then
 fi
 if [ -n "$BENCH" ] && [ -f "$BENCH" ]; then
     add_one FOS/BENCH.COM "$BENCH"
+fi
+if [ -n "$TETRIS" ] && [ -f "$TETRIS" ]; then
+    add_one GAMES/TETRIS.COM "$TETRIS"
 fi
 if [ -f "$SCRIPT_DIR/../demo.bat" ]; then
     add_one FOS/DEMO.BAT "$SCRIPT_DIR/../demo.bat"

@@ -436,6 +436,7 @@ static void cmd_help(void) {
     console_write_line("  paint [file]         Mouse paint (s save, o open, q quit)");
     console_write_line("  grep [-inv] PAT [file]  Find lines (fixed string)");
     console_write_line("  bench / test          Test bench (primes, soak, mem, gfx, audio, hw)");
+    console_write_line("  tetris                Tetromino game (arrows, z/x, space, c hold)");
     console_write_line("  cmd1 | cmd2          Pipe stdout to stdin");
     console_write_line("  cmd > file           Redirect stdout to file");
     console_write_line("  Up/Down/Left/Right  Edit command line");
@@ -565,6 +566,9 @@ static const char *which_alias_com(const char *name) {
     }
     if (strcasecmp(name, "bench") == 0 || strcasecmp(name, "test") == 0) {
         return "BENCH";
+    }
+    if (strcasecmp(name, "tetris") == 0) {
+        return "TETRIS";
     }
     return 0;
 }
@@ -1044,6 +1048,11 @@ static void cmd_bench(const char *args) {
                    "BENCH failed (missing or corrupt BENCH.COM — run: make clean && make)");
 }
 
+static void cmd_tetris(const char *args) {
+    run_direct_com("TETRIS", args,
+                   "TETRIS failed (missing or corrupt TETRIS.COM — run: make clean && make)");
+}
+
 static int copy_ident(const char *p, char *name, size_t name_sz, const char **rest) {
     size_t n = 0;
 
@@ -1249,6 +1258,8 @@ static int run_builtin(char *line) {
         cmd_paint(cmd_arg(line));
     } else if (match_cmd(line, "BENCH") || match_cmd(line, "TEST")) {
         cmd_bench(cmd_arg(line));
+    } else if (match_cmd(line, "TETRIS")) {
+        cmd_tetris(cmd_arg(line));
     } else if (match_cmd(line, "TRUE")) {
         set_status(0);
     } else if (match_cmd(line, "FALSE")) {

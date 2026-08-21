@@ -67,9 +67,10 @@ Audio backend defaults to **PipeWire** when that session socket exists, otherwis
 | `\FOS\PAINT.COM` | Mouse paint (`paint [file.pnt]`; B fill, S save, O open, Q quit) |
 | `\FOS\GREP.COM` | Fixed-string search (`grep [-inv] PATTERN [FILE …]`) |
 | `\FOS\BENCH.COM` | Test bench TUI — primes, 60 s soak, RAM, graphics, audio, hardware monitor (`bench`, `test`) |
+| `\GAMES\TETRIS.COM` | Tetris — 7-bag, ghost, hold, levels (`tetris`; q quits) |
 | `README.TXT` | Full project README (copy of `README.md` from the repo) |
 
-Programs under `\FOS` are found via `$PATH` (seeded from `[shell] path=` in `SYSTEM.INI`).
+Programs under `\FOS` and `\GAMES` are found via `$PATH` (seeded from `[shell] path=` in `SYSTEM.INI`).
 
 A `.COM` can be 32 MiB of code+data+BSS at `0x300000`, with an 8 MiB stack. Larger working sets go on the heap (`api->mem_alloc`), which is the rest of identity-mapped RAM (512 MiB map, `make run` gives the VM 512 MiB). The loader streams the file straight to `load_addr`, so the old 128 KiB kernel bounce buffer is gone.
 
@@ -100,6 +101,7 @@ A `.COM` can be 32 MiB of code+data+BSS at `0x300000`, with an 8 MiB stack. Larg
 | `paint [file]` | Cell paint (`paint SKETCH.PNT`; left draw, right erase, `b` fill) |
 | `grep [-inv] PAT [file]` | Find lines (`grep Flash README.TXT`; `-i` case, `-n` numbers, `-v` invert) |
 | `bench` / `test` | Test bench TUI (`bench primes` / `bench mem` headless; `bench burn` = 60 s; `bench hw` = live meters) |
+| `tetris` | Tetromino game (arrows / WASD, `z`/`y` rotate, space drop, `c` hold, `p` pause, `q` quit) |
 | `echo …` / `*.com` | Run a FOSCOM program |
 | `demo` / `*.bat` | Run a `.BAT` script (`call name` also works) |
 | `NAME=value` | Set `$NAME` (`i++`, `i=i+1`, `i+=n`; `export NAME=value` is the same) |
@@ -119,7 +121,7 @@ Prompt shows the current path, e.g. `0:\>` or `0:\docs>`. It is green after a su
 
 ### Mouse
 
-A yellow arrow follows the host mouse in QEMU (no grab — `make run` adds `-device vmmouse`). Left-drag selects text; right-click copies the selection, or pastes if nothing is selected. Left-click activates `[ OK ]` / Y/N buttons, moves the caret in the shell and editor, opens FM entries on double-click, and pages `less` (upper/lower half). Click the bottom row in `play` to quit. In `paint`, left-drag draws, right-drag erases, `B` or **Fill** flood-fills, and the bottom swatches pick a colour. In `bench`, click a menu row to select and click again to run; in the hardware monitor, click the load bar to set synthetic CPU load.
+A yellow arrow follows the host mouse in QEMU (no grab — `make run` adds `-device vmmouse`). Left-drag selects text; right-click copies the selection, or pastes if nothing is selected. Left-click activates `[ OK ]` / Y/N buttons, moves the caret in the shell and editor, opens FM entries on double-click, and pages `less` (upper/lower half). Click the bottom row in `play` to quit. In `paint`, left-drag draws, right-drag erases, `B` or **Fill** flood-fills, and the bottom swatches pick a colour. In `bench`, click a menu row to select and click again to run; in the hardware monitor, click the load bar to set synthetic CPU load. In `tetris`, click the well to rotate, the sides to nudge, or the bottom bar.
 
 ### Scripts (`if` / `for` / `while` / `.BAT`)
 
@@ -216,7 +218,7 @@ mode=text
 
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
-| `path` | colon-separated dirs | `\FOS` | Initial `$PATH` for `.COM` lookup |
+| `path` | colon-separated dirs | `\FOS:\GAMES` | Initial `$PATH` for `.COM` lookup |
 
 `$PATH` is a real environment variable (`echo $PATH`, `PATH=\FOS:\BIN`). The `[shell] path=` key only seeds it at boot. Entries are absolute directories on the **current drive** (no drive letters). The shell checks the current directory first, then each PATH entry. Other variables: `$PWD`, `$HOME` (`\`), `$DRIVE`, `$ERRORLEVEL`.
 
@@ -287,6 +289,8 @@ fos/
 │   ├── grep/   grep.com
 │   ├── bench/  bench.com (TUI: primes, soak, RAM, graphics, audio, hardware monitor)
 │   └── fm/     fm.com
+├── games/
+│   └── tetris/ tetris.com (7-bag, ghost, hold, levels)
 ├── scripts/                   # mkdisk.sh, foscom_pack.py, …
 ├── system.ini                 # Template → 0:\SYSTEM.INI
 └── Makefile
