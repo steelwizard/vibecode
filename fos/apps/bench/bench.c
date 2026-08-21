@@ -3,8 +3,11 @@
  *
  *   bench              interactive menu
  *   bench primes       headless CPU/prime test (for smoke)
+ *   bench mem          headless heap + RAM pattern test
+ *   bench burn         60 s integer soak (q cancels in the TUI)
+ *   bench hw           live hardware monitor (CPU %, RAM, heap, clock)
  *
- * Arrows / 1-4 / mouse select, Enter run, q back or quit.
+ * Arrows / 1-7 / mouse select, Enter run, q back or quit.
  */
 
 #include "fos_api.h"
@@ -57,9 +60,13 @@
 #define IN_SPACE  8
 #define IN_DIGIT  9
 
-#define N_MENU 5
-#define N_GFX  4
+#define N_MENU 8
+#define N_GFX  8
 #define N_SND  3
+#define BURN_MS 60000u
+#define MEM_PTRS 64
+#define HW_HIST 48
+#define HW_FRAME_MS 200u
 
 static fos_api_t *g;
 static int cols = 80;
@@ -82,14 +89,6 @@ static size_t slen(const char *s) {
         n++;
     }
     return n;
-}
-
-static int scmp(const char *a, const char *b) {
-    while (*a && *a == *b) {
-        a++;
-        b++;
-    }
-    return (unsigned char)*a - (unsigned char)*b;
 }
 
 static const char *skip_ws(const char *s) {
@@ -128,6 +127,32 @@ static int iabs(int v) {
     return v < 0 ? -v : v;
 }
 
+static int isqrt(int n) {
+    int x, y;
+    if (n <= 0) {
+        return 0;
+    }
+    x = n;
+    y = (x + 1) / 2;
+    while (y < x) {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    return x;
+}
+
+static int arg_is(const char *arg, const char *name) {
+    if (!arg || !name) {
+        return 0;
+    }
+    while (*name && *arg == *name) {
+        arg++;
+        name++;
+    }
+    return *name == 0 && (*arg == 0 || *arg == ' ' || *arg == '\t' ||
+                          *arg == '\r' || *arg == '\n');
+}
+
 static int clampi(int v, int lo, int hi) {
     if (v < lo) {
         return lo;
@@ -140,6 +165,14 @@ static int clampi(int v, int lo, int hi) {
 
 static uint64_t now_ms(void) {
     return g->get_ticks_ms ? g->get_ticks_ms() : 0;
+}
+
+/* Shell launches BENCH inside direct VGA, which mutes COM1. Headless
+ * tests need the serial console (and the restored scrollback) back. */
+static void bench_use_stdout(void) {
+    if (g->end_direct) {
+        g->end_direct();
+    }
 }
 
 static void sti(void) {
@@ -309,6 +342,31 @@ static void put_ms(int x, int y, uint8_t fg, uint8_t bg, uint64_t ms) {
     put_str(x, y, fg, bg, buf, 39);
 }
 
+static void put_size(int x, int y, uint8_t fg, uint8_t bg, uint64_t bytes) {
+    char buf[40];
+    const char *unit = "B";
+    uint64_t v = bytes;
+    int n;
+    if (bytes >= 1024ull * 1024ull * 1024ull) {
+        v = bytes / (1024ull * 1024ull * 1024ull);
+        unit = "GB";
+    } else if (bytes >= 1024ull * 1024ull) {
+        v = bytes / (1024ull * 1024ull);
+        unit = "MB";
+    } else if (bytes >= 1024ull) {
+        v = bytes / 1024ull;
+        unit = "KB";
+    }
+    n = fmt_u64(buf, v);
+    buf[n++] = ' ';
+    buf[n++] = unit[0];
+    if (unit[1]) {
+        buf[n++] = unit[1];
+    }
+    buf[n] = 0;
+    put_str(x, y, fg, bg, buf, 39);
+}
+
 static void bar(int x, int y, int w, uint32_t num, uint32_t den, uint8_t fg, uint8_t bg) {
     uint32_t fill = 0;
     uint32_t i;
@@ -442,7 +500,7 @@ static void layout_menu(void) {
     if (win_w < 46) {
         win_w = cols > 4 ? cols - 2 : cols;
     }
-    win_h = 21;
+    win_h = 9 + N_MENU * 2;
     if (win_h > rows - 1) {
         win_h = rows - 1;
     }
@@ -671,7 +729,8 @@ static void cpu_print_stdout(int which) {
     char nbuf[32];
     int rc;
 
-    g->write_line("FOS Bench — prime test");
+    bench_use_stdout();
+    g->write_line("FOS Bench - prime test");
     rc = cpu_execute(which, 0, &sn, &sc, &sms, &ok, &tn, &tc, &tms, &aops, &ams);
     if (rc == -2) {
         g->write_line("FAIL: heap API missing");
@@ -845,7 +904,524 @@ handle:
     }
 }
 
-/* ---- graphics ---- */
+#define BURN_WALK 64
+
+static uint64_t burn_spin(uint32_t ms, int live, int *cancelled) {
+    uint64_t t0 = now_ms();
+    uint64_t last = 0;
+    uint64_t acc = 0x9E3779B97F4A7C15ULL;
+    uint64_t n = 0;
+    uint32_t walk[BURN_WALK];
+    int i;
+
+    if (cancelled) {
+        *cancelled = 0;
+    }
+    for (i = 0; i < BURN_WALK; i++) {
+        walk[i] = 1u + (uint32_t)i * 17u;
+    }
+    sti();
+    while (now_ms() - t0 < (uint64_t)ms) {
+        uint32_t k;
+        uint32_t x;
+        uint32_t d;
+        for (k = 0; k < 512; k++) {
+            acc *= 6364136223846793005ULL;
+            acc += 1;
+            acc ^= acc >> 17;
+            walk[k & (BURN_WALK - 1)] += (uint32_t)acc;
+            walk[k & (BURN_WALK - 1)] *= 1664525u;
+            n++;
+        }
+        x = ((uint32_t)acc) | 1u;
+        for (d = 3; d < 97; d += 2) {
+            if ((x % d) == 0) {
+                acc ^= d;
+            }
+        }
+        if (now_ms() - last > 80u) {
+            uint64_t el;
+            int digit;
+            last = now_ms();
+            el = now_ms() - t0;
+            if (el > ms) {
+                el = ms;
+            }
+            if (live) {
+                bar(win_x + 4, win_y + 8, win_w - 8, (uint32_t)el, ms, C_HOT, C_WIN);
+                put_str(win_x + 4, win_y + 10, C_MUTED, C_WIN, "elapsed", 8);
+                put_ms(win_x + 14, win_y + 10, C_FG, C_WIN, el);
+                put_str(win_x + 4, win_y + 11, C_MUTED, C_WIN, "ops", 8);
+                put_u64(win_x + 14, win_y + 11, C_ACC, C_WIN, n);
+                if (el) {
+                    put_str(win_x + 4, win_y + 12, C_MUTED, C_WIN, "rate", 8);
+                    put_u64(win_x + 14, win_y + 12, C_INFO, C_WIN, (n * 1000ull) / el);
+                    put_str(win_x + 36, win_y + 12, C_MUTED, C_WIN, "/s", 3);
+                }
+            }
+            if (poll_in(&digit) == IN_BACK) {
+                if (cancelled) {
+                    *cancelled = 1;
+                }
+                break;
+            }
+        }
+    }
+    (void)acc;
+    (void)walk[0];
+    return n;
+}
+
+static void draw_burn_frame(int running) {
+    layout_full();
+    desktop();
+    draw_window(win_x, win_y, win_w, win_h, " CPU  ·  One-minute soak ");
+    put_str(win_x + 3, win_y + 3, C_FG, C_WIN,
+            "Integer multiply, xor-shift, and trial mods - no pauses.", win_w - 6);
+    put_str(win_x + 3, win_y + 5, C_MUTED, C_WIN, "Target", 8);
+    put_ms(win_x + 12, win_y + 5, C_TITLE, C_WIN, BURN_MS);
+    footer(win_y + win_h - 2,
+           running ? "Burning...  q cancel" : "Enter start  q back");
+}
+
+static void burn_print_stdout(uint32_t ms) {
+    int cancelled = 0;
+    uint64_t t0;
+    uint64_t ops;
+    uint64_t dt;
+    char nbuf[32];
+
+    bench_use_stdout();
+    g->write_line("FOS Bench - CPU soak");
+    t0 = now_ms();
+    ops = burn_spin(ms, 0, &cancelled);
+    dt = now_ms() - t0;
+    if (dt == 0) {
+        dt = 1;
+    }
+    g->write("  ops=");
+    fmt_u64(nbuf, ops);
+    g->write(nbuf);
+    g->write("  ");
+    fmt_u64(nbuf, dt);
+    g->write(nbuf);
+    g->write_line(" ms");
+    g->write("  rate=");
+    fmt_u64(nbuf, (ops * 1000ull) / dt);
+    g->write(nbuf);
+    g->write_line("/s");
+    g->write_line(cancelled ? "RESULT: CANCEL" : "RESULT: PASS");
+}
+
+static int run_burn_ui(uint32_t ms) {
+    sti();
+    hide_cursor();
+    draw_burn_frame(0);
+    drain_keys();
+    for (;;) {
+        int d;
+        int k = poll_in(&d);
+        if (k == IN_NONE) {
+            pause_cpu();
+            continue;
+        }
+        if (k == IN_BACK) {
+            return IN_BACK;
+        }
+        if (k == IN_ENTER || k == IN_SPACE) {
+            uint64_t t0;
+            uint64_t ops;
+            uint64_t dt;
+            int cancelled = 0;
+            draw_burn_frame(1);
+            t0 = now_ms();
+            ops = burn_spin(ms, 1, &cancelled);
+            dt = now_ms() - t0;
+            if (dt == 0) {
+                dt = 1;
+            }
+            draw_burn_frame(0);
+            bar(win_x + 4, win_y + 8, win_w - 8, cancelled ? (uint32_t)dt : ms, ms,
+                cancelled ? C_HOT : C_ACC, C_WIN);
+            put_str(win_x + 4, win_y + 10, C_MUTED, C_WIN, "elapsed", 8);
+            put_ms(win_x + 14, win_y + 10, C_FG, C_WIN, dt);
+            put_str(win_x + 4, win_y + 11, C_MUTED, C_WIN, "ops", 8);
+            put_u64(win_x + 14, win_y + 11, C_ACC, C_WIN, ops);
+            put_str(win_x + 4, win_y + 12, C_MUTED, C_WIN, "rate", 8);
+            put_u64(win_x + 14, win_y + 12, C_INFO, C_WIN, (ops * 1000ull) / dt);
+            put_str(win_x + 36, win_y + 12, C_MUTED, C_WIN, "/s", 3);
+            put_str(win_x + 4, win_y + 14, cancelled ? C_HOT : C_ACC, C_WIN,
+                    cancelled ? "Cancelled." : "PASS - soak finished.", 28);
+        }
+    }
+}
+
+/* ---- memory ---- */
+
+static void *mem_ptrs[MEM_PTRS];
+static uint32_t mem_sizes[MEM_PTRS];
+
+static void mem_pat_fill(void *p, uint32_t n, uint8_t seed) {
+    uint8_t *b = (uint8_t *)p;
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        b[i] = (uint8_t)(seed + (uint8_t)i);
+    }
+}
+
+static int mem_pat_ok(const void *p, uint32_t n, uint8_t seed) {
+    const uint8_t *b = (const uint8_t *)p;
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        if (b[i] != (uint8_t)(seed + (uint8_t)i)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static uint32_t mem_word_pat(uint32_t i, int kind) {
+    if (kind == 0) {
+        return 0;
+    }
+    if (kind == 1) {
+        return 0xFFFFFFFFu;
+    }
+    if (kind == 2) {
+        return 0x55555555u;
+    }
+    if (kind == 3) {
+        return 0xAAAAAAAAu;
+    }
+    return i * 0x9E3779B1u;
+}
+
+static int mem_march(uint8_t *p, uint32_t n, int kind, int live) {
+    uint32_t *w = (uint32_t *)p;
+    uint32_t nw = n / 4u;
+    uint32_t i;
+    uint64_t last = 0;
+
+    for (i = 0; i < nw; i++) {
+        w[i] = mem_word_pat(i, kind);
+        if (live && (i & 0xFFFFu) == 0 && now_ms() - last > 50u) {
+            int d;
+            last = now_ms();
+            bar(win_x + 4, win_y + 8, win_w - 8, i, nw ? nw : 1, C_INFO, C_WIN);
+            if (poll_in(&d) == IN_BACK) {
+                return -1;
+            }
+        }
+    }
+    for (i = 0; i < nw; i++) {
+        if (w[i] != mem_word_pat(i, kind)) {
+            return 0;
+        }
+        if (live && (i & 0xFFFFu) == 0 && now_ms() - last > 50u) {
+            int d;
+            last = now_ms();
+            bar(win_x + 4, win_y + 8, win_w - 8, i, nw ? nw : 1, C_ACC, C_WIN);
+            if (poll_in(&d) == IN_BACK) {
+                return -1;
+            }
+        }
+    }
+    return 1;
+}
+
+static void mem_row(int row, const char *name, int ok) {
+    int y = win_y + 11 + row;
+    uint8_t fg;
+    if (y >= win_y + win_h - 2 || y < 0) {
+        return;
+    }
+    fg = (ok < 0) ? C_MUTED : (ok ? C_ACC : C_HOT);
+    fill_span(win_x + 3, y, win_w - 6, C_FG, C_WIN, ' ');
+    put_str(win_x + 4, y, fg, C_WIN, ok < 0 ? "...." : (ok ? "ok  " : "FAIL"), 4);
+    put_str(win_x + 10, y, C_FG, C_WIN, name, win_w - 14);
+}
+
+static void draw_mem_frame(int running, uint64_t usable, uint64_t heap_pool) {
+    layout_full();
+    desktop();
+    draw_window(win_x, win_y, win_w, win_h, " RAM  ·  Memory test ");
+    put_str(win_x + 3, win_y + 3, C_FG, C_WIN,
+            "Heap stress + marching patterns on a large block.", win_w - 6);
+    put_str(win_x + 3, win_y + 5, C_MUTED, C_WIN, "Usable", 8);
+    if (usable) {
+        put_size(win_x + 12, win_y + 5, C_ACC, C_WIN, usable);
+    } else {
+        put_str(win_x + 12, win_y + 5, C_MUTED, C_WIN, "(no map)", 10);
+    }
+    put_str(win_x + 28, win_y + 5, C_MUTED, C_WIN, "heap pool", 10);
+    put_size(win_x + 39, win_y + 5, C_INFO, C_WIN, heap_pool);
+    footer(win_y + win_h - 2,
+           running ? "Testing...  q cancel" : "Enter run  q back");
+}
+
+static int mem_execute(int live, int *npass, int *nfail, uint32_t *chunk) {
+    fos_heap_info_t before;
+    fos_heap_info_t after;
+    uint32_t try_sz[] = {
+        16u * 1024u * 1024u, 8u * 1024u * 1024u, 4u * 1024u * 1024u,
+        1024u * 1024u
+    };
+    uint8_t *big = 0;
+    uint32_t big_n = 0;
+    int i;
+    int row = 0;
+    int ok;
+
+    *npass = 0;
+    *nfail = 0;
+    *chunk = 0;
+    if (!g->mem_alloc || !g->mem_free || !g->get_heap_info) {
+        return -2;
+    }
+    g->get_heap_info(&before);
+
+    for (i = 0; i < MEM_PTRS; i++) {
+        mem_sizes[i] = (rnd() % 4096u) + 16u;
+        mem_ptrs[i] = g->mem_alloc(mem_sizes[i]);
+        if (mem_ptrs[i]) {
+            mem_pat_fill(mem_ptrs[i], mem_sizes[i], (uint8_t)i);
+        }
+    }
+    ok = 1;
+    for (i = 0; i < MEM_PTRS; i++) {
+        if (!mem_ptrs[i] || !mem_pat_ok(mem_ptrs[i], mem_sizes[i], (uint8_t)i)) {
+            ok = 0;
+        }
+    }
+    if (live) {
+        mem_row(row, "mixed heap blocks hold their patterns", ok);
+    }
+    row++;
+    if (ok) {
+        (*npass)++;
+    } else {
+        (*nfail)++;
+    }
+
+    for (i = 0; i < MEM_PTRS; i += 2) {
+        g->mem_free(mem_ptrs[i]);
+        mem_ptrs[i] = 0;
+    }
+    for (i = 0; i < MEM_PTRS; i += 2) {
+        mem_sizes[i] = (rnd() % 2048u) + 16u;
+        mem_ptrs[i] = g->mem_alloc(mem_sizes[i]);
+        if (mem_ptrs[i]) {
+            mem_pat_fill(mem_ptrs[i], mem_sizes[i], (uint8_t)(i + 9));
+        }
+    }
+    ok = 1;
+    for (i = 0; i < MEM_PTRS; i++) {
+        uint8_t seed = (i % 2) ? (uint8_t)i : (uint8_t)(i + 9);
+        if (!mem_ptrs[i] || !mem_pat_ok(mem_ptrs[i], mem_sizes[i], seed)) {
+            ok = 0;
+        }
+    }
+    if (live) {
+        mem_row(row, "freed holes reused, neighbours intact", ok);
+    }
+    row++;
+    if (ok) {
+        (*npass)++;
+    } else {
+        (*nfail)++;
+    }
+
+    {
+        void *p = g->mem_alloc(64);
+        ok = p != 0;
+        if (ok) {
+            mem_pat_fill(p, 64, 0xA5);
+            if (g->mem_realloc) {
+                void *q = g->mem_realloc(p, 4096);
+                ok = q && mem_pat_ok(q, 64, 0xA5);
+                g->mem_free(q);
+            } else {
+                g->mem_free(p);
+            }
+        }
+        if (live) {
+            mem_row(row, "realloc keeps the old bytes", ok);
+        }
+        row++;
+        if (ok) {
+            (*npass)++;
+        } else {
+            (*nfail)++;
+        }
+    }
+
+    for (i = 0; i < 4; i++) {
+        big = (uint8_t *)g->mem_alloc(try_sz[i]);
+        if (big) {
+            big_n = try_sz[i];
+            break;
+        }
+    }
+    ok = big != 0;
+    if (live) {
+        mem_row(row, "large block allocated", ok);
+    }
+    row++;
+    if (ok) {
+        (*npass)++;
+        *chunk = big_n;
+    } else {
+        (*nfail)++;
+    }
+
+    if (big) {
+        static const char *names[] = {
+            "march 0x00", "march 0xFF", "march 0x55", "march 0xAA", "march index"
+        };
+        for (i = 0; i < 5; i++) {
+            int rc = mem_march(big, big_n, i, live);
+            if (rc < 0) {
+                g->mem_free(big);
+                for (i = 0; i < MEM_PTRS; i++) {
+                    g->mem_free(mem_ptrs[i]);
+                    mem_ptrs[i] = 0;
+                }
+                return -1;
+            }
+            ok = rc == 1;
+            if (live) {
+                mem_row(row, names[i], ok);
+            }
+            row++;
+            if (ok) {
+                (*npass)++;
+            } else {
+                (*nfail)++;
+            }
+        }
+        g->mem_free(big);
+    }
+
+    {
+        void *p = g->mem_alloc(1024ull * 1024ull * 1024ull);
+        ok = p == 0;
+        if (p) {
+            g->mem_free(p);
+        }
+        if (live) {
+            mem_row(row, "1 GB request refused", ok);
+        }
+        row++;
+        if (ok) {
+            (*npass)++;
+        } else {
+            (*nfail)++;
+        }
+    }
+
+    for (i = 0; i < MEM_PTRS; i++) {
+        g->mem_free(mem_ptrs[i]);
+        mem_ptrs[i] = 0;
+    }
+    g->get_heap_info(&after);
+    ok = after.heap_used == before.heap_used &&
+         after.heap_blocks == before.heap_blocks;
+    if (live) {
+        mem_row(row, "heap back to baseline after free", ok);
+    }
+    if (ok) {
+        (*npass)++;
+    } else {
+        (*nfail)++;
+    }
+    (void)row;
+    return 0;
+}
+
+static void mem_print_stdout(void) {
+    int pass = 0;
+    int fail = 0;
+    uint32_t chunk = 0;
+    int rc;
+    char nbuf[32];
+
+    bench_use_stdout();
+    g->write_line("FOS Bench - memory test");
+    rc = mem_execute(0, &pass, &fail, &chunk);
+    if (rc == -2) {
+        g->write_line("FAIL: heap API missing");
+        g->write_line("RESULT: FAIL");
+        return;
+    }
+    g->write("  pass=");
+    fmt_u64(nbuf, (uint64_t)pass);
+    g->write(nbuf);
+    g->write("  fail=");
+    fmt_u64(nbuf, (uint64_t)fail);
+    g->write(nbuf);
+    g->write_line("");
+    if (chunk) {
+        g->write("  marched ");
+        fmt_u64(nbuf, chunk);
+        g->write(nbuf);
+        g->write_line(" bytes");
+    }
+    g->write_line(fail == 0 ? "RESULT: PASS" : "RESULT: FAIL");
+}
+
+static int run_mem_ui(void) {
+    fos_mem_info_t minfo;
+    fos_heap_info_t heap;
+    uint64_t usable = 0;
+    uint64_t pool = 0;
+    int pass = 0;
+    int fail = 0;
+    uint32_t chunk = 0;
+
+    sti();
+    hide_cursor();
+    if (g->get_mem_info && g->get_mem_info(&minfo) == 0) {
+        usable = minfo.usable_bytes;
+    }
+    if (g->get_heap_info && g->get_heap_info(&heap) == 0) {
+        pool = heap.pool_total;
+    }
+    draw_mem_frame(0, usable, pool);
+    drain_keys();
+    for (;;) {
+        int d;
+        int k = poll_in(&d);
+        if (k == IN_NONE) {
+            pause_cpu();
+            continue;
+        }
+        if (k == IN_BACK) {
+            return IN_BACK;
+        }
+        if (k == IN_ENTER || k == IN_SPACE) {
+            int rc;
+            draw_mem_frame(1, usable, pool);
+            rc = mem_execute(1, &pass, &fail, &chunk);
+            if (rc == -1) {
+                draw_mem_frame(0, usable, pool);
+                put_str(win_x + 4, win_y + 8, C_HOT, C_WIN, "Cancelled.", 20);
+                continue;
+            }
+            if (rc == -2) {
+                draw_mem_frame(0, usable, pool);
+                put_str(win_x + 4, win_y + 8, C_HOT, C_WIN, "Need heap (rebuild kernel).", 32);
+                continue;
+            }
+            footer(win_y + win_h - 2, "Enter run again  q back");
+            put_str(win_x + 40, win_y + 5, fail ? C_HOT : C_ACC, C_WIN,
+                    fail ? "FAIL" : "PASS", 6);
+            if (chunk) {
+                put_str(win_x + 4, win_y + 9, C_MUTED, C_WIN, "marched", 8);
+                put_size(win_x + 14, win_y + 9, C_INFO, C_WIN, chunk);
+            }
+        }
+    }
+}
 
 static int gx, gy, gw, gh;
 
@@ -1298,7 +1874,12 @@ static void scene_bounce3d(int t) {
 
 #define FIRE_MAX (MAX_COLS * MAX_ROWS)
 static uint8_t fire[FIRE_MAX];
+static uint8_t gfx_scratch[FIRE_MAX];
 static int fire_on;
+static int16_t rain_y[MAX_COLS];
+static uint8_t rain_spd[MAX_COLS];
+static int rain_on;
+static int life_on;
 
 static void fire_init(void) {
     int i;
@@ -1378,8 +1959,233 @@ static void scene_fire(int t) {
     }
 }
 
+static int gfx_buf_h(void) {
+    int h = gh;
+    if (gw < 1) {
+        return 0;
+    }
+    if (gw * h > FIRE_MAX) {
+        h = FIRE_MAX / gw;
+    }
+    return h;
+}
+
+static void scene_donut(int t) {
+    int theta, phi;
+    int h = gfx_buf_h();
+    int n = gw * h;
+    int i;
+    int ax = t * 3;
+    int ay = t * 2;
+
+    if (h < 4) {
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        gfx_scratch[i] = 0;
+        fire[i] = 0;
+    }
+    gfx_clear(C_WIN);
+    for (theta = 0; theta < 256; theta += 4) {
+        int ct = icos(theta);
+        int st = isin(theta);
+        for (phi = 0; phi < 256; phi += 3) {
+            int cp = icos(phi);
+            int sp = isin(phi);
+            int r1 = 26;
+            int r2 = 64;
+            int cx = r2 + (r1 * ct) / 127;
+            int x0 = (cx * cp) / 127;
+            int y0 = (r1 * st) / 127;
+            int z0 = (cx * sp) / 127;
+            int xr, yr, zr;
+            int sx, sy;
+            int zi;
+            int idx;
+            unsigned char ch;
+            uint8_t fg;
+            rot3(x0, y0, z0, ax, ay, t, &xr, &yr, &zr);
+            proj3(xr * 2, yr * 2, zr * 2, &sx, &sy);
+            if (sx < 0 || sy < 0 || sx >= gw || sy >= h) {
+                continue;
+            }
+            zi = (zr + 220) / 3;
+            if (zi < 1) {
+                zi = 1;
+            }
+            if (zi > 255) {
+                zi = 255;
+            }
+            idx = sy * gw + sx;
+            if ((uint8_t)zi <= gfx_scratch[idx]) {
+                continue;
+            }
+            gfx_scratch[idx] = (uint8_t)zi;
+            if (zi > 90) {
+                ch = '@';
+                fg = 15;
+            } else if (zi > 70) {
+                ch = '#';
+                fg = 14;
+            } else if (zi > 50) {
+                ch = '*';
+                fg = 6;
+            } else if (zi > 30) {
+                ch = '+';
+                fg = 6;
+            } else {
+                ch = '.';
+                fg = 8;
+            }
+            plot(sx, sy, fg, C_WIN, ch);
+        }
+    }
+}
+
+static void scene_tunnel(int t) {
+    int y, x;
+    int cx = gw / 2;
+    int cy = gh / 2;
+    for (y = 0; y < gh; y++) {
+        for (x = 0; x < gw; x++) {
+            int dx = x - cx;
+            int dy = (y - cy) * 2;
+            int r = isqrt(dx * dx + dy * dy);
+            int ang;
+            int u, v, idx;
+            uint8_t fg;
+            unsigned char ch;
+            if (r < 1) {
+                r = 1;
+            }
+            ang = (dx * 48) / r + t;
+            u = (ang + t) & 15;
+            v = ((200 / r) + t) & 15;
+            idx = u ^ v;
+            if (idx < 4) {
+                fg = 1;
+                ch = CH_LITE;
+            } else if (idx < 8) {
+                fg = 9;
+                ch = CH_DIM;
+            } else if (idx < 12) {
+                fg = 11;
+                ch = CH_MED;
+            } else {
+                fg = 15;
+                ch = CH_FILL;
+            }
+            plot(x, y, fg, C_WIN, ch);
+        }
+    }
+}
+
+static void rain_init(void) {
+    int x;
+    for (x = 0; x < MAX_COLS; x++) {
+        rain_y[x] = (int16_t)(rnd() % 40u);
+        rain_spd[x] = (uint8_t)(1 + (rnd() % 3u));
+    }
+    rain_on = 1;
+}
+
+static void scene_matrix(int t) {
+    int x, k;
+    (void)t;
+    gfx_clear(C_WIN);
+    for (x = 0; x < gw; x++) {
+        rain_y[x] = (int16_t)(rain_y[x] + rain_spd[x]);
+        if (rain_y[x] > gh + 12) {
+            rain_y[x] = (int16_t)(-((int)(rnd() % 12u)));
+            rain_spd[x] = (uint8_t)(1 + (rnd() % 3u));
+        }
+        for (k = 0; k < 10; k++) {
+            int y = rain_y[x] - k;
+            unsigned char ch;
+            uint8_t fg;
+            if (y < 0 || y >= gh) {
+                continue;
+            }
+            ch = (unsigned char)(33 + (rnd() % 90u));
+            if (k == 0) {
+                fg = 15;
+            } else if (k < 3) {
+                fg = 10;
+            } else if (k < 6) {
+                fg = 2;
+            } else {
+                fg = 8;
+            }
+            plot(x, y, fg, C_WIN, ch);
+        }
+    }
+}
+
+static void life_init(void) {
+    int n = gw * gfx_buf_h();
+    int i;
+    for (i = 0; i < n && i < FIRE_MAX; i++) {
+        fire[i] = (uint8_t)((rnd() % 5u) == 0);
+    }
+    life_on = 1;
+}
+
+static void scene_life(int t) {
+    int w = gw;
+    int h = gfx_buf_h();
+    int x, y;
+    (void)t;
+    if (w < 4 || h < 4) {
+        return;
+    }
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            int n = 0;
+            int dy, dx;
+            for (dy = -1; dy <= 1; dy++) {
+                for (dx = -1; dx <= 1; dx++) {
+                    int xx, yy;
+                    if (dx == 0 && dy == 0) {
+                        continue;
+                    }
+                    xx = x + dx;
+                    yy = y + dy;
+                    if (xx < 0) {
+                        xx = w - 1;
+                    } else if (xx >= w) {
+                        xx = 0;
+                    }
+                    if (yy < 0) {
+                        yy = h - 1;
+                    } else if (yy >= h) {
+                        yy = 0;
+                    }
+                    n += fire[yy * w + xx] ? 1 : 0;
+                }
+            }
+            {
+                int alive = fire[y * w + x] ? 1 : 0;
+                gfx_scratch[y * w + x] = (uint8_t)((alive && (n == 2 || n == 3)) ||
+                                                   (!alive && n == 3));
+            }
+        }
+    }
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            uint8_t a = gfx_scratch[y * w + x];
+            fire[y * w + x] = a;
+            if (a) {
+                plot(x, y, 10, C_WIN, CH_FILL);
+            } else {
+                plot(x, y, C_MUTED, C_WIN, ' ');
+            }
+        }
+    }
+}
+
 static const char *GFX_NAME[N_GFX] = {
-    "Plasma", "Starfield", "3D bounce", "Fire"
+    "Plasma", "Starfield", "3D bounce", "Fire",
+    "Donut", "Tunnel", "Matrix", "Life"
 };
 
 static void draw_gfx_chrome(int scene) {
@@ -1387,7 +2193,7 @@ static void draw_gfx_chrome(int scene) {
     desktop();
     draw_window(win_x, win_y, win_w, win_h, " GFX  ·  Graphics demo ");
     put_str(win_x + 3, win_y + 1, C_TITLE, C_BTN_BG, GFX_NAME[scene], 16);
-    footer(win_y + win_h - 2, "1-4 / Left Right  scene   Space pause   q back");
+    footer(win_y + win_h - 2, "1-8 / Left Right  scene   Space pause   q back");
     gfx_viewport();
 }
 
@@ -1403,6 +2209,8 @@ static int run_gfx_ui(int start_scene, uint32_t auto_ms) {
     stars_on = 0;
     fire_on = 0;
     bounce_on = 0;
+    rain_on = 0;
+    life_on = 0;
     draw_gfx_chrome(scene);
     drain_keys();
     for (;;) {
@@ -1419,12 +2227,15 @@ static int run_gfx_ui(int start_scene, uint32_t auto_ms) {
         }
         if (k == IN_LEFT) {
             scene = (scene + N_GFX - 1) % N_GFX;
+            stars_on = fire_on = bounce_on = rain_on = life_on = 0;
             draw_gfx_chrome(scene);
         } else if (k == IN_RIGHT) {
             scene = (scene + 1) % N_GFX;
+            stars_on = fire_on = bounce_on = rain_on = life_on = 0;
             draw_gfx_chrome(scene);
         } else if (k == IN_DIGIT && d >= 0 && d < N_GFX) {
             scene = d;
+            stars_on = fire_on = bounce_on = rain_on = life_on = 0;
             draw_gfx_chrome(scene);
         } else if (k == IN_SPACE) {
             paused = !paused;
@@ -1451,11 +2262,25 @@ static int run_gfx_ui(int start_scene, uint32_t auto_ms) {
             scene_stars(t);
         } else if (scene == 2) {
             scene_bounce3d(t);
-        } else {
+        } else if (scene == 3) {
             if (!fire_on) {
                 fire_init();
             }
             scene_fire(t);
+        } else if (scene == 4) {
+            scene_donut(t);
+        } else if (scene == 5) {
+            scene_tunnel(t);
+        } else if (scene == 6) {
+            if (!rain_on) {
+                rain_init();
+            }
+            scene_matrix(t);
+        } else {
+            if (!life_on) {
+                life_init();
+            }
+            scene_life(t);
         }
         if (g->has_key) {
             (void)g->has_key();
@@ -1539,7 +2364,7 @@ static void draw_snd_frame(const char *status, int lit) {
 static int snd_ready(void) {
     if (!g->sound_present || !g->sound_beep || !g->sound_play) {
         if (g->show_error) {
-            g->show_error("Sound API missing — rebuild the kernel");
+            g->show_error("Sound API missing - rebuild the kernel");
         }
         return 0;
     }
@@ -1762,6 +2587,755 @@ play:
     }
 }
 
+/* ---- hardware monitor ---- */
+
+typedef struct {
+    char vendor[13];
+    char brand[49];
+    char hv[13];
+    char feats[48];
+    uint32_t family;
+    uint32_t model;
+    uint32_t stepping;
+    uint32_t threads;
+    int has_hv;
+} hw_cpu_t;
+
+static void hw_cpuid(uint32_t leaf, uint32_t sub, uint32_t *eax, uint32_t *ebx,
+                     uint32_t *ecx, uint32_t *edx) {
+    __asm__ volatile("cpuid"
+                     : "=a"(*eax), "=b"(*ebx), "=c"(*ecx), "=d"(*edx)
+                     : "a"(leaf), "c"(sub));
+}
+
+static uint64_t hw_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static void hw_idle_tick(void) {
+    if (g->sleep_ms) {
+        g->sleep_ms(1);
+    } else {
+        __asm__ volatile("sti; hlt");
+    }
+}
+
+static void hw_feat_add(char *out, int cap, const char *tag, int on) {
+    int n, t, i;
+    if (!on || cap <= 1) {
+        return;
+    }
+    n = 0;
+    while (out[n]) {
+        n++;
+    }
+    t = 0;
+    while (tag[t]) {
+        t++;
+    }
+    if (n + 1 + t >= cap) {
+        return;
+    }
+    if (n) {
+        out[n++] = ' ';
+    }
+    for (i = 0; i < t; i++) {
+        out[n++] = tag[i];
+    }
+    out[n] = 0;
+}
+
+static void hw_identify(hw_cpu_t *cpu) {
+    uint32_t eax, ebx, ecx, edx;
+    uint32_t max_ext;
+    uint32_t *dest;
+    uint32_t base_fam, base_mod;
+    char *p;
+
+    cpu->vendor[0] = 0;
+    cpu->brand[0] = 0;
+    cpu->hv[0] = 0;
+    cpu->feats[0] = 0;
+    cpu->family = 0;
+    cpu->model = 0;
+    cpu->stepping = 0;
+    cpu->threads = 1;
+    cpu->has_hv = 0;
+
+    hw_cpuid(0, 0, &eax, &ebx, &ecx, &edx);
+    *(uint32_t *)(cpu->vendor + 0) = ebx;
+    *(uint32_t *)(cpu->vendor + 4) = edx;
+    *(uint32_t *)(cpu->vendor + 8) = ecx;
+    cpu->vendor[12] = 0;
+
+    hw_cpuid(0x80000000, 0, &max_ext, &ebx, &ecx, &edx);
+    if (max_ext >= 0x80000004) {
+        dest = (uint32_t *)cpu->brand;
+        hw_cpuid(0x80000002, 0, &eax, &ebx, &ecx, &edx);
+        dest[0] = eax;
+        dest[1] = ebx;
+        dest[2] = ecx;
+        dest[3] = edx;
+        hw_cpuid(0x80000003, 0, &eax, &ebx, &ecx, &edx);
+        dest[4] = eax;
+        dest[5] = ebx;
+        dest[6] = ecx;
+        dest[7] = edx;
+        hw_cpuid(0x80000004, 0, &eax, &ebx, &ecx, &edx);
+        dest[8] = eax;
+        dest[9] = ebx;
+        dest[10] = ecx;
+        dest[11] = edx;
+        cpu->brand[48] = 0;
+        p = cpu->brand;
+        while (*p == ' ') {
+            p++;
+        }
+        if (p != cpu->brand) {
+            int i = 0;
+            while (p[i] && i < 48) {
+                cpu->brand[i] = p[i];
+                i++;
+            }
+            cpu->brand[i] = 0;
+        }
+    }
+
+    hw_cpuid(1, 0, &eax, &ebx, &ecx, &edx);
+    base_fam = (eax >> 8) & 0xFu;
+    base_mod = (eax >> 4) & 0xFu;
+    cpu->family = base_fam;
+    if (base_fam == 0xFu) {
+        cpu->family += (eax >> 20) & 0xFFu;
+    }
+    cpu->model = base_mod;
+    if (base_fam == 0x6u || base_fam == 0xFu) {
+        cpu->model |= ((eax >> 16) & 0xFu) << 4;
+    }
+    cpu->stepping = eax & 0xFu;
+    cpu->threads = (ebx >> 16) & 0xFFu;
+    if (cpu->threads == 0) {
+        cpu->threads = 1;
+    }
+
+    hw_feat_add(cpu->feats, (int)sizeof(cpu->feats), "TSC", (edx >> 4) & 1);
+    hw_feat_add(cpu->feats, (int)sizeof(cpu->feats), "SSE", (edx >> 25) & 1);
+    hw_feat_add(cpu->feats, (int)sizeof(cpu->feats), "SSE2", (edx >> 26) & 1);
+    hw_feat_add(cpu->feats, (int)sizeof(cpu->feats), "AVX", (ecx >> 28) & 1);
+    if (max_ext >= 0x80000001) {
+        uint32_t eeax, eebx, eecx, eedx;
+        hw_cpuid(0x80000001, 0, &eeax, &eebx, &eecx, &eedx);
+        hw_feat_add(cpu->feats, (int)sizeof(cpu->feats), "LM", (eedx >> 29) & 1);
+    }
+    if (ecx & (1u << 31)) {
+        cpu->has_hv = 1;
+        hw_cpuid(0x40000000, 0, &eax, &ebx, &ecx, &edx);
+        *(uint32_t *)(cpu->hv + 0) = ebx;
+        *(uint32_t *)(cpu->hv + 4) = ecx;
+        *(uint32_t *)(cpu->hv + 8) = edx;
+        cpu->hv[12] = 0;
+        hw_feat_add(cpu->feats, (int)sizeof(cpu->feats), "HV", 1);
+    }
+}
+
+static uint32_t hw_calibrate_mhz(void) {
+    uint64_t t0, t1, dt, c0, c1;
+    if (!g->sleep_ms || !g->get_ticks_ms) {
+        return 0;
+    }
+    t0 = now_ms();
+    c0 = hw_rdtsc();
+    g->sleep_ms(100);
+    c1 = hw_rdtsc();
+    t1 = now_ms();
+    dt = t1 - t0;
+    if (dt == 0) {
+        dt = 1;
+    }
+    return (uint32_t)((c1 - c0) / dt / 1000ull);
+}
+
+static uint32_t hw_pct(uint64_t num, uint64_t den) {
+    if (den == 0) {
+        return 0;
+    }
+    if (num >= den) {
+        return 100;
+    }
+    return (uint32_t)((num * 100ull) / den);
+}
+
+static uint8_t hw_pct_fg(uint32_t pct) {
+    if (pct >= 90) {
+        return C_HOT;
+    }
+    if (pct >= 60) {
+        return C_TITLE;
+    }
+    return C_ACC;
+}
+
+static int hw_fmt_size(char *out, uint64_t bytes) {
+    const char *unit = "B";
+    uint64_t v = bytes;
+    int n;
+    if (bytes >= 1024ull * 1024ull * 1024ull) {
+        v = bytes / (1024ull * 1024ull * 1024ull);
+        unit = "GB";
+    } else if (bytes >= 1024ull * 1024ull) {
+        v = bytes / (1024ull * 1024ull);
+        unit = "MB";
+    } else if (bytes >= 1024ull) {
+        v = bytes / 1024ull;
+        unit = "KB";
+    }
+    n = fmt_u64(out, v);
+    out[n++] = ' ';
+    out[n++] = unit[0];
+    if (unit[1]) {
+        out[n++] = unit[1];
+    }
+    out[n] = 0;
+    return n;
+}
+
+static void hw_put_pct(int x, int y, uint8_t fg, uint32_t pct) {
+    char buf[8];
+    int n = 0;
+    if (pct > 100) {
+        pct = 100;
+    }
+    if (pct >= 100) {
+        buf[n++] = '1';
+        buf[n++] = '0';
+        buf[n++] = '0';
+    } else {
+        if (pct >= 10) {
+            buf[n++] = (char)('0' + pct / 10);
+        } else {
+            buf[n++] = ' ';
+        }
+        buf[n++] = (char)('0' + (pct % 10));
+    }
+    buf[n++] = '%';
+    buf[n] = 0;
+    put_str(x, y, fg, C_WIN, buf, 4);
+}
+
+static void hw_put_freq(int x, int y, uint32_t mhz) {
+    char buf[24];
+    int n;
+    if (mhz == 0) {
+        put_str(x, y, C_MUTED, C_WIN, "? MHz", 8);
+        return;
+    }
+    if (mhz >= 1000u) {
+        uint32_t g = mhz / 1000u;
+        uint32_t frac = (mhz % 1000u) / 100u;
+        n = fmt_u64(buf, g);
+        buf[n++] = '.';
+        buf[n++] = (char)('0' + frac);
+        buf[n++] = ' ';
+        buf[n++] = 'G';
+        buf[n++] = 'H';
+        buf[n++] = 'z';
+        buf[n] = 0;
+    } else {
+        n = fmt_u64(buf, mhz);
+        buf[n++] = ' ';
+        buf[n++] = 'M';
+        buf[n++] = 'H';
+        buf[n++] = 'z';
+        buf[n] = 0;
+    }
+    put_str(x, y, C_ACC, C_WIN, buf, 23);
+}
+
+static void hw_fmt_clock(char *out, const fos_rtc_t *t) {
+    uint32_t y = t->year;
+    out[0] = (char)('0' + (y / 1000u) % 10u);
+    out[1] = (char)('0' + (y / 100u) % 10u);
+    out[2] = (char)('0' + (y / 10u) % 10u);
+    out[3] = (char)('0' + y % 10u);
+    out[4] = '-';
+    out[5] = (char)('0' + t->month / 10u);
+    out[6] = (char)('0' + t->month % 10u);
+    out[7] = '-';
+    out[8] = (char)('0' + t->day / 10u);
+    out[9] = (char)('0' + t->day % 10u);
+    out[10] = ' ';
+    out[11] = (char)('0' + t->hour / 10u);
+    out[12] = (char)('0' + t->hour % 10u);
+    out[13] = ':';
+    out[14] = (char)('0' + t->minute / 10u);
+    out[15] = (char)('0' + t->minute % 10u);
+    out[16] = ':';
+    out[17] = (char)('0' + t->second / 10u);
+    out[18] = (char)('0' + t->second % 10u);
+    out[19] = 0;
+}
+
+static void hw_fmt_uptime(char *out, uint64_t ms) {
+    uint64_t s = ms / 1000ull;
+    uint64_t h = s / 3600ull;
+    uint32_t m = (uint32_t)((s / 60ull) % 60ull);
+    uint32_t sec = (uint32_t)(s % 60ull);
+    int n = fmt_u64(out, h);
+    out[n++] = ':';
+    out[n++] = (char)('0' + m / 10u);
+    out[n++] = (char)('0' + m % 10u);
+    out[n++] = ':';
+    out[n++] = (char)('0' + sec / 10u);
+    out[n++] = (char)('0' + sec % 10u);
+    out[n] = 0;
+}
+
+static int hw_bar_x;
+static int hw_bar_w;
+static int hw_y_cpu;
+static int hw_y_hist;
+static int hw_y_ram;
+static int hw_y_heap;
+static int hw_y_load;
+static int hw_y_clk;
+static int hw_y_io;
+static int hw_got_mouse;
+static int hw_got_sb;
+static int hw_n_disks;
+
+static void hw_meter(int y, const char *name, uint32_t pct, uint8_t bar_fg,
+                     const char *tail) {
+    int name_w = 4;
+    fill_span(win_x + 2, y, win_w - 4, C_FG, C_WIN, ' ');
+    put_str(win_x + 3, y, C_TITLE, C_WIN, name, name_w);
+    bar(hw_bar_x, y, hw_bar_w, pct, 100, bar_fg, C_WIN);
+    hw_put_pct(hw_bar_x + hw_bar_w + 1, y, bar_fg, pct);
+    if (tail && tail[0]) {
+        put_str(hw_bar_x + hw_bar_w + 6, y, C_MUTED, C_WIN, tail, win_w - 20);
+    }
+}
+
+static void hw_draw_hist(const uint8_t *hist, int n, int head) {
+    int w = hw_bar_w - 2;
+    int i;
+    fill_span(win_x + 2, hw_y_hist, win_w - 4, C_FG, C_WIN, ' ');
+    if (w < 4) {
+        return;
+    }
+    if (w > HW_HIST) {
+        w = HW_HIST;
+    }
+    for (i = 0; i < w; i++) {
+        uint8_t v = 0;
+        unsigned char ch;
+        uint8_t fg;
+        int idx;
+        if (n <= 0) {
+            put_xy(hw_bar_x + 1 + i, hw_y_hist, C_MUTED, C_WIN, CH_DOT);
+            continue;
+        }
+        if (n < HW_HIST) {
+            idx = i - (w - n);
+            if (idx < 0 || idx >= n) {
+                put_xy(hw_bar_x + 1 + i, hw_y_hist, C_MUTED, C_WIN, CH_DOT);
+                continue;
+            }
+            v = hist[idx];
+        } else {
+            idx = (head + HW_HIST - w + i) % HW_HIST;
+            v = hist[idx];
+        }
+        if (v < 12) {
+            ch = CH_DOT;
+            fg = C_MUTED;
+        } else if (v < 37) {
+            ch = CH_LITE;
+            fg = C_ACC;
+        } else if (v < 62) {
+            ch = CH_DIM;
+            fg = C_ACC;
+        } else if (v < 87) {
+            ch = CH_MED;
+            fg = C_TITLE;
+        } else {
+            ch = CH_FILL;
+            fg = C_HOT;
+        }
+        put_xy(hw_bar_x + 1 + i, hw_y_hist, fg, C_WIN, ch);
+    }
+}
+
+static void hw_draw_chrome(const hw_cpu_t *cpu, uint32_t mhz) {
+    char line[80];
+    int n;
+    int y;
+    int inner;
+
+    layout_full();
+    desktop();
+    draw_window(win_x, win_y, win_w, win_h, " HW  ·  Hardware monitor ");
+    y = win_y + 3;
+    put_str(win_x + 3, y, C_FG, C_WIN,
+            cpu->brand[0] ? cpu->brand : cpu->vendor, win_w - 6);
+    y++;
+    hw_put_freq(win_x + 3, y, mhz);
+    put_str(win_x + 16, y, C_MUTED, C_WIN, "threads", 8);
+    put_u64(win_x + 24, y, C_FG, C_WIN, cpu->threads);
+    put_str(win_x + 30, y, C_MUTED, C_WIN, "fam/mod", 8);
+    n = fmt_u64(line, cpu->family);
+    line[n++] = '/';
+    n += fmt_u64(line + n, cpu->model);
+    line[n++] = '.';
+    n += fmt_u64(line + n, cpu->stepping);
+    line[n] = 0;
+    put_str(win_x + 39, y, C_INFO, C_WIN, line, 20);
+    y++;
+    if (cpu->feats[0]) {
+        put_str(win_x + 3, y, C_MUTED, C_WIN, cpu->feats, win_w - 6);
+    }
+    if (cpu->has_hv && cpu->hv[0]) {
+        int fl = 0;
+        while (cpu->feats[fl]) {
+            fl++;
+        }
+        put_str(win_x + 4 + fl, y, C_INFO, C_WIN, cpu->hv, 12);
+    }
+    y++;
+    fill_span(win_x + 3, y, win_w - 6, C_FRAME, C_WIN, CH_H);
+    y++;
+
+    hw_bar_x = win_x + 8;
+    hw_bar_w = win_w - 28;
+    if (hw_bar_w > 42) {
+        hw_bar_w = 42;
+    }
+    if (hw_bar_w < 12) {
+        hw_bar_w = win_w > 16 ? win_w - 14 : 10;
+        hw_bar_x = win_x + 8;
+    }
+
+    hw_y_cpu = y;
+    y += 2;
+    hw_y_hist = hw_y_cpu + 1;
+    hw_y_ram = y;
+    y++;
+    hw_y_heap = y;
+    y++;
+    hw_y_load = y;
+    y += 2;
+    fill_span(win_x + 3, y - 1, win_w - 6, C_FRAME, C_WIN, CH_H);
+    hw_y_clk = y;
+    y++;
+    hw_y_io = y;
+
+    inner = win_y + win_h - 2;
+    if (hw_y_io >= inner) {
+        hw_y_io = inner - 1;
+    }
+    footer(inner, "Space load on/off  Left/Right 0-9  q back");
+}
+
+static void hw_update(uint32_t cpu_pct, int load, const uint8_t *hist, int hist_n,
+                      int hist_head) {
+    fos_mem_info_t minfo;
+    fos_heap_info_t heap;
+    fos_rtc_t rtc;
+    char tail[48];
+    char tmp[32];
+    uint64_t ram_used = 0;
+    uint64_t ram_total = 0;
+    uint32_t ram_pct = 0;
+    uint32_t heap_pct = 0;
+    int n;
+    int x;
+
+    minfo.usable_bytes = 0;
+    minfo.kernel_size = 0;
+    heap.pool_total = 0;
+    heap.pool_used = 0;
+    heap.heap_reserved = 0;
+    heap.heap_used = 0;
+    heap.heap_blocks = 0;
+    if (g->get_mem_info) {
+        (void)g->get_mem_info(&minfo);
+    }
+    if (g->get_heap_info) {
+        (void)g->get_heap_info(&heap);
+    }
+
+    ram_total = minfo.usable_bytes;
+    ram_used = minfo.kernel_size + heap.pool_used;
+    if (ram_used > ram_total && ram_total) {
+        ram_used = ram_total;
+    }
+    ram_pct = hw_pct(ram_used, ram_total);
+    heap_pct = hw_pct(heap.heap_used, heap.heap_reserved ? heap.heap_reserved
+                                                         : heap.pool_total);
+
+    hw_meter(hw_y_cpu, "CPU", cpu_pct, hw_pct_fg(cpu_pct), NULL);
+    hw_draw_hist(hist, hist_n, hist_head);
+
+    n = hw_fmt_size(tail, ram_used);
+    tail[n++] = ' ';
+    tail[n++] = '/';
+    tail[n++] = ' ';
+    n += hw_fmt_size(tail + n, ram_total);
+    tail[n] = 0;
+    hw_meter(hw_y_ram, "RAM", ram_pct, C_INFO, tail);
+
+    n = hw_fmt_size(tail, heap.heap_used);
+    tail[n++] = ' ';
+    tail[n++] = '/';
+    tail[n++] = ' ';
+    n += hw_fmt_size(tail + n, heap.heap_reserved);
+    tail[n] = 0;
+    hw_meter(hw_y_heap, "HEAP", heap_pct, C_ACC, tail);
+
+    hw_meter(hw_y_load, "LOAD", (uint32_t)load, C_FRAME,
+             load ? "synth" : "idle");
+
+    fill_span(win_x + 2, hw_y_clk, win_w - 4, C_FG, C_WIN, ' ');
+    put_str(win_x + 3, hw_y_clk, C_TITLE, C_WIN, "CLK", 4);
+    if (g->rtc_read && g->rtc_read(&rtc) == 0 && rtc.year >= 1970) {
+        hw_fmt_clock(tmp, &rtc);
+        put_str(win_x + 8, hw_y_clk, C_FG, C_WIN, tmp, 20);
+    } else {
+        put_str(win_x + 8, hw_y_clk, C_MUTED, C_WIN, "(no RTC)", 10);
+    }
+    put_str(win_x + 30, hw_y_clk, C_MUTED, C_WIN, "up", 3);
+    hw_fmt_uptime(tmp, now_ms());
+    put_str(win_x + 33, hw_y_clk, C_INFO, C_WIN, tmp, 16);
+
+    fill_span(win_x + 2, hw_y_io, win_w - 4, C_FG, C_WIN, ' ');
+    put_str(win_x + 3, hw_y_io, C_TITLE, C_WIN, "I/O", 4);
+    x = win_x + 8;
+    if (hw_got_sb) {
+        put_str(x, hw_y_io, C_ACC, C_WIN, "SB16", 4);
+        x += 6;
+    } else {
+        put_str(x, hw_y_io, C_MUTED, C_WIN, "no SB", 5);
+        x += 7;
+    }
+    put_str(x, hw_y_io, hw_got_mouse ? C_ACC : C_MUTED, C_WIN,
+            hw_got_mouse ? "mouse" : "no mouse", 8);
+    x += hw_got_mouse ? 7 : 10;
+    put_u64(x, hw_y_io, C_FG, C_WIN, (uint64_t)hw_n_disks);
+    x += fmt_u64(tmp, (uint64_t)hw_n_disks);
+    put_str(x, hw_y_io, C_MUTED, C_WIN, hw_n_disks == 1 ? " disk  " : " disks ", 8);
+    x += 7;
+    put_u64(x, hw_y_io, C_FG, C_WIN, (uint64_t)cols);
+    x += fmt_u64(tmp, (uint64_t)cols);
+    put_str(x, hw_y_io, C_MUTED, C_WIN, "x", 1);
+    put_u64(x + 1, hw_y_io, C_FG, C_WIN, (uint64_t)rows);
+}
+
+static void hw_hist_push(uint8_t *hist, int *n, int *head, uint8_t v) {
+    if (*n < HW_HIST) {
+        hist[*n] = v;
+        (*n)++;
+        return;
+    }
+    hist[*head] = v;
+    *head = (*head + 1) % HW_HIST;
+}
+
+static int hw_apply_key(int k, int d, int *load, int *last_load) {
+    if (k == IN_BACK) {
+        return -1;
+    }
+    if (k == IN_SPACE || k == IN_ENTER) {
+        if (*load == 0) {
+            *load = *last_load ? *last_load : 100;
+        } else {
+            *last_load = *load;
+            *load = 0;
+        }
+        return 0;
+    }
+    if (k == IN_LEFT || k == IN_DOWN) {
+        *load = *load >= 10 ? *load - 10 : 0;
+        if (*load) {
+            *last_load = *load;
+        }
+        return 0;
+    }
+    if (k == IN_RIGHT || k == IN_UP) {
+        *load = *load <= 90 ? *load + 10 : 100;
+        *last_load = *load;
+        return 0;
+    }
+    if (k == IN_DIGIT) {
+        if (d == 9) {
+            *load = 0;
+        } else if (d >= 0 && d <= 8) {
+            *load = (d + 1) * 10;
+            *last_load = *load;
+        }
+    }
+    return 0;
+}
+
+static void hw_burn_until(uint64_t until, int *key, int *digit) {
+    uint64_t acc = (uint64_t)rng_state ^ 0x9E3779B97F4A7C15ULL;
+    uint32_t n = 0;
+
+    *key = IN_NONE;
+    if (digit) {
+        *digit = -1;
+    }
+    while (now_ms() < until) {
+        uint32_t k;
+        for (k = 0; k < 256; k++) {
+            acc *= 6364136223846793005ULL;
+            acc += 1;
+            acc ^= acc >> 17;
+        }
+        n++;
+        if ((n & 7u) == 0) {
+            int d;
+            int kk = poll_in(&d);
+            if (kk != IN_NONE) {
+                *key = kk;
+                if (digit) {
+                    *digit = d;
+                }
+                rng_state = (uint32_t)acc;
+                return;
+            }
+        }
+    }
+    rng_state = (uint32_t)acc;
+}
+
+static int hw_load_hit(int mx, int my, int *load) {
+    int inner;
+    if (my != hw_y_load) {
+        return 0;
+    }
+    inner = hw_bar_w - 2;
+    if (inner < 1 || mx < hw_bar_x || mx >= hw_bar_x + hw_bar_w) {
+        return 0;
+    }
+    if (mx <= hw_bar_x) {
+        *load = 0;
+    } else if (mx >= hw_bar_x + hw_bar_w - 1) {
+        *load = 100;
+    } else {
+        *load = ((mx - hw_bar_x - 1) * 100) / inner;
+        if (*load > 100) {
+            *load = 100;
+        }
+        if (*load < 0) {
+            *load = 0;
+        }
+    }
+    return 1;
+}
+
+static int hw_poll_load(int *load, int *last_load) {
+    int mx, my;
+    if (!mouse_click(&mx, &my)) {
+        return 0;
+    }
+    if (hw_load_hit(mx, my, load)) {
+        if (*load) {
+            *last_load = *load;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static int run_hw_ui(void) {
+    hw_cpu_t cpu;
+    uint32_t mhz;
+    int load = 0;
+    int last_load = 100;
+    uint8_t hist[HW_HIST];
+    int hist_n = 0;
+    int hist_head = 0;
+    uint32_t cpu_pct = 0;
+    fos_mouse_t mouse;
+
+    sti();
+    hide_cursor();
+    layout_full();
+    desktop();
+    draw_window(win_x, win_y, win_w, win_h, " HW  ·  Hardware monitor ");
+    put_str(win_x + 3, win_y + 3, C_MUTED, C_WIN, "Calibrating TSC against PIT...", 36);
+    footer(win_y + win_h - 2, "q back");
+    hw_identify(&cpu);
+    mhz = hw_calibrate_mhz();
+    hw_got_sb = g->sound_present && g->sound_present();
+    hw_got_mouse = g->mouse_poll && g->mouse_poll(&mouse);
+    hw_n_disks = g->drive_count ? g->drive_count() : 0;
+    hw_draw_chrome(&cpu, mhz);
+    hw_update(0, load, hist, 0, 0);
+    drain_keys();
+
+    for (;;) {
+        uint64_t t0 = now_ms();
+        int d = -1;
+        int k = IN_NONE;
+        uint32_t busy;
+        uint32_t wall;
+
+        (void)hw_poll_load(&load, &last_load);
+        k = poll_in(&d);
+        if (k != IN_NONE) {
+            if (hw_apply_key(k, d, &load, &last_load) < 0) {
+                return IN_BACK;
+            }
+            k = IN_NONE;
+        }
+
+        if (load > 0) {
+            uint64_t burn_ms = ((uint64_t)HW_FRAME_MS * (uint64_t)load) / 100ull;
+            hw_burn_until(t0 + burn_ms, &k, &d);
+            if (k != IN_NONE) {
+                if (hw_apply_key(k, d, &load, &last_load) < 0) {
+                    return IN_BACK;
+                }
+                k = IN_NONE;
+            }
+        }
+
+        hw_update(cpu_pct, load, hist, hist_n, hist_head);
+        busy = (uint32_t)(now_ms() - t0);
+
+        while (now_ms() - t0 < (uint64_t)HW_FRAME_MS) {
+            (void)hw_poll_load(&load, &last_load);
+            d = -1;
+            k = poll_in(&d);
+            if (k != IN_NONE) {
+                break;
+            }
+            if (g->has_key) {
+                (void)g->has_key();
+            }
+            hw_idle_tick();
+        }
+
+        wall = (uint32_t)(now_ms() - t0);
+        if (wall == 0) {
+            wall = 1;
+        }
+        cpu_pct = (busy * 100u) / wall;
+        if (cpu_pct > 100) {
+            cpu_pct = 100;
+        }
+        hw_hist_push(hist, &hist_n, &hist_head, (uint8_t)cpu_pct);
+
+        if (k != IN_NONE) {
+            if (hw_apply_key(k, d, &load, &last_load) < 0) {
+                return IN_BACK;
+            }
+        }
+    }
+}
+
 /* ---- run all ---- */
 
 static int run_all(void) {
@@ -1774,7 +3348,7 @@ static int run_all(void) {
     sti();
     hide_cursor();
     draw_cpu_frame(0, 1);
-    put_str(win_x + 4, win_y + 8, C_INFO, C_WIN, "Full show — 100k sieve first...", 36);
+    put_str(win_x + 4, win_y + 8, C_INFO, C_WIN, "Full show - 100k sieve first...", 36);
     rc = cpu_execute(0, 1, &sn, &sc, &sms, &ok, &tn, &tc, &tms, &aops, &ams);
     if (rc == -1) {
         return IN_BACK;
@@ -1785,12 +3359,44 @@ static int run_all(void) {
     }
     {
         uint64_t t0 = now_ms();
-        while (now_ms() - t0 < 1200u) {
+        while (now_ms() - t0 < 900u) {
             int d;
             if (poll_in(&d) == IN_BACK) {
                 return IN_BACK;
             }
             pause_cpu();
+        }
+    }
+    {
+        fos_mem_info_t minfo;
+        fos_heap_info_t heap;
+        uint64_t usable = 0;
+        uint64_t pool = 0;
+        int pass = 0;
+        int fail = 0;
+        uint32_t chunk = 0;
+        int mrc;
+        if (g->get_mem_info && g->get_mem_info(&minfo) == 0) {
+            usable = minfo.usable_bytes;
+        }
+        if (g->get_heap_info && g->get_heap_info(&heap) == 0) {
+            pool = heap.pool_total;
+        }
+        draw_mem_frame(1, usable, pool);
+        mrc = mem_execute(1, &pass, &fail, &chunk);
+        if (mrc == -1) {
+            return IN_BACK;
+        }
+        (void)chunk;
+        {
+            uint64_t t0 = now_ms();
+            while (now_ms() - t0 < 900u) {
+                int d;
+                if (poll_in(&d) == IN_BACK) {
+                    return IN_BACK;
+                }
+                pause_cpu();
+            }
         }
     }
     for (i = 0; i < N_GFX; i++) {
@@ -1810,7 +3416,7 @@ static int run_all(void) {
     desktop();
     draw_window(win_x, win_y, win_w, 11, " Show complete ");
     put_str(win_x + 4, win_y + 4, C_ACC, C_WIN, ok ? "Prime sieve: PASS" : "Prime sieve: FAIL", 24);
-    put_str(win_x + 4, win_y + 6, C_FG, C_WIN, "Graphics + audio played.", 28);
+    put_str(win_x + 4, win_y + 6, C_FG, C_WIN, "Memory, graphics, and audio played.", 40);
     footer(win_y + 9, "Enter / q  back to menu");
     drain_keys();
     for (;;) {
@@ -1832,9 +3438,12 @@ typedef struct {
 
 static const menu_item_t MENU[N_MENU] = {
     {'1', "CPU", "Prime numbers", "Sieve, trial division, integer ALU"},
-    {'2', "GFX", "Graphics demo", "Plasma, starfield, bouncing 3D, fire"},
-    {'3', "SND", "Audio demo", "Scale, Ode to Joy, dual-voice synth"},
-    {'4', "ALL", "Run everything", "CPU, then each graphics scene, then sound"},
+    {'2', "BURN", "One-minute soak", "Keep the CPU busy for 60 seconds"},
+    {'3', "RAM", "Memory test", "Heap stress and marching RAM patterns"},
+    {'4', "GFX", "Graphics demo", "Plasma, stars, 3D, fire, donut, tunnel, rain, life"},
+    {'5', "SND", "Audio demo", "Scale, Ode to Joy, dual-voice synth"},
+    {'6', "HW", "Hardware monitor", "Live CPU %, RAM, heap, clock, and load"},
+    {'7', "ALL", "Run everything", "CPU, RAM, each graphics scene, then sound"},
     {'Q', "OUT", "Quit", "Return to the shell"}
 };
 
@@ -1869,7 +3478,7 @@ static void draw_menu(int sel) {
         put_str(win_x + 13, y, fg, bg, MENU[i].title, win_w - 16);
         put_str(win_x + 13, y + 1, i == sel ? fg : C_MUTED, bg, MENU[i].blurb, win_w - 16);
     }
-    footer(win_y + win_h - 2, "Arrows / mouse  Enter  1-4  q quit");
+    footer(win_y + win_h - 2, "Arrows / mouse  Enter  1-7  q quit");
 }
 
 static int menu_hit(int mx, int my) {
@@ -1925,18 +3534,30 @@ void com_main(void) {
     }
 
     arg = skip_ws(g->cmdline);
-    if (arg[0] && (scmp(arg, "primes") == 0 || scmp(arg, "cpu") == 0 ||
-                   scmp(arg, "prime") == 0)) {
+    if (arg[0] && (arg_is(arg, "primes") || arg_is(arg, "cpu") ||
+                   arg_is(arg, "prime"))) {
         cpu_print_stdout(0);
         return;
     }
-    if (arg[0] && (scmp(arg, "gfx") == 0 || scmp(arg, "graphics") == 0)) {
-        start = 1;
-    } else if (arg[0] && (scmp(arg, "snd") == 0 || scmp(arg, "audio") == 0 ||
-                          scmp(arg, "sound") == 0)) {
-        start = 2;
-    } else if (arg[0] && scmp(arg, "all") == 0) {
+    if (arg[0] && (arg_is(arg, "mem") || arg_is(arg, "memory") ||
+                   arg_is(arg, "ram"))) {
+        mem_print_stdout();
+        return;
+    }
+    if (arg[0] && (arg_is(arg, "burn") || arg_is(arg, "soak"))) {
+        burn_print_stdout(BURN_MS);
+        return;
+    }
+    if (arg[0] && (arg_is(arg, "gfx") || arg_is(arg, "graphics"))) {
         start = 3;
+    } else if (arg[0] && (arg_is(arg, "snd") || arg_is(arg, "audio") ||
+                          arg_is(arg, "sound"))) {
+        start = 4;
+    } else if (arg[0] && (arg_is(arg, "hw") || arg_is(arg, "mon") ||
+                          arg_is(arg, "monitor") || arg_is(arg, "top"))) {
+        start = 5;
+    } else if (arg[0] && arg_is(arg, "all")) {
+        start = 6;
     }
 
     if (g->begin_direct) {
@@ -1949,17 +3570,22 @@ void com_main(void) {
         rng_state = 2463534242u;
     }
 
-    if (start == 1) {
+    if (start == 3) {
         (void)run_gfx_ui(0, 0);
         restore_console();
         return;
     }
-    if (start == 2) {
+    if (start == 4) {
         (void)run_snd_ui(-1);
         restore_console();
         return;
     }
-    if (start == 3) {
+    if (start == 5) {
+        (void)run_hw_ui();
+        restore_console();
+        return;
+    }
+    if (start == 6) {
         (void)run_all();
         restore_console();
         return;
@@ -2000,21 +3626,27 @@ dispatch:
         } else if (k == IN_DOWN) {
             sel = (sel + 1) % N_MENU;
             draw_menu(sel);
-        } else if (k == IN_DIGIT && d >= 0 && d < 4) {
+        } else if (k == IN_DIGIT && d >= 0 && d < N_MENU - 1) {
             sel = d;
             k = IN_ENTER;
         }
         if (k == IN_ENTER || k == IN_SPACE) {
-            if (sel == 4) {
+            if (sel == N_MENU - 1) {
                 break;
             }
             if (sel == 0) {
                 (void)run_cpu_ui(3);
             } else if (sel == 1) {
-                (void)run_gfx_ui(0, 0);
+                (void)run_burn_ui(BURN_MS);
             } else if (sel == 2) {
-                (void)run_snd_ui(-1);
+                (void)run_mem_ui();
             } else if (sel == 3) {
+                (void)run_gfx_ui(0, 0);
+            } else if (sel == 4) {
+                (void)run_snd_ui(-1);
+            } else if (sel == 5) {
+                (void)run_hw_ui();
+            } else if (sel == 6) {
                 (void)run_all();
             }
             draw_menu(sel);

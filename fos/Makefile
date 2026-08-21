@@ -151,6 +151,10 @@ $(BOOT_BIN): boot_stage1.asm boot_stage2.asm boot.inc
 kernel/%.o: kernel/%.asm
 	$(NASM) -f elf64 $< -o $@
 
+# Shell is the largest .c; -Os keeps kernel.bin under the 128 KiB loader cap.
+kernel/shell.o: kernel/shell.c $(KERNEL_HDRS)
+	$(CC) $(KERNEL_CFLAGS) -Os -c $< -o $@
+
 kernel/%.o: kernel/%.c $(KERNEL_HDRS)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 

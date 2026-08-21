@@ -267,8 +267,7 @@ int vfs_resolve(int drive, const char *path, int *out_drive, char *out_path, siz
 
 static int dir_entry_count = 0;
 
-static int dir_cb_print(const char *name, uint8_t attr, uint32_t size, void *ctx) {
-    (void)ctx;
+static int dir_print_entry(const char *name, uint8_t attr, uint64_t size) {
     if (keyboard_check_ctrl_c()) {
         console_write_line("^C");
         return 1; /* stop listing */
@@ -284,31 +283,20 @@ static int dir_cb_print(const char *name, uint8_t attr, uint32_t size, void *ctx
         console_write_line("  <DIR>");
     } else {
         console_write("  ");
-        /* simple decimal size */
-        char buf[16];
-        int i = 0;
-        uint32_t v = size;
-        if (v == 0) {
-            buf[i++] = '0';
-        } else {
-            char tmp[16];
-            int j = 0;
-            while (v > 0) {
-                tmp[j++] = (char)('0' + (v % 10));
-                v /= 10;
-            }
-            while (j > 0) {
-                buf[i++] = tmp[--j];
-            }
-        }
-        buf[i] = 0;
-        console_write_line(buf);
+        console_write_size(size);
+        console_write_line("");
     }
     return 0;
 }
 
+static int dir_cb_print(const char *name, uint8_t attr, uint32_t size, void *ctx) {
+    (void)ctx;
+    return dir_print_entry(name, attr, (uint64_t)size);
+}
+
 static int exfat_dir_cb_print(const char *name, uint8_t attr, uint64_t size, void *ctx) {
-    return dir_cb_print(name, attr, (uint32_t)size, ctx);
+    (void)ctx;
+    return dir_print_entry(name, attr, size);
 }
 
 int vfs_list_dir(int drive, const char *path) {

@@ -218,7 +218,8 @@ static const char *take_token(const char *s, char *out, size_t cap) {
         out[n] = 0;
         return s;
     }
-    while (*s && *s != ' ' && *s != '\t' && *s != '=' && *s != '(' && *s != ')' && n + 1 < cap) {
+    while (*s && *s != ' ' && *s != '\t' && *s != '=' && *s != '(' && *s != ')' &&
+           *s != '<' && *s != '>' && *s != '!' && n + 1 < cap) {
         out[n++] = *s++;
     }
     out[n] = 0;
@@ -414,6 +415,7 @@ static void cmd_help(void) {
     console_write_line("  cls / clear          Clear screen");
     console_write_line("  dir [path]           List directory");
     console_write_line("  cd <path>            Change directory");
+    console_write_line("  pwd / which <name>   Directory; locate .COM / .BAT / builtin");
     console_write_line("  mkdir / md <path>    Create directory");
     console_write_line("  del / erase <path>   Delete file or empty folder");
     console_write_line("  copy <src> <dst>     Copy file");
@@ -433,7 +435,7 @@ static void cmd_help(void) {
     console_write_line("  play <file>          WAV/MP3/MIDI (play MIDI\\PREL1.MID)");
     console_write_line("  paint [file]         Mouse paint (s save, o open, q quit)");
     console_write_line("  grep [-inv] PAT [file]  Find lines (fixed string)");
-    console_write_line("  bench / test          Test bench TUI (primes, gfx, audio)");
+    console_write_line("  bench / test          Test bench (primes, soak, mem, gfx, audio, hw)");
     console_write_line("  cmd1 | cmd2          Pipe stdout to stdin");
     console_write_line("  cmd > file           Redirect stdout to file");
     console_write_line("  Up/Down/Left/Right  Edit command line");
@@ -448,7 +450,7 @@ static void cmd_help(void) {
     console_write_line("  echo $(1+5)           Integer math (+ - * / %; names ok)");
     console_write_line("  PATH                  $PATH for .COM / .BAT lookup (default \\FOS)");
     console_write_line("  echo %1 / %PATH%      .BAT args %0..%9 %* and %NAME%");
-    console_write_line("  if exist f then cmd   Also: errorlevel N, true/false, A == B");
+    console_write_line("  if exist f / i < y    Also errorlevel, true/false, == != <= >=");
     console_write_line("  for i in a b do cmd   Or: for i = 1 to 10 do cmd");
     console_write_line("  while true do cmd     Blocks: omit then/do, indent, close with end");
     console_write_line("  break / continue      Leave or restart the innermost for/while");
@@ -485,6 +487,143 @@ static void cmd_cd(const char *args) {
         return;
     }
     env_sync_pwd();
+}
+
+static void write_drive_path(const char *rel) {
+    char shown[VFS_PATH_MAX + 8];
+    char joined[VFS_PATH_MAX];
+    const char *path = rel;
+    size_t n = 0;
+    int d = vfs_get_drive();
+
+    if (rel && rel[0] && rel[1] == ':') {
+        console_write_line(rel);
+        return;
+    }
+    if (!rel) {
+        rel = "\\";
+    }
+    if (rel[0] != '\\') {
+        if (path_join(joined, sizeof(joined), vfs_get_cwd(), rel) == 0) {
+            path = joined;
+        }
+    }
+    shown[n++] = (char)('0' + d);
+    shown[n++] = ':';
+    while (*path && n + 1 < sizeof(shown)) {
+        shown[n++] = *path++;
+    }
+    shown[n] = 0;
+    console_write_line(shown);
+}
+
+static void cmd_pwd(void) {
+    const char *pwd;
+
+    env_sync_pwd();
+    pwd = env_get("PWD");
+    if (pwd && pwd[0]) {
+        console_write_line(pwd);
+        return;
+    }
+    write_drive_path(vfs_get_cwd());
+}
+
+static int is_shell_builtin(const char *name) {
+    static const char *const names[] = {
+        "help", "?", "ver", "cls", "clear", "dir", "cd", "pwd", "which", "where",
+        "mkdir", "md", "del", "erase", "copy", "move", "ren", "rename",
+        "type", "cat", "drives", "df", "reboot", "call",
+        "true", "false", "env", "set", "unset", "export",
+        0
+    };
+    int i;
+
+    for (i = 0; names[i]; i++) {
+        if (strcasecmp(name, names[i]) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static const char *which_alias_com(const char *name) {
+    if (strcasecmp(name, "edit") == 0) {
+        return "EDIT";
+    }
+    if (strcasecmp(name, "fm") == 0) {
+        return "FM";
+    }
+    if (strcasecmp(name, "less") == 0 || strcasecmp(name, "more") == 0) {
+        return "LESS";
+    }
+    if (strcasecmp(name, "play") == 0) {
+        return "PLAY";
+    }
+    if (strcasecmp(name, "paint") == 0) {
+        return "PAINT";
+    }
+    if (strcasecmp(name, "bench") == 0 || strcasecmp(name, "test") == 0) {
+        return "BENCH";
+    }
+    return 0;
+}
+
+static int which_one(const char *name) {
+    char path[VFS_PATH_MAX];
+    const char *com;
+
+    if (!name || !name[0]) {
+        return -1;
+    }
+    com = which_alias_com(name);
+    if (com && resolve_com(com, path, sizeof(path)) == 0) {
+        write_drive_path(path);
+        return 0;
+    }
+    if (is_shell_builtin(name)) {
+        console_write(name);
+        console_write_line(": shell builtin");
+        return 0;
+    }
+    if (resolve_com(name, path, sizeof(path)) == 0) {
+        write_drive_path(path);
+        return 0;
+    }
+    if (resolve_prog(name, ".BAT", path, sizeof(path)) == 0) {
+        write_drive_path(path);
+        return 0;
+    }
+    console_write("which: ");
+    console_write(name);
+    console_write_line(": not found");
+    return -1;
+}
+
+static void cmd_which(const char *args) {
+    char tok[64];
+    const char *s = args;
+    int any = 0;
+    int miss = 0;
+
+    for (;;) {
+        s = take_token(s, tok, sizeof(tok));
+        if (tok[0] == 0) {
+            break;
+        }
+        any = 1;
+        if (which_one(tok) != 0) {
+            miss = 1;
+        }
+    }
+    if (!any) {
+        set_status(1);
+        console_error("WHICH: name required");
+        return;
+    }
+    if (miss) {
+        set_status(1);
+    }
 }
 
 static int confirm_yes_no(void) {
@@ -1078,6 +1217,10 @@ static int run_builtin(char *line) {
         cmd_dir(cmd_arg(line));
     } else if (match_cmd(line, "CD")) {
         cmd_cd(cmd_arg(line));
+    } else if (match_cmd(line, "PWD")) {
+        cmd_pwd();
+    } else if (match_cmd(line, "WHICH") || match_cmd(line, "WHERE")) {
+        cmd_which(cmd_arg(line));
     } else if (match_cmd(line, "MKDIR") || match_cmd(line, "MD")) {
         cmd_mkdir(cmd_arg(line));
     } else if (match_cmd(line, "DEL") || match_cmd(line, "ERASE")) {
@@ -1282,6 +1425,63 @@ static int eval_condition(const char *s, const char **rest_out);
 static int exec_range(int lo, int hi);
 static int exec_leaf(char *line);
 
+static int cond_parse_int(const char *s, int64_t *out) {
+    uint64_t u = 0;
+    int neg = 0;
+
+    if (!s) {
+        return -1;
+    }
+    while (*s == ' ' || *s == '\t') {
+        s++;
+    }
+    if (*s == '-') {
+        neg = 1;
+        s++;
+    } else if (*s == '+') {
+        s++;
+    }
+    if (*s < '0' || *s > '9') {
+        return -1;
+    }
+    while (*s >= '0' && *s <= '9') {
+        u = u * 10ull + (uint64_t)(*s - '0');
+        s++;
+    }
+    while (*s == ' ' || *s == '\t') {
+        s++;
+    }
+    if (*s) {
+        return -1;
+    }
+    *out = neg ? -(int64_t)u : (int64_t)u;
+    return 0;
+}
+
+static int cond_num(const char *tok, int64_t *out) {
+    const char *v;
+    const char *p;
+
+    if (cond_parse_int(tok, out) == 0) {
+        return 0;
+    }
+    if (!tok || !env_name_start((unsigned char)tok[0])) {
+        return env_arith_eval(tok, out);
+    }
+    p = tok + 1;
+    while (env_name_char((unsigned char)*p)) {
+        p++;
+    }
+    if (*p) {
+        return env_arith_eval(tok, out);
+    }
+    v = env_get(tok);
+    if (!v) {
+        return -1;
+    }
+    return cond_parse_int(v, out);
+}
+
 static int eval_condition(const char *s, const char **rest_out) {
     char left[LINE_MAX];
     char right[LINE_MAX];
@@ -1311,20 +1511,78 @@ static int eval_condition(const char *s, const char **rest_out) {
         s = after_kw(s, "false");
         ok = 0;
     } else {
+        int cop = 0;
+        int64_t lv = 0;
+        int64_t rv = 0;
+        int ln;
+        int rn;
+
         s = take_token(s, left, sizeof(left));
         s = skip_spaces(s);
-        if (s[0] == '=' && s[1] == '=') {
+        if (s[0] == '<' && s[1] == '=') {
+            cop = 4;
             s += 2;
-        } else if (s[0] == '=') {
+        } else if (s[0] == '>' && s[1] == '=') {
+            cop = 6;
+            s += 2;
+        } else if (s[0] == '=' && s[1] == '=') {
+            cop = 1;
+            s += 2;
+        } else if ((s[0] == '!' && s[1] == '=') || (s[0] == '<' && s[1] == '>')) {
+            cop = 2;
+            s += 2;
+        } else if (s[0] == '<') {
+            cop = 3;
             s++;
-        } else {
+        } else if (s[0] == '>') {
+            cop = 5;
+            s++;
+        } else if (s[0] == '=') {
+            cop = 1;
+            s++;
+        }
+        if (!cop || !left[0]) {
             if (rest_out) {
-                *rest_out = s;
+                *rest_out = skip_spaces(s);
             }
             return 0;
         }
         s = take_token(s, right, sizeof(right));
-        ok = strcmp(left, right) == 0;
+        ln = cond_num(left, &lv) == 0;
+        rn = cond_num(right, &rv) == 0;
+        if (cop >= 3) {
+            if (!ln && env_name_start((unsigned char)left[0])) {
+                lv = 0;
+                ln = 1;
+            }
+            if (!rn && env_name_start((unsigned char)right[0])) {
+                rv = 0;
+                rn = 1;
+            }
+            if (ln && rn) {
+                ok = (cop == 3) ? lv < rv :
+                     (cop == 4) ? lv <= rv :
+                     (cop == 5) ? lv > rv : lv >= rv;
+            }
+        } else if (ln && rn) {
+            ok = (lv == rv);
+            if (cop == 2) {
+                ok = !ok;
+            }
+        } else {
+            const char *ls = env_get(left);
+            const char *rs = env_get(right);
+            if (!ls) {
+                ls = left;
+            }
+            if (!rs) {
+                rs = right;
+            }
+            ok = strcmp(ls, rs) == 0;
+            if (cop == 2) {
+                ok = !ok;
+            }
+        }
     }
 
     if (neg) {

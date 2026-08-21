@@ -66,7 +66,7 @@ Audio backend defaults to **PipeWire** when that session socket exists, otherwis
 | `\FOS\PLAY.COM` | WAV/MP3/MIDI player TUI (`play DEMO.MID`, q stops) |
 | `\FOS\PAINT.COM` | Mouse paint (`paint [file.pnt]`; B fill, S save, O open, Q quit) |
 | `\FOS\GREP.COM` | Fixed-string search (`grep [-inv] PATTERN [FILE …]`) |
-| `\FOS\BENCH.COM` | Test bench TUI — primes, bouncing 3D, audio (`bench`, `test`) |
+| `\FOS\BENCH.COM` | Test bench TUI — primes, 60 s soak, RAM, graphics, audio, hardware monitor (`bench`, `test`) |
 | `README.TXT` | Full project README (copy of `README.md` from the repo) |
 
 Programs under `\FOS` are found via `$PATH` (seeded from `[shell] path=` in `SYSTEM.INI`).
@@ -81,7 +81,9 @@ A `.COM` can be 32 MiB of code+data+BSS at `0x300000`, with an 8 MiB stack. Larg
 | `ver` | Version string |
 | `cls` / `clear` | Clear screen |
 | `dir [path]` | List directory |
-| `cd <path>` | Change directory on current drive |
+| `cd <path>` | Change directory on current drive (`cd` alone uses `$HOME` or `\`) |
+| `pwd` | Print the current directory (`0:\` or `0:\MIDI`) |
+| `which` / `where <name>` | Locate a command (builtin, `$PATH` `.COM`, then `.BAT`) |
 | `mkdir` / `md <path>` | Create directory (FAT32 only) |
 | `del` / `erase <path>` | Delete file or empty folder (FAT32, confirms Y/N) |
 | `copy <src> <dst>` | Copy file (FAT32) — progress window |
@@ -97,7 +99,7 @@ A `.COM` can be 32 MiB of code+data+BSS at `0x300000`, with an 8 MiB stack. Larg
 | `play <file>` | WAV/MP3/MIDI player (`play DEMO.MID`; q quits) |
 | `paint [file]` | Cell paint (`paint SKETCH.PNT`; left draw, right erase, `b` fill) |
 | `grep [-inv] PAT [file]` | Find lines (`grep Flash README.TXT`; `-i` case, `-n` numbers, `-v` invert) |
-| `bench` / `test` | Test bench TUI (`bench primes` for a headless sieve) |
+| `bench` / `test` | Test bench TUI (`bench primes` / `bench mem` headless; `bench burn` = 60 s; `bench hw` = live meters) |
 | `echo …` / `*.com` | Run a FOSCOM program |
 | `demo` / `*.bat` | Run a `.BAT` script (`call name` also works) |
 | `NAME=value` | Set `$NAME` (`i++`, `i=i+1`, `i+=n`; `export NAME=value` is the same) |
@@ -117,7 +119,7 @@ Prompt shows the current path, e.g. `0:\>` or `0:\docs>`. It is green after a su
 
 ### Mouse
 
-A yellow arrow follows the host mouse in QEMU (no grab — `make run` adds `-device vmmouse`). Left-drag selects text; right-click copies the selection, or pastes if nothing is selected. Left-click activates `[ OK ]` / Y/N buttons, moves the caret in the shell and editor, opens FM entries on double-click, and pages `less` (upper/lower half). Click the bottom row in `play` to quit. In `paint`, left-drag draws, right-drag erases, `B` or **Fill** flood-fills, and the bottom swatches pick a colour. In `bench`, click a menu row to select and click again to run.
+A yellow arrow follows the host mouse in QEMU (no grab — `make run` adds `-device vmmouse`). Left-drag selects text; right-click copies the selection, or pastes if nothing is selected. Left-click activates `[ OK ]` / Y/N buttons, moves the caret in the shell and editor, opens FM entries on double-click, and pages `less` (upper/lower half). Click the bottom row in `play` to quit. In `paint`, left-drag draws, right-drag erases, `B` or **Fill** flood-fills, and the bottom swatches pick a colour. In `bench`, click a menu row to select and click again to run; in the hardware monitor, click the load bar to set synthetic CPU load.
 
 ### Scripts (`if` / `for` / `while` / `.BAT`)
 
@@ -144,9 +146,10 @@ i=0
 i=i+1
 i++
 echo $i
+if i < 10 then echo small
 ```
 
-Conditions: `exist PATH`, `not exist PATH`, `errorlevel N` (`$ERRORLEVEL` ≥ N), `true` / `false`, and `A == B` (or `A = B`). `$ERRORLEVEL` is 0 after a successful command and 1 after a failure. `;` and `&` separate commands on one line. Nested `if`/`for`/`while` work.
+Conditions: `exist PATH`, `not exist PATH`, `errorlevel N` (`$ERRORLEVEL` ≥ N), `true` / `false`, string `A == B` (or `=` / `!=` / `<>`), and integer `i < y` (`< > <= >=`; names are variables, unset is 0). `$ERRORLEVEL` is 0 after a successful command and 1 after a failure. `;` and `&` separate commands on one line. Nested `if`/`for`/`while` work.
 
 ## Configuration (`SYSTEM.INI`)
 
@@ -282,7 +285,7 @@ fos/
 │   ├── beep/   beep.com
 │   ├── play/   play.com (WAV/MP3/MIDI TUI, minimp3 + TinySoundFont)
 │   ├── grep/   grep.com
-│   ├── bench/  bench.com (TUI: primes, bouncing 3D, audio)
+│   ├── bench/  bench.com (TUI: primes, soak, RAM, graphics, audio, hardware monitor)
 │   └── fm/     fm.com
 ├── scripts/                   # mkdisk.sh, foscom_pack.py, …
 ├── system.ini                 # Template → 0:\SYSTEM.INI
