@@ -1,0 +1,11 @@
+Bach MIDI (public domain). play MIDI\NAME.MID
+
+INV4     Invention 4  BWV 775
+INV8     Invention 8  BWV 779
+INV10    Invention 10 BWV 781
+INV13    Invention 13 BWV 784
+PREL1    WTC I Prelude 1  BWV 846
+FUGUE1   WTC I Fugue 1    BWV 846
+TOCCATA  Toccata and Fugue BWV 565
+BISTDU   Bist du bei mir  BWV 508
+DEMO.MID (root)  Ode to Joy

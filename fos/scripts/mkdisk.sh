@@ -19,6 +19,7 @@ BEEP=${14:-}
 PLAY=${15:-}
 PAINT=${16:-}
 GREP=${17:-}
+BENCH=${18:-}
 
 TOTAL_SECTORS=131072
 PART_SECTORS=$((TOTAL_SECTORS - PART_START))
@@ -128,6 +129,9 @@ fi
 if [ -n "$GREP" ] && [ -f "$GREP" ]; then
     add_one FOS/GREP.COM "$GREP"
 fi
+if [ -n "$BENCH" ] && [ -f "$BENCH" ]; then
+    add_one FOS/BENCH.COM "$BENCH"
+fi
 if [ -f "$SCRIPT_DIR/../demo.bat" ]; then
     add_one FOS/DEMO.BAT "$SCRIPT_DIR/../demo.bat"
 fi
@@ -160,5 +164,36 @@ if command -v ffmpeg >/dev/null 2>&1; then
     rm -f "$DEMO_MP3"
 fi
 rm -f "$DEMO_WAV"
+
+# GM soundfont for play FILE.MID. Default is a tiny CC0 wavetable bank
+# (scripts/mksf2.py). Override with FOS_SF2=/path/to/file.sf2 or data/GM.SF2
+# (e.g. TimGM6mb) for a full sampled GM set — loading a 6 MiB font over ATA PIO
+# is slow.
+if [ -n "${FOS_SF2:-}" ] && [ -f "$FOS_SF2" ]; then
+    add_one FOS/GM.SF2 "$FOS_SF2"
+elif [ -f "$SCRIPT_DIR/../data/GM.SF2" ]; then
+    add_one FOS/GM.SF2 "$SCRIPT_DIR/../data/GM.SF2"
+else
+    GM_SF2=$(mktemp)
+    python3 "$SCRIPT_DIR/mksf2.py" "$GM_SF2"
+    add_one FOS/GM.SF2 "$GM_SF2"
+    rm -f "$GM_SF2"
+fi
+DEMO_MID=$(mktemp)
+python3 "$SCRIPT_DIR/mkmidi.py" "$DEMO_MID"
+add_one DEMO.MID "$DEMO_MID"
+rm -f "$DEMO_MID"
+
+MIDI_DIR="$SCRIPT_DIR/../data/midi"
+if [ -d "$MIDI_DIR" ]; then
+    if [ -f "$MIDI_DIR/LIST.TXT" ]; then
+        add_one MIDI/LIST.TXT "$MIDI_DIR/LIST.TXT"
+    fi
+    for f in "$MIDI_DIR"/*.mid; do
+        [ -f "$f" ] || continue
+        base=$(basename "$f" .mid | tr '[:lower:]' '[:upper:]')
+        add_one "MIDI/${base}.MID" "$f"
+    done
+fi
 
 echo "Built $IMG — drive 0: FAT32 ESP (LBA $PART_START, ${PART_SECTORS} sectors)"

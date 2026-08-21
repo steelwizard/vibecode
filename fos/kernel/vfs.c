@@ -314,9 +314,23 @@ static int exfat_dir_cb_print(const char *name, uint8_t attr, uint64_t size, voi
 int vfs_list_dir(int drive, const char *path) {
     char resolved[VFS_PATH_MAX];
     int d = drive;
+    char where[8];
+
+    if (path == 0 || path[0] == 0) {
+        path = vfs_get_cwd();
+    }
     if (vfs_resolve(drive, path, &d, resolved, sizeof(resolved)) != 0) {
         return -1;
     }
+
+    /* So `dir` after `cd MIDI` is clearly 0:\MIDI, not the drive root. */
+    where[0] = (char)('0' + d);
+    where[1] = ':';
+    where[2] = 0;
+    console_write(" Directory of ");
+    console_write(where);
+    console_write_line(resolved);
+    console_write_line("");
 
     drive_vol_t *dv = &drives[d];
     if (!dv->mounted) {

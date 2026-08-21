@@ -3,6 +3,7 @@
  *
  *   play FILE.WAV
  *   play FILE.MP3
+ *   play FILE.MID
  *
  * Full-screen TUI: purple desktop, grey player, blue title bar.
  * ← → seek 5s, ↑ ↓ 30s, Home / End, q / Esc / Ctrl+C quit.
@@ -10,6 +11,7 @@
 
 #include "fos_api.h"
 #include "mp3dec_fos.h"
+#include "midi_fos.h"
 
 #define IN_MAX     4096
 #define PCM8_MAX   4096
@@ -1225,6 +1227,172 @@ static void mp3_apply_seek(fos_api_t *api, uint32_t *file_off, uint32_t *in_off,
     ui_progress(api, body, payload, ms, ui.total_ms);
 }
 
+static int looks_midi(const uint8_t *p, uint32_t n) {
+    return n >= 4 && p[0] == 'M' && p[1] == 'T' && p[2] == 'h' && p[3] == 'd';
+}
+
+static int load_all(fos_api_t *api, const char *path, uint8_t **out, uint32_t *out_len) {
+    uint32_t size = 0;
+    int is_dir = 0;
+    uint8_t *buf;
+    uint32_t off = 0;
+
+    if (!api->stat_file || api->stat_file(path, &size, &is_dir) != 0 || is_dir || size == 0) {
+        return -1;
+    }
+    if (size > 32u * 1024u * 1024u) {
+        return -1;
+    }
+    if (!api->mem_alloc) {
+        return -1;
+    }
+    buf = (uint8_t *)api->mem_alloc(size);
+    if (!buf) {
+        return -1;
+    }
+    while (off < size) {
+        uint32_t got = 0;
+        uint32_t n = size - off;
+        if (n > 32768u) {
+            n = 32768u;
+        }
+        __asm__ volatile("sti");
+        if (api->read_at(path, off, buf + off, n, &got) != 0 || got == 0) {
+            api->mem_free(buf);
+            return -1;
+        }
+        off += got;
+    }
+    *out = buf;
+    *out_len = size;
+    return 0;
+}
+
+static const char *find_sf2(fos_api_t *api) {
+    static const char *paths[] = {
+        "\\FOS\\GM.SF2",
+        "GM.SF2",
+        "\\GM.SF2",
+        0
+    };
+    int i;
+    for (i = 0; paths[i]; i++) {
+        uint32_t size = 0;
+        int is_dir = 0;
+        if (api->stat_file && api->stat_file(paths[i], &size, &is_dir) == 0 &&
+            !is_dir && size > 64u) {
+            return paths[i];
+        }
+    }
+    return 0;
+}
+
+static int play_midi(fos_api_t *api, const char *path, uint32_t file_size) {
+    uint8_t *mid = 0;
+    uint8_t *sf2 = 0;
+    uint32_t mid_len = 0;
+    uint32_t sf2_len = 0;
+    const char *sfpath;
+    uint32_t rate = 22050;
+    uint8_t pcm[2048];
+    int n;
+
+    (void)file_size;
+    ui.kind = "MIDI";
+    ui.bits = 16;
+    ui.ch = 1;
+    ui.rate = rate;
+    draw_meta(api);
+
+    if (load_all(api, path, &mid, &mid_len) != 0) {
+        ui_set_status(api, "Cannot read MIDI", FG_ERR);
+        ui_wait_key(api);
+        return -1;
+    }
+    sfpath = find_sf2(api);
+    if (!sfpath) {
+        api->mem_free(mid);
+        if (api->show_error) {
+            api->show_error("Need \\FOS\\GM.SF2 (rebuild the disk image)");
+        } else {
+            ui_set_status(api, "Need \\FOS\\GM.SF2", FG_ERR);
+            ui_wait_key(api);
+        }
+        return -1;
+    }
+    ui_set_status(api, "Loading soundfont...", FG_MUTED);
+    if (load_all(api, sfpath, &sf2, &sf2_len) != 0) {
+        api->mem_free(mid);
+        ui_set_status(api, "Cannot read GM.SF2", FG_ERR);
+        ui_wait_key(api);
+        return -1;
+    }
+    midi_fos_init(api);
+    if (midi_fos_start(sf2, (int)sf2_len, mid, (int)mid_len, (int)rate) != 0) {
+        api->mem_free(mid);
+        api->mem_free(sf2);
+        midi_fos_stop();
+        ui_set_status(api, "MIDI / soundfont load failed", FG_ERR);
+        ui_wait_key(api);
+        return -1;
+    }
+    api->mem_free(mid);
+    api->mem_free(sf2);
+    ui.total_ms = midi_fos_length_ms();
+    ui.total = ui.total_ms ? ui.total_ms : 1;
+    ui.status = "Playing";
+    ui.status_fg = FG_OK;
+    ui_progress(api, 0, ui.total, 0, ui.total_ms);
+    draw_meta(api);
+
+    for (;;) {
+        int q;
+        if (have_seek) {
+            unsigned ms = seek_to_ms;
+            audio_cut(api);
+            have_seek = 0;
+            if (ms == SEEK_TAIL) {
+                ms = ui.total_ms;
+            }
+            midi_fos_seek_ms(ms);
+            ui_progress(api, midi_fos_time_ms(), ui.total, midi_fos_time_ms(), ui.total_ms);
+            continue;
+        }
+        n = midi_fos_render_u8(pcm, 2048);
+        if (n <= 0) {
+            break;
+        }
+        q = queue_pcm(api, pcm, (uint32_t)n, rate);
+        ui_progress(api, midi_fos_time_ms(), ui.total, midi_fos_time_ms(), ui.total_ms);
+        if (q == PLAY_QUIT) {
+            midi_fos_stop();
+            return 0;
+        }
+        if (q == PLAY_SEEK) {
+            continue;
+        }
+    }
+    {
+        int cmd = finish_playback(api);
+        midi_fos_stop();
+        if (cmd == PLAY_QUIT) {
+            return 0;
+        }
+        if (cmd == PLAY_SEEK) {
+            return play_midi(api, path, file_size);
+        }
+    }
+    ui_progress(api, ui.total, ui.total, ui.total_ms, ui.total_ms);
+    ui_set_status(api, "Done", FG_OK);
+    {
+        int cmd = wait_done_keys(api);
+        if (cmd == PLAY_SEEK) {
+            return play_midi(api, path, file_size);
+        }
+    }
+    return 0;
+}
+
 static int play_mp3(fos_api_t *api, const char *path, uint32_t file_size) {
     uint32_t file_off;
     uint32_t id3;
@@ -1442,7 +1610,7 @@ void com_main(void) {
     }
 
     if (!path[0]) {
-        ui_set_status(api, "usage: play FILE.WAV  or  play FILE.MP3", FG_MUTED);
+        ui_set_status(api, "usage: play FILE.WAV / FILE.MP3 / FILE.MID", FG_MUTED);
         ui_wait_key(api);
         goto done;
     }
@@ -1471,15 +1639,19 @@ void com_main(void) {
         play_wav(api, path, size);
         goto done;
     }
+    if (looks_midi(sniff, got)) {
+        play_midi(api, path, size);
+        goto done;
+    }
     if (looks_mp3(sniff, got)) {
         play_mp3(api, path, size);
         goto done;
     }
 
     if (api->show_error) {
-        api->show_error("Not WAV or MP3");
+        api->show_error("Not WAV, MP3 or MIDI");
     } else {
-        ui_set_status(api, "Not WAV or MP3", FG_ERR);
+        ui_set_status(api, "Not WAV, MP3 or MIDI", FG_ERR);
         ui_wait_key(api);
     }
 

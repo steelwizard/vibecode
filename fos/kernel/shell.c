@@ -430,9 +430,10 @@ static void cmd_help(void) {
     console_write_line("  date [when]          Show or set RTC (date.com)");
     console_write_line("  mem                  RAM map and usage (mem.com)");
     console_write_line("  beep [hz [ms]|file]  Sound Blaster beep (beep.com)");
-    console_write_line("  play <file>          WAV/MP3 player (q quits)");
+    console_write_line("  play <file>          WAV/MP3/MIDI (play MIDI\\PREL1.MID)");
     console_write_line("  paint [file]         Mouse paint (s save, o open, q quit)");
     console_write_line("  grep [-inv] PAT [file]  Find lines (fixed string)");
+    console_write_line("  bench / test          Test bench TUI (primes, gfx, audio)");
     console_write_line("  cmd1 | cmd2          Pipe stdout to stdin");
     console_write_line("  cmd > file           Redirect stdout to file");
     console_write_line("  Up/Down/Left/Right  Edit command line");
@@ -466,7 +467,8 @@ static void cmd_drives(void) {
 }
 
 static void cmd_dir(const char *args) {
-    if (vfs_list_dir(vfs_get_drive(), args[0] ? args : "\\") != 0) {
+    const char *path = args[0] ? args : vfs_get_cwd();
+    if (vfs_list_dir(vfs_get_drive(), path) != 0) {
         set_status(1);
         console_error("DIR failed");
     }
@@ -898,6 +900,11 @@ static void cmd_paint(const char *args) {
                    "PAINT failed (missing or corrupt PAINT.COM — run: make clean && make)");
 }
 
+static void cmd_bench(const char *args) {
+    run_direct_com("BENCH", args,
+                   "BENCH failed (missing or corrupt BENCH.COM — run: make clean && make)");
+}
+
 static int copy_ident(const char *p, char *name, size_t name_sz, const char **rest) {
     size_t n = 0;
 
@@ -1097,6 +1104,8 @@ static int run_builtin(char *line) {
         cmd_play(cmd_arg(line));
     } else if (match_cmd(line, "PAINT")) {
         cmd_paint(cmd_arg(line));
+    } else if (match_cmd(line, "BENCH") || match_cmd(line, "TEST")) {
+        cmd_bench(cmd_arg(line));
     } else if (match_cmd(line, "TRUE")) {
         set_status(0);
     } else if (match_cmd(line, "FALSE")) {
@@ -2010,8 +2019,17 @@ static void line_insert(char c) {
     line_buf[line_cursor] = c;
     line_len++;
     line_buf[line_len] = 0;
+    /* Paint the new character and the tail; the old redraw started *after*
+     * the insert point so typing in the middle (e.g. before ()) was invisible. */
+    console_write(line_buf + line_cursor);
+    console_putchar(' ');
+    {
+        int back = line_len - line_cursor;
+        while (back-- > 0) {
+            console_cursor_back();
+        }
+    }
     line_cursor++;
-    line_redraw_tail();
 }
 
 static void line_cursor_left(void) {

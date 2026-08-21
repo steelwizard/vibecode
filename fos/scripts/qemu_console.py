@@ -16,9 +16,12 @@ PROMPT = "0:\\>"
 
 
 def at_prompt(text):
-    """True when the serial output ends at a drive prompt (0:\\>, 1:\\>, …)."""
+    """True when output ends at a drive prompt (0:\\>, 0:\\MIDI>, 1:\\>, …)."""
     t = text.rstrip()
-    return len(t) >= 4 and t.endswith(":\\>") and t[-4].isdigit()
+    line = t.rsplit("\n", 1)[-1].rstrip("\r")
+    if len(line) < 4 or not line.endswith(">"):
+        return False
+    return line[0].isdigit() and line[1:3] == ":\\"
 
 
 def image_copy(src="boot.img"):

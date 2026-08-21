@@ -25,6 +25,8 @@ PAINT_BIN   = apps/paint/paint.bin
 PAINT_COM   = apps/paint/paint.com
 GREP_BIN    = apps/grep/grep.bin
 GREP_COM    = apps/grep/grep.com
+BENCH_BIN   = apps/bench/bench.bin
+BENCH_COM   = apps/bench/bench.com
 EFI_EFI     = efi/BOOTX64.EFI
 DATA_IMG    = data.img
 
@@ -104,8 +106,8 @@ BEEP_OBJ   = $(BEEP_ASM:.asm=.o) $(BEEP_C:.c=.o)
 BEEP_ELF   = apps/beep/beep.elf
 
 PLAY_ASM   = apps/play/entry.asm
-PLAY_C     = apps/play/play.c apps/play/minimp3_impl.c
-PLAY_OBJ   = apps/play/entry.o apps/play/play.o apps/play/minimp3_impl.o
+PLAY_C     = apps/play/play.c apps/play/minimp3_impl.c apps/play/tsf_fos.c
+PLAY_OBJ   = apps/play/entry.o apps/play/play.o apps/play/minimp3_impl.o apps/play/tsf_fos.o
 PLAY_ELF   = apps/play/play.elf
 
 PAINT_ASM  = apps/paint/entry.asm
@@ -117,6 +119,11 @@ GREP_ASM   = apps/grep/entry.asm
 GREP_C     = apps/grep/grep.c
 GREP_OBJ   = $(GREP_ASM:.asm=.o) $(GREP_C:.c=.o)
 GREP_ELF   = apps/grep/grep.elf
+
+BENCH_ASM  = apps/bench/entry.asm
+BENCH_C    = apps/bench/bench.c
+BENCH_OBJ  = $(BENCH_ASM:.asm=.o) $(BENCH_C:.c=.o)
+BENCH_ELF  = apps/bench/bench.elf
 
 KERNEL_OBJ = $(KERNEL_ASM:.asm=.o) $(KERNEL_C:.c=.o)
 
@@ -195,13 +202,20 @@ apps/beep/%.o: apps/beep/%.c $(KERNEL_HDRS)
 apps/play/%.o: apps/play/%.asm
 	$(NASM) -f elf64 $< -o $@
 
-apps/play/play.o: apps/play/play.c apps/play/mp3dec_fos.h $(KERNEL_HDRS)
+apps/play/play.o: apps/play/play.c apps/play/mp3dec_fos.h apps/play/midi_fos.h $(KERNEL_HDRS)
 	$(CC) $(KERNEL_CFLAGS) -I apps/play -c $< -o $@
 
 apps/play/minimp3_impl.o: apps/play/minimp3_impl.c apps/play/minimp3.h apps/play/mp3dec_fos.h
 	$(CC) -m64 -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
 	      -mno-red-zone -mstackrealign -Os -Wall -I apps/play -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
 	      -Wno-unused-function -Wno-unused-variable -c $< -o $@
+
+apps/play/tsf_fos.o: apps/play/tsf_fos.c apps/play/tsf.h apps/play/tml.h apps/play/midi_fos.h $(KERNEL_HDRS)
+	$(CC) -m64 -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
+	      -mno-red-zone -mstackrealign -O2 -Wall -I apps/play -I kernel/include \
+	      -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
+	      -Wno-unused-function -Wno-unused-variable -Wno-unused-parameter \
+	      -c $< -o $@
 
 apps/paint/%.o: apps/paint/%.asm
 	$(NASM) -f elf64 $< -o $@
@@ -213,6 +227,12 @@ apps/grep/%.o: apps/grep/%.asm
 	$(NASM) -f elf64 $< -o $@
 
 apps/grep/%.o: apps/grep/%.c $(KERNEL_HDRS)
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+apps/bench/%.o: apps/bench/%.asm
+	$(NASM) -f elf64 $< -o $@
+
+apps/bench/%.o: apps/bench/%.c $(KERNEL_HDRS)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(KERNEL_ELF): $(KERNEL_OBJ) kernel/linker.ld
@@ -377,6 +397,19 @@ $(GREP_COM): $(GREP_BIN) $(GREP_ELF) scripts/foscom_pack.py
 		--mem-size 0x$$(nm -n $(GREP_ELF) | awk '$$3=="_end"{print $$1; exit}') \
 		--stack $(COM_STACK) --name GREP
 
+$(BENCH_ELF): $(BENCH_OBJ) apps/bench/linker.ld
+	$(LD) -m elf_x86_64 -T apps/bench/linker.ld -nostdlib -o $@ $(BENCH_OBJ)
+
+$(BENCH_BIN): $(BENCH_ELF)
+	$(OBJCOPY) -O binary $< $@
+
+$(BENCH_COM): $(BENCH_BIN) $(BENCH_ELF) scripts/foscom_pack.py
+	$(PYTHON) scripts/foscom_pack.py $(BENCH_BIN) $@ \
+		--load $(COM_LOAD) \
+		--entry 0x$$(nm -n $(BENCH_ELF) | awk '$$3=="_start"{print $$1; exit}') \
+		--mem-size 0x$$(nm -n $(BENCH_ELF) | awk '$$3=="_end"{print $$1; exit}') \
+		--stack $(COM_STACK) --name BENCH
+
 EFI_CFLAGS = -m64 -mabi=ms -fshort-wchar -ffreestanding -fno-stack-protector \
              -fno-builtin -fpie -mno-red-zone -fno-ident \
              -fno-asynchronous-unwind-tables -Wall -Wextra -O2 -I efi
@@ -400,8 +433,8 @@ $(EFI_EFI): efi/efi_main.o efi/efi.ld
 	      --image-base 0x140000000 --disable-auto-import \
 	      -o $@ efi/efi_main.o
 
-$(IMG): $(BOOT_BIN) $(KERNEL_BIN) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(BEEP_COM) $(PLAY_COM) $(PAINT_COM) $(GREP_COM) $(EFI_EFI) system.ini demo.bat scripts/mkdisk.sh scripts/fat32_add.py
-	scripts/mkdisk.sh $(IMG) $(BOOT_BIN) $(KERNEL_BIN) $(KERNEL_LBA) $(PART_START) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(EFI_EFI) $(BEEP_COM) $(PLAY_COM) $(PAINT_COM) $(GREP_COM)
+$(IMG): $(BOOT_BIN) $(KERNEL_BIN) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(BEEP_COM) $(PLAY_COM) $(PAINT_COM) $(GREP_COM) $(BENCH_COM) $(EFI_EFI) system.ini demo.bat scripts/mkdisk.sh scripts/fat32_add.py
+	scripts/mkdisk.sh $(IMG) $(BOOT_BIN) $(KERNEL_BIN) $(KERNEL_LBA) $(PART_START) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(EFI_EFI) $(BEEP_COM) $(PLAY_COM) $(PAINT_COM) $(GREP_COM) $(BENCH_COM)
 
 $(DATA_IMG): scripts/mkdata.sh scripts/exfat_add.py data/LOREM.TXT data/IPSUM.TXT data/CICERO.TXT
 	scripts/mkdata.sh $(DATA_IMG)
@@ -467,6 +500,7 @@ clean:
 	      $(PLAY_BIN) $(PLAY_COM) $(PLAY_ELF) \
 	      $(PAINT_BIN) $(PAINT_COM) $(PAINT_ELF) \
 	      $(GREP_BIN) $(GREP_COM) $(GREP_ELF) \
+	      $(BENCH_BIN) $(BENCH_COM) $(BENCH_ELF) \
 	      $(EFI_EFI) efi/efi_main.o efi/enter_kernel.bin efi/enter_kernel_bin.h \
 	      $(KERNEL_ELF) shell/shell.elf $(ECHO_ELF) \
-	      $(IMG) $(DATA_IMG) fos-sb16.wav $(KERNEL_OBJ) $(SHELL_OBJ) $(ECHO_OBJ) $(EDIT_OBJ) $(FM_OBJ) $(LESS_OBJ) $(DATE_OBJ) $(MEM_OBJ) $(BEEP_OBJ) $(PLAY_OBJ) $(PAINT_OBJ) $(GREP_OBJ)
+	      $(IMG) $(DATA_IMG) fos-sb16.wav $(KERNEL_OBJ) $(SHELL_OBJ) $(ECHO_OBJ) $(EDIT_OBJ) $(FM_OBJ) $(LESS_OBJ) $(DATE_OBJ) $(MEM_OBJ) $(BEEP_OBJ) $(PLAY_OBJ) $(PAINT_OBJ) $(GREP_OBJ) $(BENCH_OBJ)

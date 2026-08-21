@@ -67,7 +67,15 @@ CASES = [
     ("0:", 10, None, None, None),
     ("play DEMO.WAV", 25, 2.0, "q", "DEMO.WAV"),
     ("play DEMO.MP3", 25, 2.0, "q", "DEMO.MP3"),
-    ("dir FOS", 10, None, None, "PLAY.COM"),  # shell alive after the audio runs
+    ("play DEMO.MID", 25, 3.0, "q", "DEMO.MID"),
+    ("dir MIDI", 10, None, None, "PREL1.MID"),
+    ("cd MIDI", 10, None, None, None),
+    ("dir", 10, None, None, "PREL1.MID"),
+    ("cd ..", 10, None, None, None),
+    ("play MIDI\\INV4.MID", 25, 3.0, "q", "INV4.MID"),
+    ("for i = 1 to 500 do echo $i", 40, None, None, "500"),
+    ("bench primes", 30, None, None, "RESULT: PASS"),
+    ("dir FOS", 10, None, None, "BENCH.COM"),  # shell alive after bench
 ]
 
 

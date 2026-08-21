@@ -1,0 +1,23 @@
+Bach MIDI files packed as MIDI\*.MID on the FOS boot volume.
+The compositions are public domain (J.S. Bach, d. 1750). MIDI encodings:
+
+  INV4.MID    Invention No. 4 in D minor, BWV 775
+              Mutopia / Wikimedia Commons (public domain)
+
+  INV8.MID    Invention No. 8 in F major, BWV 779
+  INV10.MID   Invention No. 10 in G major, BWV 781
+  INV13.MID   Invention No. 13 in A minor, BWV 784
+              MIDI by Michael Bednarek, released to the public domain
+              (Wikimedia Commons)
+
+  PREL1.MID   WTC Book I, Prelude No. 1 in C major, BWV 846
+  FUGUE1.MID  WTC Book I, Fugue No. 1 in C major, BWV 846
+              Mutopia Project, public domain (Tobias Erbsland)
+
+  TOCCATA.MID Toccata and Fugue in D minor, BWV 565
+              Mutopia Project, public domain
+
+  BISTDU.MID  Aria "Bist du bei mir", BWV 508
+              Mutopia Project, public domain
+
+Play:  play MIDI\PREL1.MID

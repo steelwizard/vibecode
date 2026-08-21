@@ -429,33 +429,44 @@ static void stamp_cell(int x, int y, uint16_t cell) {
 }
 
 static void scroll_drop_oldest(void) {
+    int i;
+
     if (scroll_lines <= 1) {
         return;
     }
-    for (int i = 1; i < scroll_lines; i++) {
-        for (int x = 0; x < term_cols; x++) {
-            scrollback[i - 1][x] = scrollback[i][x];
-        }
+    for (i = 1; i < scroll_lines; i++) {
+        memcpy(scrollback[i - 1], scrollback[i],
+               (size_t)term_cols * sizeof(uint16_t));
     }
     scroll_lines--;
     if (scroll_view_top > 0) {
         scroll_view_top--;
     }
-    for (int x = 0; x < term_cols; x++) {
-        scrollback[scroll_lines - 1][x] = blank_cell();
-    }
 }
 
-static void scroll_ensure_line(int abs_line) {
-    while (scroll_lines <= abs_line) {
-        if (scroll_lines >= SCROLLBACK_MAX) {
-            scroll_drop_oldest();
+/* Map a growing absolute line number onto the ring of SCROLLBACK_MAX rows. */
+static int scroll_ensure_line(int abs_line) {
+    if (abs_line < 0) {
+        return 0;
+    }
+    while (abs_line >= SCROLLBACK_MAX) {
+        scroll_drop_oldest();
+        abs_line--;
+        if (abs_line < 0) {
+            return 0;
         }
-        for (int x = 0; x < term_cols; x++) {
+    }
+    while (scroll_lines <= abs_line) {
+        int x;
+        for (x = 0; x < term_cols; x++) {
             scrollback[scroll_lines][x] = blank_cell();
         }
         scroll_lines++;
     }
+    if (abs_line >= scroll_lines) {
+        abs_line = scroll_lines - 1;
+    }
+    return abs_line;
 }
 
 static void scroll_pin_bottom(void) {
@@ -625,8 +636,9 @@ static void console_redraw(void) {
 }
 
 static void scroll_write_cell(int abs_line, int x, uint16_t cell) {
-    scroll_ensure_line(abs_line);
-    if (x >= 0 && x < CONSOLE_MAX_COLS) {
+    abs_line = scroll_ensure_line(abs_line);
+    if (x >= 0 && x < CONSOLE_MAX_COLS && abs_line >= 0 &&
+        abs_line < SCROLLBACK_MAX) {
         scrollback[abs_line][x] = cell;
     }
     if (!direct_vga) {
@@ -638,10 +650,11 @@ static void scroll_write_cell(int abs_line, int x, uint16_t cell) {
 }
 
 static void scroll_newline(void) {
+    int next_abs;
+
     cursor_x = 0;
     direct_wrap_pending = 0;
-    int next_abs = scroll_view_top + cursor_y + 1;
-    scroll_ensure_line(next_abs);
+    next_abs = scroll_ensure_line(scroll_view_top + cursor_y + 1);
 
     if (next_abs >= scroll_view_top + term_rows) {
         cursor_y = term_rows - 1;
