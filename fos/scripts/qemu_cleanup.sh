@@ -110,31 +110,15 @@ kill_pids "$QEMU_PIDS"
 kill_pids "$WRAP_PIDS"
 
 # Temp junk from qemu_console / smoke / shot / audio_check / ad-hoc runs.
+# Catch-all fos-* : ad-hoc -D /tmp/fos-midi-int.log etc. are multi-GB and
+# were missed by the old fos-int*.log / fos-smoke-int.log list.
+TMP="${TMPDIR:-/tmp}"
 JUNK=(
-    /tmp/fos-qemu-*
-    /tmp/fos-test-*.img
-    /tmp/fos-smoke-int.log
-    /tmp/fos-play-smoke-int.log
-    /tmp/fos-uefi-int.log
-    /tmp/fos-int*.log
-    /tmp/fos-e9.log
+    "$TMP"/fos-*
+    "$TMP"/fos_*
     /tmp/fb.img
     /tmp/fd.img
-    /tmp/fosshot
-    /tmp/fos-fm
-    /tmp/fos-cap*.wav
-    /tmp/fos-sb16.wav
-    /tmp/fos_serial.txt
-    /tmp/fos_qemu_err.txt
-    /tmp/fos_play_err.txt
-    /tmp/fos_play_serial.txt
-    /tmp/fos_sb_err.txt
-    /tmp/fos_sb_serial.txt
-    /tmp/fos-serial.log
-    /tmp/fos-audio-check.sock
-    /tmp/fos-com1.sock
-    /tmp/fos-mon.sock
-    /tmp/fos-play-smoke.sock
+    "$ROOT"/fos-sb16.wav
     "$ROOT"/.shot-*
 )
 

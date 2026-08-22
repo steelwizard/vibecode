@@ -31,6 +31,7 @@
 #define SCRIPT_MAX     64
 #define BAT_FILE_MAX   8192
 #define BAT_NEST       4
+#define SHELL_NEST     4
 #define LOOP_MAX       10000
 #define FLOW_NEXT      0
 #define FLOW_BREAK     1
@@ -57,6 +58,8 @@ static int script_n;
 static int script_depth;
 static int bat_depth;
 static int prompt_cols;
+static int shell_depth;
+static int shell_leave;
 
 static void set_status(int st);
 static void script_reset(void);
@@ -437,6 +440,7 @@ static void cmd_help(void) {
     console_write_line("  grep [-inv] PAT [file]  Find lines (fixed string)");
     console_write_line("  bench / test          Test bench (primes, soak, mem, gfx, audio, hw)");
     console_write_line("  tetris                Tetromino game (arrows, z/x, space, c hold)");
+    console_write_line("  shell / exit          Nested shell; exit returns");
     console_write_line("  cmd1 | cmd2          Pipe stdout to stdin");
     console_write_line("  cmd > file           Redirect stdout to file");
     console_write_line("  Up/Down/Left/Right  Edit command line");
@@ -536,6 +540,7 @@ static int is_shell_builtin(const char *name) {
         "mkdir", "md", "del", "erase", "copy", "move", "ren", "rename",
         "type", "cat", "drives", "df", "reboot", "call",
         "true", "false", "env", "set", "unset", "export",
+        "shell", "exit",
         0
     };
     int i;
@@ -819,6 +824,37 @@ static int try_drive_switch(char *line) {
     return 0;
 }
 
+static void cmd_exit(void) {
+    if (shell_depth <= 1) {
+        console_write_line("Cannot exit the root shell");
+        set_status(1);
+        return;
+    }
+    shell_leave = 1;
+}
+
+static void cmd_shell(void) {
+    shell_run();
+}
+
+static int name_is_shell_com(const char *name) {
+    const char *base = name;
+    const char *p;
+
+    if (!name || !name[0]) {
+        return 0;
+    }
+    for (p = name; *p; p++) {
+        if (*p == '\\' || *p == '/') {
+            base = p + 1;
+        }
+    }
+    return strcasecmp(base, "shell") == 0 ||
+           strcasecmp(base, "shell.com") == 0 ||
+           strcasecmp(base, "command") == 0 ||
+           strcasecmp(base, "command.com") == 0;
+}
+
 static int try_run_com(const char *line) {
     char name[64];
     char args[256];
@@ -828,9 +864,16 @@ static int try_run_com(const char *line) {
     if (name[0] == 0) {
         return 0;
     }
-
+    if (name_is_shell_com(name)) {
+        cmd_shell();
+        return 1;
+    }
     if (resolve_com(name, path, sizeof(path)) != 0) {
         return 0;
+    }
+    if (name_is_shell_com(path)) {
+        cmd_shell();
+        return 1;
     }
     return exec_run(vfs_get_drive(), path, args) == 0;
 }
@@ -1260,6 +1303,10 @@ static int run_builtin(char *line) {
         cmd_bench(cmd_arg(line));
     } else if (match_cmd(line, "TETRIS")) {
         cmd_tetris(cmd_arg(line));
+    } else if (match_cmd(line, "SHELL") || match_cmd(line, "COMMAND")) {
+        cmd_shell();
+    } else if (match_cmd(line, "EXIT")) {
+        cmd_exit();
     } else if (match_cmd(line, "TRUE")) {
         set_status(0);
     } else if (match_cmd(line, "FALSE")) {
@@ -2504,9 +2551,18 @@ static void shell_restore_live_view(void) {
 }
 
 void shell_run(void) {
-    print_banner();
-    script_reset();
-    set_status(0);
+    if (shell_depth >= SHELL_NEST) {
+        console_error("Too many nested shells");
+        return;
+    }
+    shell_depth++;
+    if (shell_depth == 1) {
+        print_banner();
+        script_reset();
+        set_status(0);
+    } else {
+        console_write_line("Nested shell — type exit to return");
+    }
     print_prompt();
 
     for (;;) {
@@ -2562,6 +2618,10 @@ void shell_run(void) {
             hist_pos = -1;
             submit_line(line_buf);
             line_reset();
+            if (shell_leave) {
+                shell_leave = 0;
+                break;
+            }
             print_prompt();
             continue;
         }
@@ -2619,4 +2679,5 @@ void shell_run(void) {
             line_insert(ev.ch);
         }
     }
+    shell_depth--;
 }

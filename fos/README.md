@@ -102,6 +102,7 @@ A `.COM` can be 32 MiB of code+data+BSS at `0x300000`, with an 8 MiB stack. Larg
 | `grep [-inv] PAT [file]` | Find lines (`grep Flash README.TXT`; `-i` case, `-n` numbers, `-v` invert) |
 | `bench` / `test` | Test bench TUI (`bench primes` / `bench mem` headless; `bench burn` = 60 s; `bench hw` = live meters) |
 | `tetris` | Tetromino game (arrows / WASD, `z`/`y` rotate, space drop, `c` hold, `p` pause, `q` quit) |
+| `shell` / `shell.com` | Nested shell (`exit` returns; on-disk `SHELL.COM` is not a FOSCOM) |
 | `echo …` / `*.com` | Run a FOSCOM program |
 | `demo` / `*.bat` | Run a `.BAT` script (`call name` also works) |
 | `NAME=value` | Set `$NAME` (`i++`, `i=i+1`, `i+=n`; `export NAME=value` is the same) |

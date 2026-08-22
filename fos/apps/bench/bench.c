@@ -6,6 +6,7 @@
  *   bench mem          headless heap + RAM pattern test
  *   bench burn         60 s integer soak (q cancels in the TUI)
  *   bench hw           live hardware monitor (CPU %, RAM, heap, clock)
+ *   bench gfx          graphics (opens on the spinning cube)
  *
  * Arrows / 1-7 / mouse select, Enter run, q back or quit.
  */
@@ -61,7 +62,7 @@
 #define IN_DIGIT  9
 
 #define N_MENU 8
-#define N_GFX  8
+#define N_GFX  9
 #define N_SND  3
 #define BURN_MS 60000u
 #define MEM_PTRS 64
@@ -1872,6 +1873,216 @@ static void scene_bounce3d(int t) {
     }
 }
 
+static void span_edge(int x0, int y0, int x1, int y1, int *xmin, int *xmax) {
+    int dx = iabs(x1 - x0);
+    int sx = x0 < x1 ? 1 : -1;
+    int dy = -iabs(y1 - y0);
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+
+    for (;;) {
+        if (y0 >= 0 && y0 < gh && y0 < MAX_ROWS) {
+            if (x0 < xmin[y0]) {
+                xmin[y0] = x0;
+            }
+            if (x0 > xmax[y0]) {
+                xmax[y0] = x0;
+            }
+        }
+        if (x0 == x1 && y0 == y1) {
+            break;
+        }
+        {
+            int e2 = err * 2;
+            if (e2 >= dy) {
+                err += dy;
+                x0 += sx;
+            }
+            if (e2 <= dx) {
+                err += dx;
+                y0 += sy;
+            }
+        }
+    }
+}
+
+static void fill_tri(int x0, int y0, int x1, int y1, int x2, int y2,
+                     uint8_t fg, uint8_t bg, unsigned char ch) {
+    int xmin[MAX_ROWS];
+    int xmax[MAX_ROWS];
+    int y;
+    int i;
+
+    for (i = 0; i < gh && i < MAX_ROWS; i++) {
+        xmin[i] = gw + 1;
+        xmax[i] = -1;
+    }
+    span_edge(x0, y0, x1, y1, xmin, xmax);
+    span_edge(x1, y1, x2, y2, xmin, xmax);
+    span_edge(x2, y2, x0, y0, xmin, xmax);
+    for (y = 0; y < gh && y < MAX_ROWS; y++) {
+        int x;
+        if (xmax[y] < xmin[y]) {
+            continue;
+        }
+        if (xmin[y] < 0) {
+            xmin[y] = 0;
+        }
+        if (xmax[y] >= gw) {
+            xmax[y] = gw - 1;
+        }
+        for (x = xmin[y]; x <= xmax[y]; x++) {
+            plot(x, y, fg, bg, ch);
+        }
+    }
+}
+
+static void fill_quad(int *x, int *y, uint8_t fg, uint8_t bg, unsigned char ch) {
+    fill_tri(x[0], y[0], x[1], y[1], x[2], y[2], fg, bg, ch);
+    fill_tri(x[0], y[0], x[2], y[2], x[3], y[3], fg, bg, ch);
+}
+
+static void scene_cube(int t) {
+    static const int8_t CUBE_V[8][3] = {
+        {-1, -1, -1}, {1, -1, -1}, {1, 1, -1}, {-1, 1, -1},
+        {-1, -1, 1}, {1, -1, 1}, {1, 1, 1}, {-1, 1, 1}
+    };
+    static const uint8_t CUBE_F[6][4] = {
+        {0, 1, 2, 3}, {5, 4, 7, 6}, {1, 5, 6, 2},
+        {4, 0, 3, 7}, {0, 4, 5, 1}, {3, 2, 6, 7}
+    };
+    static const uint8_t FACE_FG[6] = {12, 9, 10, 13, 14, 11};
+    static const uint8_t FACE_BG[6] = {4, 1, 2, 5, 6, 3};
+    int vx[8], vy[8], vz[8];
+    int px[8], py[8];
+    int order[6];
+    int zavg[6];
+    int vis[6];
+    int ax = t * 2;
+    int ay = t * 3;
+    int az = t;
+    int scale = (gw < 40 || gh < 16) ? 88 : 132;
+    int i, j;
+    int gx0, gz;
+
+    gfx_clear(C_WIN);
+    /* Ground grid so the cube sits in space. */
+    for (gz = 20; gz <= 220; gz += 24) {
+        int a0, a1, b0, b1;
+        proj3(-180, 92, gz, &a0, &a1);
+        proj3(180, 92, gz, &b0, &b1);
+        line_to(a0, a1, b0, b1, C_MUTED, C_WIN, CH_DOT);
+    }
+    for (gx0 = -180; gx0 <= 180; gx0 += 30) {
+        int a0, a1, b0, b1;
+        proj3(gx0, 92, 20, &a0, &a1);
+        proj3(gx0, 92, 220, &b0, &b1);
+        line_to(a0, a1, b0, b1, 8, C_WIN, CH_DOT);
+    }
+
+    for (i = 0; i < 8; i++) {
+        rot3(CUBE_V[i][0] * scale, CUBE_V[i][1] * scale, CUBE_V[i][2] * scale,
+             ax, ay, az, &vx[i], &vy[i], &vz[i]);
+        vy[i] += isin(t * 2) / 6;
+        proj3(vx[i], vy[i], vz[i], &px[i], &py[i]);
+    }
+
+    for (i = 0; i < 6; i++) {
+        int i0 = CUBE_F[i][0];
+        int i1 = CUBE_F[i][1];
+        int i2 = CUBE_F[i][2];
+        int e1x = vx[i1] - vx[i0];
+        int e1y = vy[i1] - vy[i0];
+        int e1z = vz[i1] - vz[i0];
+        int e2x = vx[i2] - vx[i0];
+        int e2y = vy[i2] - vy[i0];
+        int e2z = vz[i2] - vz[i0];
+        int nx = e1y * e2z - e1z * e2y;
+        int ny = e1z * e2x - e1x * e2z;
+        int nz = e1x * e2y - e1y * e2x;
+        int cx = (vx[i0] + vx[i1] + vx[i2] + vx[CUBE_F[i][3]]) / 4;
+        int cy = (vy[i0] + vy[i1] + vy[i2] + vy[CUBE_F[i][3]]) / 4;
+        int cz = (vz[i0] + vz[i1] + vz[i2] + vz[CUBE_F[i][3]]) / 4;
+        /* Camera sits at (0,0,-280). Visible if the face looks toward it. */
+        int to_cam = nx * (0 - cx) + ny * (0 - cy) + nz * (-280 - cz);
+        vis[i] = to_cam > 0;
+        zavg[i] = cz;
+        order[i] = i;
+    }
+    for (i = 0; i < 5; i++) {
+        for (j = i + 1; j < 6; j++) {
+            if (zavg[order[j]] > zavg[order[i]]) {
+                int tmp = order[i];
+                order[i] = order[j];
+                order[j] = tmp;
+            }
+        }
+    }
+    for (i = 0; i < 6; i++) {
+        int f = order[i];
+        int qx[4];
+        int qy[4];
+        int light;
+        unsigned char ch;
+        uint8_t fg;
+        uint8_t bg;
+        int i0, i1, i2;
+        int e1x, e1y, e1z, e2x, e2y, e2z, nx, ny, nz;
+
+        if (!vis[f]) {
+            continue;
+        }
+        for (j = 0; j < 4; j++) {
+            int vi = CUBE_F[f][j];
+            qx[j] = px[vi];
+            qy[j] = py[vi];
+        }
+        i0 = CUBE_F[f][0];
+        i1 = CUBE_F[f][1];
+        i2 = CUBE_F[f][2];
+        e1x = vx[i1] - vx[i0];
+        e1y = vy[i1] - vy[i0];
+        e1z = vz[i1] - vz[i0];
+        e2x = vx[i2] - vx[i0];
+        e2y = vy[i2] - vy[i0];
+        e2z = vz[i2] - vz[i0];
+        nx = e1y * e2z - e1z * e2y;
+        ny = e1z * e2x - e1x * e2z;
+        nz = e1x * e2y - e1y * e2x;
+        nx /= 128;
+        ny /= 128;
+        nz /= 128;
+        /* Key light from upper-left, toward the camera. +y is down. */
+        light = (-nx - ny - nz) / 180;
+        if (light < 0) {
+            light = 0;
+        }
+        if (light > 3) {
+            light = 3;
+        }
+        fg = FACE_FG[f];
+        bg = FACE_BG[f];
+        if (light <= 0) {
+            ch = CH_LITE;
+            fg = FACE_BG[f];
+            bg = C_WIN;
+        } else if (light == 1) {
+            ch = CH_DIM;
+        } else if (light == 2) {
+            ch = CH_MED;
+        } else {
+            ch = CH_FILL;
+            fg = 15;
+        }
+        fill_quad(qx, qy, fg, bg, ch);
+        for (j = 0; j < 4; j++) {
+            int a = CUBE_F[f][j];
+            int b = CUBE_F[f][(j + 1) & 3];
+            line_to(px[a], py[a], px[b], py[b], 15, bg, CH_MED);
+        }
+    }
+}
+
 #define FIRE_MAX (MAX_COLS * MAX_ROWS)
 static uint8_t fire[FIRE_MAX];
 static uint8_t gfx_scratch[FIRE_MAX];
@@ -2185,7 +2396,7 @@ static void scene_life(int t) {
 
 static const char *GFX_NAME[N_GFX] = {
     "Plasma", "Starfield", "3D bounce", "Fire",
-    "Donut", "Tunnel", "Matrix", "Life"
+    "Donut", "Tunnel", "Matrix", "Life", "Cube"
 };
 
 static void draw_gfx_chrome(int scene) {
@@ -2193,7 +2404,7 @@ static void draw_gfx_chrome(int scene) {
     desktop();
     draw_window(win_x, win_y, win_w, win_h, " GFX  ·  Graphics demo ");
     put_str(win_x + 3, win_y + 1, C_TITLE, C_BTN_BG, GFX_NAME[scene], 16);
-    footer(win_y + win_h - 2, "1-8 / Left Right  scene   Space pause   q back");
+    footer(win_y + win_h - 2, "1-9 / Left Right  scene   Space pause   q back");
     gfx_viewport();
 }
 
@@ -2276,11 +2487,13 @@ static int run_gfx_ui(int start_scene, uint32_t auto_ms) {
                 rain_init();
             }
             scene_matrix(t);
-        } else {
+        } else if (scene == 7) {
             if (!life_on) {
                 life_init();
             }
             scene_life(t);
+        } else {
+            scene_cube(t);
         }
         if (g->has_key) {
             (void)g->has_key();
@@ -3440,7 +3653,7 @@ static const menu_item_t MENU[N_MENU] = {
     {'1', "CPU", "Prime numbers", "Sieve, trial division, integer ALU"},
     {'2', "BURN", "One-minute soak", "Keep the CPU busy for 60 seconds"},
     {'3', "RAM", "Memory test", "Heap stress and marching RAM patterns"},
-    {'4', "GFX", "Graphics demo", "Plasma, stars, 3D, fire, donut, tunnel, rain, life"},
+    {'4', "GFX", "Graphics demo", "Plasma, stars, 3D, cube, fire, donut, tunnel, life"},
     {'5', "SND", "Audio demo", "Scale, Ode to Joy, dual-voice synth"},
     {'6', "HW", "Hardware monitor", "Live CPU %, RAM, heap, clock, and load"},
     {'7', "ALL", "Run everything", "CPU, RAM, each graphics scene, then sound"},
@@ -3571,7 +3784,7 @@ void com_main(void) {
     }
 
     if (start == 3) {
-        (void)run_gfx_ui(0, 0);
+        (void)run_gfx_ui(8, 0);
         restore_console();
         return;
     }
@@ -3641,7 +3854,7 @@ dispatch:
             } else if (sel == 2) {
                 (void)run_mem_ui();
             } else if (sel == 3) {
-                (void)run_gfx_ui(0, 0);
+                (void)run_gfx_ui(8, 0);
             } else if (sel == 4) {
                 (void)run_snd_ui(-1);
             } else if (sel == 5) {
