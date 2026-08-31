@@ -332,12 +332,22 @@ static int save_file(fos_api_t *api) {
     if (filename[0] == 0) {
         return -1;
     }
-    if (api->write_file(filename, text, (size_t)text_len) != 0) {
-        if (api->show_error) {
-            api->show_error("Could not save file");
+    {
+        int fd = api->fopen(filename, FOS_O_WRITE | FOS_O_CREATE | FOS_O_TRUNC);
+        uint32_t put = 0;
+        if (fd < 0 ||
+            (text_len > 0 && (api->fwrite(fd, text, (uint32_t)text_len, &put) != 0 ||
+                              put != (uint32_t)text_len)) ||
+            api->fclose(fd) != 0) {
+            if (fd >= 0) {
+                api->fclose(fd);
+            }
+            if (api->show_error) {
+                api->show_error("Could not save file");
+            }
+            draw(api);
+            return -1;
         }
-        draw(api);
-        return -1;
     }
     modified = 0;
     draw(api);
@@ -489,10 +499,17 @@ void com_main(void) {
     modified = filename[0] == 0;
     scroll_line = 0;
 
-    if (filename[0] != 0 &&
-        api->read_file(filename, text, sizeof(text) - 1, &loaded) == 0) {
-        text_len = (int)loaded;
-        modified = 0;
+    if (filename[0] != 0) {
+        int fd = api->fopen(filename, FOS_O_READ);
+        uint32_t n = 0;
+        if (fd >= 0 && api->fread(fd, text, (uint32_t)sizeof(text) - 1, &n) == 0) {
+            loaded = n;
+            text_len = (int)loaded;
+            modified = 0;
+        }
+        if (fd >= 0) {
+            api->fclose(fd);
+        }
     }
     text[text_len] = 0;
 

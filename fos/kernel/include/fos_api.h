@@ -109,6 +109,13 @@ typedef struct {
 #define FOS_HIT_Y     3
 #define FOS_HIT_N     4
 
+#define FOS_O_READ   0x01
+#define FOS_O_WRITE  0x02
+#define FOS_O_RDWR   (FOS_O_READ | FOS_O_WRITE)
+#define FOS_O_CREATE 0x04
+#define FOS_O_TRUNC  0x08
+#define FOS_O_APPEND 0x10
+
 typedef struct {
     uint32_t magic;
     void (*write)(const char *s);
@@ -121,6 +128,7 @@ typedef struct {
     /* Extended API for interactive programs (editor, etc.) */
     int (*has_key)(void);
     fos_key_event_t (*read_key)(void);
+    /* Compatibility shims over fopen/fread/fwrite/fclose. Prefer those. */
     int (*read_file)(const char *path, char *buf, size_t cap, size_t *out_len);
     int (*write_file)(const char *path, const char *buf, size_t len);
     void (*clear_screen)(void);
@@ -152,6 +160,7 @@ typedef struct {
     void (*sound_stop)(void);
     int (*sound_playing)(void);
     int (*stat_file)(const char *path, uint32_t *size, int *is_dir);
+    /* Compatibility shim over fopen/fseek/fread/fclose. Prefer those. */
     int (*read_at)(const char *path, uint32_t offset, void *buf, uint32_t cap, uint32_t *out_len);
     void (*begin_direct)(void);
     void (*end_direct)(void);
@@ -190,6 +199,15 @@ typedef struct {
     int (*mouse_poll)(fos_mouse_t *out);
     void (*hit_clear)(void);
     void (*hit_add)(int x, int y, int w, int h, int action);
+    /* Streaming file I/O. fopen returns a fd (>= 0) or -1. Offsets are
+     * absolute. FDs opened by a .COM are closed when it exits. */
+    int (*fopen)(const char *path, int flags);
+    int (*fread)(int fd, void *buf, uint32_t cap, uint32_t *out_len);
+    int (*fwrite)(int fd, const void *data, uint32_t len, uint32_t *out_len);
+    int (*fseek)(int fd, uint32_t offset);
+    int (*ftell)(int fd, uint32_t *offset);
+    int (*fsize)(int fd, uint32_t *size);
+    int (*fclose)(int fd);
 } fos_api_t;
 
 void fos_api_init(void);
@@ -206,3 +224,4 @@ typedef struct {
 
 void fos_api_save_io(fos_api_io_t *out);
 void fos_api_restore_io(const fos_api_io_t *in);
+void fos_api_close_owner(uint16_t owner);

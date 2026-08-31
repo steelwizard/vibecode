@@ -228,15 +228,22 @@ static uint32_t parse_u32(const char *s) {
 
 static void load_high(void) {
     char buf[32];
-    size_t n = 0;
+    uint32_t n = 0;
+    int fd;
 
     high = 0;
-    if (!api->read_file) {
+    if (!api->fopen) {
         return;
     }
-    if (api->read_file(HI_PATH, buf, sizeof(buf) - 1, &n) != 0) {
+    fd = api->fopen(HI_PATH, FOS_O_READ);
+    if (fd < 0) {
         return;
     }
+    if (api->fread(fd, buf, (uint32_t)sizeof(buf) - 1, &n) != 0) {
+        api->fclose(fd);
+        return;
+    }
+    api->fclose(fd);
     buf[n] = 0;
     high = parse_u32(buf);
 }
@@ -248,7 +255,7 @@ static void save_high(void) {
     int k = 0;
     char tmp[12];
 
-    if (!high_dirty || !api->write_file) {
+    if (!high_dirty || !api->fopen) {
         return;
     }
     if (t == 0) {
@@ -264,8 +271,15 @@ static void save_high(void) {
     }
     buf[n++] = '\r';
     buf[n++] = '\n';
-    if (api->write_file(HI_PATH, buf, (size_t)n) == 0) {
-        high_dirty = 0;
+    {
+        int fd = api->fopen(HI_PATH, FOS_O_WRITE | FOS_O_CREATE | FOS_O_TRUNC);
+        uint32_t put = 0;
+        if (fd >= 0 && api->fwrite(fd, buf, (uint32_t)n, &put) == 0 && put == (uint32_t)n &&
+            api->fclose(fd) == 0) {
+            high_dirty = 0;
+        } else if (fd >= 0) {
+            api->fclose(fd);
+        }
     }
 }
 

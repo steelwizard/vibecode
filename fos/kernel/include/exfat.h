@@ -22,7 +22,19 @@ int exfat_list_dir(exfat_vol_t *vol, uint32_t cluster, exfat_dir_cb cb, void *ct
 int exfat_find_path(exfat_vol_t *vol, uint32_t start_cluster, const char *path,
                     uint32_t *out_cluster, int *is_dir, uint64_t *file_size,
                     int *no_fat_chain);
-int exfat_read_file(exfat_vol_t *vol, uint32_t cluster, uint64_t offset,
-                    void *buf, uint32_t size, uint64_t file_size, int no_fat_chain);
+
+typedef struct {
+    uint32_t start_cluster;
+    uint32_t clus;
+    uint32_t clus_idx;
+    uint64_t size;
+    uint64_t pos;
+    int      no_fat_chain;
+} exfat_file_t;
+
+void exfat_file_init(exfat_file_t *f, uint32_t cluster, uint64_t size, int no_fat_chain);
+int  exfat_file_read(exfat_vol_t *vol, exfat_file_t *f, void *buf, uint32_t cap,
+                     uint32_t *out_len);
+int  exfat_file_seek(exfat_file_t *f, uint64_t offset);
 
 #define EXFAT_ATTR_DIR 0x10

@@ -172,9 +172,18 @@ void com_main(void) {
         return;
     }
 
-    if (api->read_file(arg, (char *)filebuf, sizeof(filebuf), &n) != 0 || n == 0) {
-        beep_error(api, "BEEP: cannot read file");
-        return;
+    {
+        int fd = api->fopen(arg, FOS_O_READ);
+        uint32_t got = 0;
+        if (fd < 0 || api->fread(fd, filebuf, (uint32_t)sizeof(filebuf), &got) != 0 || got == 0) {
+            if (fd >= 0) {
+                api->fclose(fd);
+            }
+            beep_error(api, "BEEP: cannot read file");
+            return;
+        }
+        api->fclose(fd);
+        n = got;
     }
     if (play_wav_or_raw(api, filebuf, n) != 0) {
         beep_error(api, "BEEP: playback failed");

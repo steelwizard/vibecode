@@ -907,7 +907,16 @@ static uint32_t s16le_to_u8_mono(const uint8_t *pcm, uint32_t bytes, int ch, uin
     return o;
 }
 
-static int parse_wav(fos_api_t *api, const char *path, uint32_t file_size,
+
+static int file_read(fos_api_t *api, int fd, uint32_t off, void *buf, uint32_t cap, uint32_t *got) {
+    *got = 0;
+    if (api->fseek(fd, off) != 0) {
+        return -1;
+    }
+    return api->fread(fd, buf, cap, got);
+}
+
+static int parse_wav(fos_api_t *api, int fd, uint32_t file_size,
                      uint32_t *data_off, uint32_t *data_len, uint32_t *rate,
                      uint16_t *ch, uint16_t *bits) {
     uint8_t riff[12];
@@ -920,7 +929,7 @@ static int parse_wav(fos_api_t *api, const char *path, uint32_t file_size,
     if (file_size < 44) {
         return -1;
     }
-    if (api->read_at(path, 0, riff, 12, &got) != 0 || got < 12) {
+    if (file_read(api, fd, 0, riff, 12, &got) != 0 || got < 12) {
         return -1;
     }
     if (!(riff[0] == 'R' && riff[1] == 'I' && riff[2] == 'F' && riff[3] == 'F' &&
@@ -933,7 +942,7 @@ static int parse_wav(fos_api_t *api, const char *path, uint32_t file_size,
         uint32_t cksz;
         uint32_t payload;
         uint32_t next;
-        if (api->read_at(path, pos, chdr, 8, &got) != 0 || got < 8) {
+        if (file_read(api, fd, pos, chdr, 8, &got) != 0 || got < 8) {
             break;
         }
         cksz = rd32(chdr + 4);
@@ -942,7 +951,7 @@ static int parse_wav(fos_api_t *api, const char *path, uint32_t file_size,
         if (chdr[0] == 'f' && chdr[1] == 'm' && chdr[2] == 't') {
             uint8_t fmt[16];
             uint32_t n = 0;
-            if (api->read_at(path, payload, fmt, 16, &n) != 0 || n < 16) {
+            if (file_read(api, fd, payload, fmt, 16, &n) != 0 || n < 16) {
                 return -1;
             }
             if (rd16(fmt) != 1) {
@@ -1012,13 +1021,13 @@ static int wait_done_keys(fos_api_t *api) {
     }
 }
 
-static int play_wav(fos_api_t *api, const char *path, uint32_t file_size) {
+static int play_wav(fos_api_t *api, int fd, uint32_t file_size) {
     uint32_t data_off = 0, data_len = 0, rate = 8000, pos = 0;
     uint16_t ch = 1, bits = 8;
     uint32_t frame;
     int parsed;
 
-    parsed = parse_wav(api, path, file_size, &data_off, &data_len, &rate, &ch, &bits);
+    parsed = parse_wav(api, fd, file_size, &data_off, &data_len, &rate, &ch, &bits);
     if (parsed == -2) {
         ui_set_status(api, "WAV is not PCM", FG_ERR);
         ui_wait_key(api);
@@ -1076,7 +1085,7 @@ static int play_wav(fos_api_t *api, const char *path, uint32_t file_size) {
             if (want == 0) {
                 break;
             }
-            if (api->read_at(path, data_off + pos, filebuf, want, &got) != 0 || got == 0) {
+            if (file_read(api, fd, data_off + pos, filebuf, want, &got) != 0 || got == 0) {
                 break;
             }
             got -= got % frame;
@@ -1140,14 +1149,14 @@ static int play_wav(fos_api_t *api, const char *path, uint32_t file_size) {
     }
 }
 
-static uint32_t skip_id3(fos_api_t *api, const char *path, uint32_t file_size) {
+static uint32_t skip_id3(fos_api_t *api, int fd, uint32_t file_size) {
     uint8_t h[10];
     uint32_t got = 0;
 
     if (file_size < 10) {
         return 0;
     }
-    if (api->read_at(path, 0, h, 10, &got) != 0 || got < 10) {
+    if (file_read(api, fd, 0, h, 10, &got) != 0 || got < 10) {
         return 0;
     }
     if (h[0] == 'I' && h[1] == 'D' && h[2] == '3') {
@@ -1231,23 +1240,19 @@ static int looks_midi(const uint8_t *p, uint32_t n) {
     return n >= 4 && p[0] == 'M' && p[1] == 'T' && p[2] == 'h' && p[3] == 'd';
 }
 
-static int load_all(fos_api_t *api, const char *path, uint8_t **out, uint32_t *out_len) {
-    uint32_t size = 0;
-    int is_dir = 0;
+static int load_fd(fos_api_t *api, int fd, uint32_t size, uint8_t **out, uint32_t *out_len) {
     uint8_t *buf;
     uint32_t off = 0;
 
-    if (!api->stat_file || api->stat_file(path, &size, &is_dir) != 0 || is_dir || size == 0) {
-        return -1;
-    }
-    if (size > 32u * 1024u * 1024u) {
-        return -1;
-    }
-    if (!api->mem_alloc) {
+    if (size == 0 || size > 32u * 1024u * 1024u || !api->mem_alloc) {
         return -1;
     }
     buf = (uint8_t *)api->mem_alloc(size);
     if (!buf) {
+        return -1;
+    }
+    if (api->fseek(fd, 0) != 0) {
+        api->mem_free(buf);
         return -1;
     }
     while (off < size) {
@@ -1257,7 +1262,7 @@ static int load_all(fos_api_t *api, const char *path, uint8_t **out, uint32_t *o
             n = 32768u;
         }
         __asm__ volatile("sti");
-        if (api->read_at(path, off, buf + off, n, &got) != 0 || got == 0) {
+        if (api->fread(fd, buf + off, n, &got) != 0 || got == 0) {
             api->mem_free(buf);
             return -1;
         }
@@ -1266,6 +1271,25 @@ static int load_all(fos_api_t *api, const char *path, uint8_t **out, uint32_t *o
     *out = buf;
     *out_len = size;
     return 0;
+}
+
+static int load_all(fos_api_t *api, const char *path, uint8_t **out, uint32_t *out_len) {
+    uint32_t size = 0;
+    int is_dir = 0;
+    int fd;
+    int rc;
+
+    if (!api->stat_file || !api->fopen ||
+        api->stat_file(path, &size, &is_dir) != 0 || is_dir || size == 0) {
+        return -1;
+    }
+    fd = api->fopen(path, FOS_O_READ);
+    if (fd < 0) {
+        return -1;
+    }
+    rc = load_fd(api, fd, size, out, out_len);
+    api->fclose(fd);
+    return rc;
 }
 
 static const char *find_sf2(fos_api_t *api) {
@@ -1287,7 +1311,7 @@ static const char *find_sf2(fos_api_t *api) {
     return 0;
 }
 
-static int play_midi(fos_api_t *api, const char *path, uint32_t file_size) {
+static int play_midi(fos_api_t *api, int fd, uint32_t file_size) {
     uint8_t *mid = 0;
     uint8_t *sf2 = 0;
     uint32_t mid_len = 0;
@@ -1304,7 +1328,7 @@ static int play_midi(fos_api_t *api, const char *path, uint32_t file_size) {
     ui.rate = rate;
     draw_meta(api);
 
-    if (load_all(api, path, &mid, &mid_len) != 0) {
+    if (load_fd(api, fd, file_size, &mid, &mid_len) != 0) {
         ui_set_status(api, "Cannot read MIDI", FG_ERR);
         ui_wait_key(api);
         return -1;
@@ -1379,7 +1403,7 @@ static int play_midi(fos_api_t *api, const char *path, uint32_t file_size) {
             return 0;
         }
         if (cmd == PLAY_SEEK) {
-            return play_midi(api, path, file_size);
+            return play_midi(api, fd, file_size);
         }
     }
     ui_progress(api, ui.total, ui.total, ui.total_ms, ui.total_ms);
@@ -1387,13 +1411,13 @@ static int play_midi(fos_api_t *api, const char *path, uint32_t file_size) {
     {
         int cmd = wait_done_keys(api);
         if (cmd == PLAY_SEEK) {
-            return play_midi(api, path, file_size);
+            return play_midi(api, fd, file_size);
         }
     }
     return 0;
 }
 
-static int play_mp3(fos_api_t *api, const char *path, uint32_t file_size) {
+static int play_mp3(fos_api_t *api, int fd, uint32_t file_size) {
     uint32_t file_off;
     uint32_t id3;
     uint32_t payload;
@@ -1405,7 +1429,7 @@ static int play_mp3(fos_api_t *api, const char *path, uint32_t file_size) {
     uint32_t rate = 44100;
     uint64_t played = 0;
 
-    id3 = skip_id3(api, path, file_size);
+    id3 = skip_id3(api, fd, file_size);
     file_off = id3;
     payload = file_size > id3 ? file_size - id3 : 1;
     fos_mp3_init();
@@ -1461,7 +1485,7 @@ static int play_mp3(fos_api_t *api, const char *path, uint32_t file_size) {
                 in_off = 0;
                 want = file_cap - fill;
                 if (want > 0) {
-                    if (api->read_at(path, file_off, filebuf + fill, want, &got) != 0) {
+                    if (file_read(api, fd, file_off, filebuf + fill, want, &got) != 0) {
                         ui_set_status(api, "Read failed", FG_ERR);
                         ui_wait_key(api);
                         return -1;
@@ -1577,6 +1601,7 @@ void com_main(void) {
     int is_dir = 0;
     uint8_t sniff[16];
     uint32_t got = 0;
+    int fd = -1;
 
     if (!api || api->magic != FOS_API_MAGIC) {
         return;
@@ -1590,7 +1615,7 @@ void com_main(void) {
     ui_begin(api, path);
     setup_bufs(api);
 
-    if (!api->sound_present || !api->sound_play || !api->read_at || !api->stat_file) {
+    if (!api->sound_present || !api->sound_play || !api->fopen || !api->stat_file) {
         if (api->show_error) {
             api->show_error("API missing - rebuild the kernel");
         } else {
@@ -1625,7 +1650,8 @@ void com_main(void) {
         goto done;
     }
 
-    if (api->read_at(path, 0, sniff, sizeof(sniff), &got) != 0 || got < 4) {
+    fd = api->fopen(path, FOS_O_READ);
+    if (fd < 0 || file_read(api, fd, 0, sniff, sizeof(sniff), &got) != 0 || got < 4) {
         if (api->show_error) {
             api->show_error("Cannot read file");
         } else {
@@ -1636,15 +1662,15 @@ void com_main(void) {
     }
 
     if (got >= 12 && sniff[0] == 'R' && sniff[1] == 'I' && sniff[2] == 'F' && sniff[3] == 'F') {
-        play_wav(api, path, size);
+        play_wav(api, fd, size);
         goto done;
     }
     if (looks_midi(sniff, got)) {
-        play_midi(api, path, size);
+        play_midi(api, fd, size);
         goto done;
     }
     if (looks_mp3(sniff, got)) {
-        play_mp3(api, path, size);
+        play_mp3(api, fd, size);
         goto done;
     }
 
@@ -1656,6 +1682,9 @@ void com_main(void) {
     }
 
 done:
+    if (fd >= 0) {
+        api->fclose(fd);
+    }
     if (api->end_direct) {
         api->end_direct();
     }

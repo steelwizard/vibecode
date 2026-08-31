@@ -24,10 +24,31 @@ typedef int (*fat32_dir_cb)(const char *name, uint8_t attr, uint32_t size, void 
 int fat32_list_dir(fat32_vol_t *vol, uint32_t cluster, fat32_dir_cb cb, void *ctx);
 int fat32_find_path(fat32_vol_t *vol, uint32_t start_cluster, const char *path,
                     uint32_t *out_cluster, int *is_dir);
-int fat32_read_file(fat32_vol_t *vol, uint32_t cluster, uint32_t offset,
-                    void *buf, uint32_t size, uint32_t file_size);
-int fat32_write_file(fat32_vol_t *vol, uint32_t dir_cluster, const char *name,
-                     const void *data, uint32_t size);
+
+/* Open flags are VFS_O_* (read/write/create/trunc/append). */
+typedef struct {
+    uint32_t dir_cluster;
+    uint32_t start_cluster;
+    uint32_t size;
+    uint32_t pos;
+    uint32_t clus;
+    uint32_t clus_idx;
+    uint32_t dir_lba;
+    int      dir_off;
+    int      writable;
+    int      append;
+    int      dirty;
+} fat32_file_t;
+
+int fat32_file_open(fat32_vol_t *vol, uint32_t dir_cluster, const char *name,
+                    int flags, fat32_file_t *out);
+int fat32_file_read(fat32_vol_t *vol, fat32_file_t *f, void *buf, uint32_t cap,
+                    uint32_t *out_len);
+int fat32_file_write(fat32_vol_t *vol, fat32_file_t *f, const void *data, uint32_t len,
+                     uint32_t *out_len);
+int fat32_file_seek(fat32_file_t *f, uint32_t offset);
+int fat32_file_close(fat32_vol_t *vol, fat32_file_t *f);
+
 int fat32_mkdir(fat32_vol_t *vol, uint32_t parent_cluster, const char *name);
 int fat32_delete(fat32_vol_t *vol, uint32_t dir_cluster, const char *name);
 int fat32_lookup(fat32_vol_t *vol, uint32_t dir_cluster, const char *name,

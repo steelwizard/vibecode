@@ -518,8 +518,17 @@ static void view_file(fos_api_t *api, const char *path, const char *title) {
     int scroll = 0;
     const int view_rows = list_rows > 1 ? list_rows : 1;
 
-    if (api->read_file(path, buf, sizeof(buf) - 1, &len) != 0) {
-        return;
+    {
+        int fd = api->fopen(path, FOS_O_READ);
+        uint32_t n = 0;
+        if (fd < 0 || api->fread(fd, buf, (uint32_t)sizeof(buf) - 1, &n) != 0) {
+            if (fd >= 0) {
+                api->fclose(fd);
+            }
+            return;
+        }
+        api->fclose(fd);
+        len = n;
     }
     buf[len] = 0;
 
@@ -1391,9 +1400,13 @@ static void new_file(fos_api_t *api) {
         return;
     }
     join_path(path, sizeof(path), cwd, name);
-    if (api->write_file(path, "", 0) != 0) {
-        draw(api);
-        return;
+    {
+        int fd = api->fopen(path, FOS_O_WRITE | FOS_O_CREATE | FOS_O_TRUNC);
+        if (fd < 0) {
+            draw(api);
+            return;
+        }
+        api->fclose(fd);
     }
     reload_entries(api);
     draw(api);

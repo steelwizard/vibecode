@@ -760,7 +760,6 @@ static void cmd_move(const char *args) {
 static void cmd_type(const char *args) {
     fos_api_t *api = (fos_api_t *)FOS_API_ADDR;
     char chunk[512];
-    uint32_t off = 0;
     char last = 0;
     int any = 0;
 
@@ -778,30 +777,42 @@ static void cmd_type(const char *args) {
         return;
     }
 
-    for (;;) {
-        uint32_t got = 0;
-        if (keyboard_check_ctrl_c()) {
-            console_write_line("^C");
+    {
+        vfs_file_t f;
+        uint32_t got;
+
+        if (vfs_open(vfs_get_drive(), args, VFS_O_READ, &f) != 0) {
             set_status(1);
+            console_error("TYPE/CAT failed");
             return;
         }
-        if (vfs_read_at(vfs_get_drive(), args, off, chunk, sizeof(chunk), &got) != 0) {
-            if (!any) {
+        for (;;) {
+            got = 0;
+            if (keyboard_check_ctrl_c()) {
+                console_write_line("^C");
                 set_status(1);
-                console_error("TYPE/CAT failed");
+                vfs_close(&f);
+                return;
             }
-            return;
+            if (vfs_read(&f, chunk, (uint32_t)sizeof(chunk), &got) != 0) {
+                if (!any) {
+                    set_status(1);
+                    console_error("TYPE/CAT failed");
+                }
+                vfs_close(&f);
+                return;
+            }
+            if (got == 0) {
+                break;
+            }
+            console_write_n(chunk, got);
+            last = chunk[got - 1];
+            any = 1;
+            if (got < sizeof(chunk)) {
+                break;
+            }
         }
-        if (got == 0) {
-            break;
-        }
-        console_write_n(chunk, got);
-        last = chunk[got - 1];
-        any = 1;
-        off += got;
-        if (got < sizeof(chunk)) {
-            break;
-        }
+        vfs_close(&f);
     }
     if (any && last != '\n') {
         console_putchar('\n');
@@ -981,12 +992,21 @@ static int run_bat_file(const char *path, const char *args) {
             set_status(1);
             return 1;
         }
-        if (vfs_read_file(vfs_get_drive(), path, text, (size_t)size + 1, &nread) != 0) {
-            heap_free(text);
-            heap_free(saved_lines);
-            console_error("Cannot read .BAT");
-            set_status(1);
-            return 1;
+        {
+            vfs_file_t f;
+            uint32_t got = 0;
+
+            if (vfs_open(vfs_get_drive(), path, VFS_O_READ, &f) != 0 ||
+                vfs_read(&f, text, size, &got) != 0) {
+                vfs_close(&f);
+                heap_free(text);
+                heap_free(saved_lines);
+                console_error("Cannot read .BAT");
+                set_status(1);
+                return 1;
+            }
+            vfs_close(&f);
+            nread = got;
         }
         text[nread] = 0;
     }
@@ -1458,7 +1478,15 @@ static void run_pipeline(char *line) {
             size_t out_len = console_end_capture();
 
             if (has_redirect) {
-                if (vfs_write_file(vfs_get_drive(), stages[i].redirect, cap_buf, out_len) != 0) {
+                vfs_file_t rf;
+                uint32_t put = 0;
+                int wflags = VFS_O_WRITE | VFS_O_CREATE | VFS_O_TRUNC;
+
+                if (vfs_open(vfs_get_drive(), stages[i].redirect, wflags, &rf) != 0 ||
+                    (out_len > 0 && (vfs_write(&rf, cap_buf, (uint32_t)out_len, &put) != 0 ||
+                                     put != (uint32_t)out_len)) ||
+                    vfs_close(&rf) != 0) {
+                    vfs_close(&rf);
                     set_status(1);
                     console_error("Redirect failed");
                 }

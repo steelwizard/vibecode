@@ -76,21 +76,21 @@ static int save_outer(void) {
     return 0;
 }
 
-static int load_payload(int drive, const char *path, const foscom_hdr_t *hdr,
-                        uint64_t mem_span) {
+static int load_payload(vfs_file_t *f, const foscom_hdr_t *hdr, uint64_t mem_span) {
     uint64_t left = hdr->payload_size;
-    uint32_t off = (uint32_t)sizeof(foscom_hdr_t);
     uint8_t *dest = (uint8_t *)(uintptr_t)hdr->load_addr;
 
+    if (vfs_seek(f, (uint32_t)sizeof(foscom_hdr_t)) != 0) {
+        return -1;
+    }
     while (left) {
         uint32_t chunk = left > 0x10000ull ? 0x10000u : (uint32_t)left;
         uint32_t got = 0;
 
-        if (vfs_read_at(drive, path, off, dest, chunk, &got) != 0 || got == 0) {
+        if (vfs_read(f, dest, chunk, &got) != 0 || got == 0) {
             return -1;
         }
         dest += got;
-        off += got;
         left -= got;
     }
     if (mem_span > hdr->payload_size) {
@@ -100,7 +100,7 @@ static int load_payload(int drive, const char *path, const foscom_hdr_t *hdr,
     return 0;
 }
 
-static int load_and_run(int drive, const char *path, const foscom_hdr_t *hdr) {
+static int load_and_run(vfs_file_t *f, const foscom_hdr_t *hdr) {
     uint64_t mem_span;
     uint64_t stack;
     uint16_t owner;
@@ -119,7 +119,7 @@ static int load_and_run(int drive, const char *path, const foscom_hdr_t *hdr) {
     if (hdr->payload_size == 0 || hdr->mem_size < hdr->payload_size) {
         return -1;
     }
-    /* vfs_read_at offsets are 32-bit. */
+    /* File size is 32-bit in the VFS layer. */
     if (hdr->payload_size > 0xFFFFFFFFu - sizeof(foscom_hdr_t)) {
         return -1;
     }
@@ -149,7 +149,7 @@ static int load_and_run(int drive, const char *path, const foscom_hdr_t *hdr) {
         return -1;
     }
 
-    if (load_payload(drive, path, hdr, mem_span) != 0) {
+    if (load_payload(f, hdr, mem_span) != 0) {
         restore_outer();
         heap_set_owner(caller_owner);
         return -1;
@@ -177,6 +177,7 @@ static int load_and_run(int drive, const char *path, const foscom_hdr_t *hdr) {
     com_level--;
 
     heap_set_owner(0);
+    fos_api_close_owner(owner);
     heap_free_owner(owner);
     restore_outer();
     /* Drop COM-registered PIC handlers. Nested run_com (FM→PLAY) overwrites
@@ -194,6 +195,7 @@ int exec_run(int drive, const char *path, const char *cmdline) {
     uint32_t got = 0;
     foscom_hdr_t hdr;
     static fos_api_io_t nest_io[COM_STACK_LEVELS];
+    vfs_file_t file;
     int slot;
     int rc;
     int file_drive;
@@ -204,22 +206,28 @@ int exec_run(int drive, const char *path, const char *cmdline) {
     }
     drive = file_drive;
 
-    if (vfs_read_at(drive, path, 0, raw, (uint32_t)sizeof(raw), &got) != 0 ||
-        got < sizeof(hdr)) {
+    if (vfs_open(drive, path, VFS_O_READ, &file) != 0) {
+        return -1;
+    }
+    if (vfs_read(&file, raw, (uint32_t)sizeof(raw), &got) != 0 || got < sizeof(hdr)) {
+        vfs_close(&file);
         return -1;
     }
     memcpy(&hdr, raw, sizeof(hdr));
     if (hdr.magic != FOSCOM_MAGIC || hdr.version != FOSCOM_VERSION) {
+        vfs_close(&file);
         return -1;
     }
 
     slot = com_level;
     if (slot < 0 || slot >= COM_STACK_LEVELS) {
+        vfs_close(&file);
         return -1;
     }
     fos_api_save_io(&nest_io[slot]);
     fos_api_set_cmdline(cmdline ? cmdline : "");
-    rc = load_and_run(drive, path, &hdr);
+    rc = load_and_run(&file, &hdr);
+    vfs_close(&file);
     fos_api_restore_io(&nest_io[slot]);
     return rc;
 }

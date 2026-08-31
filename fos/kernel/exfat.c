@@ -277,67 +277,121 @@ int exfat_find_path(exfat_vol_t *vol, uint32_t start_cluster, const char *path,
     }
 }
 
-int exfat_read_file(exfat_vol_t *vol, uint32_t cluster, uint64_t offset,
-                    void *buf, uint32_t size, uint64_t file_size, int no_fat_chain) {
-    if (offset >= file_size) {
+void exfat_file_init(exfat_file_t *f, uint32_t cluster, uint64_t size, int no_fat_chain) {
+    memset(f, 0, sizeof(*f));
+    f->start_cluster = cluster;
+    f->clus = cluster;
+    f->clus_idx = cluster >= 2 ? 0 : 0xFFFFFFFFu;
+    f->size = size;
+    f->pos = 0;
+    f->no_fat_chain = no_fat_chain;
+}
+
+int exfat_file_seek(exfat_file_t *f, uint64_t offset) {
+    if (!f) {
+        return -1;
+    }
+    f->pos = offset;
+    return 0;
+}
+
+static int exfat_cluster_at(exfat_vol_t *vol, exfat_file_t *f, uint32_t idx) {
+    uint32_t cl;
+    uint32_t i;
+
+    if (f->start_cluster < 2) {
+        return -1;
+    }
+    if (f->no_fat_chain) {
+        f->clus = f->start_cluster + idx;
+        f->clus_idx = idx;
         return 0;
     }
-    if (offset + size > file_size) {
-        size = (uint32_t)(file_size - offset);
+    if (f->clus >= 2 && f->clus_idx == idx) {
+        return 0;
     }
-
-    uint32_t cluster_size = vol->sectors_per_cluster * vol->bytes_per_sector;
-    uint64_t skip_clusters = offset / cluster_size;
-    uint32_t skip_bytes = (uint32_t)(offset % cluster_size);
-
-    while (skip_clusters > 0) {
-        cluster = exfat_next_cluster(vol, cluster, no_fat_chain);
-        if (cluster >= 0xFFFFFFF8) {
+    if (f->clus >= 2 && idx > f->clus_idx) {
+        cl = f->clus;
+        i = f->clus_idx;
+    } else {
+        cl = f->start_cluster;
+        i = 0;
+    }
+    while (i < idx) {
+        cl = exfat_next_cluster(vol, cl, 0);
+        if (cl < 2 || cl >= 0xFFFFFFF8) {
             return -1;
         }
-        skip_clusters--;
+        i++;
     }
+    f->clus = cl;
+    f->clus_idx = idx;
+    return 0;
+}
 
+static int exfat_read_in_cluster(exfat_vol_t *vol, uint32_t cluster, uint32_t offset,
+                                 uint8_t *data, uint32_t len) {
+    uint32_t bps = vol->bytes_per_sector;
+    uint32_t lba = cluster_lba(vol, cluster);
+    uint32_t pos = 0;
+
+    while (pos < len) {
+        uint32_t abs = offset + pos;
+        uint32_t s = abs / bps;
+        uint32_t b = abs % bps;
+        uint32_t n = bps - b;
+
+        if (n > len - pos) {
+            n = len - pos;
+        }
+        if (read_sector_vol(vol, lba + s) != 0) {
+            return -1;
+        }
+        memcpy(data + pos, sector_buf + b, n);
+        pos += n;
+    }
+    return 0;
+}
+
+int exfat_file_read(exfat_vol_t *vol, exfat_file_t *f, void *buf, uint32_t cap,
+                    uint32_t *out_len) {
     uint8_t *out = (uint8_t *)buf;
-    uint32_t remaining = size;
+    uint32_t done = 0;
+    uint32_t csize;
 
-    if (skip_bytes > 0) {
-        uint32_t lba = cluster_lba(vol, cluster);
-        if (read_sector_vol(vol, lba + skip_bytes / vol->bytes_per_sector) != 0) {
+    if (out_len) {
+        *out_len = 0;
+    }
+    if (!vol || !f || !buf) {
+        return -1;
+    }
+    if (f->pos >= f->size || cap == 0) {
+        return 0;
+    }
+    if ((uint64_t)cap > f->size - f->pos) {
+        cap = (uint32_t)(f->size - f->pos);
+    }
+    csize = vol->sectors_per_cluster * vol->bytes_per_sector;
+    while (done < cap) {
+        uint32_t idx = (uint32_t)(f->pos / csize);
+        uint32_t off = (uint32_t)(f->pos % csize);
+        uint32_t n = cap - done;
+        uint32_t room = csize - off;
+
+        if (n > room) {
+            n = room;
+        }
+        if (exfat_cluster_at(vol, f, idx) != 0) {
             return -1;
         }
-        uint32_t byte_in_sector = skip_bytes % vol->bytes_per_sector;
-        uint32_t avail = vol->bytes_per_sector - byte_in_sector;
-        if (avail > remaining) {
-            avail = remaining;
+        if (exfat_read_in_cluster(vol, f->clus, off, out + done, n) != 0) {
+            return -1;
         }
-        memcpy(out, sector_buf + byte_in_sector, avail);
-        out += avail;
-        remaining -= avail;
-        skip_bytes += avail;
-        if (skip_bytes >= cluster_size) {
-            cluster = exfat_next_cluster(vol, cluster, no_fat_chain);
-        }
+        f->pos += n;
+        done += n;
     }
-
-    while (remaining > 0) {
-        uint32_t lba = cluster_lba(vol, cluster);
-        for (uint32_t s = 0; s < vol->sectors_per_cluster && remaining > 0; s++) {
-            if (read_sector_vol(vol, lba + s) != 0) {
-                return -1;
-            }
-            uint32_t n = remaining > vol->bytes_per_sector ? vol->bytes_per_sector : remaining;
-            memcpy(out, sector_buf, n);
-            out += n;
-            remaining -= n;
-        }
-        if (remaining > 0) {
-            cluster = exfat_next_cluster(vol, cluster, no_fat_chain);
-            if (cluster >= 0xFFFFFFF8) {
-                break;
-            }
-        }
+    if (out_len) {
+        *out_len = done;
     }
-
-    return (int)size;
+    return 0;
 }

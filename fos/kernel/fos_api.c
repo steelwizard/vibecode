@@ -32,6 +32,10 @@ _Static_assert(fos_offsetof(fos_api_t, cmdline) == 40, "fos_api ABI");
 _Static_assert(fos_offsetof(fos_api_t, pipe_in) == 296, "fos_api ABI");
 _Static_assert(sizeof(((fos_api_t *)0)->pipe_in) == 4096, "fos_api ABI");
 _Static_assert(fos_offsetof(fos_api_t, get_mem_info) == 4544, "fos_api ABI");
+_Static_assert(FOS_O_READ == VFS_O_READ && FOS_O_WRITE == VFS_O_WRITE &&
+                   FOS_O_CREATE == VFS_O_CREATE && FOS_O_TRUNC == VFS_O_TRUNC &&
+                   FOS_O_APPEND == VFS_O_APPEND,
+               "fopen flags");
 
 static fos_key_event_t api_read_key(void) {
     key_event_t ev = keyboard_read_event();
@@ -85,10 +89,27 @@ static fos_key_event_t api_read_key(void) {
 }
 
 static int api_read_file(const char *path, char *buf, size_t cap, size_t *out_len) {
-    if (!path || !buf || !out_len) {
+    vfs_file_t f;
+    uint32_t got = 0;
+    uint32_t n;
+
+    if (!path || !buf || cap == 0) {
         return -1;
     }
-    return vfs_read_file(vfs_get_drive(), path, buf, cap, out_len);
+    if (vfs_open(vfs_get_drive(), path, VFS_O_READ, &f) != 0) {
+        return -1;
+    }
+    n = cap > 0xFFFFFFFFu ? 0xFFFFFFFEu : (uint32_t)cap - 1;
+    if (vfs_read(&f, buf, n, &got) != 0) {
+        vfs_close(&f);
+        return -1;
+    }
+    buf[got] = 0;
+    if (out_len) {
+        *out_len = got;
+    }
+    vfs_close(&f);
+    return 0;
 }
 
 static int api_stat_file(const char *path, uint32_t *size, int *is_dir) {
@@ -99,17 +120,136 @@ static int api_stat_file(const char *path, uint32_t *size, int *is_dir) {
 }
 
 static int api_read_at(const char *path, uint32_t offset, void *buf, uint32_t cap, uint32_t *out_len) {
+    vfs_file_t f;
+    uint32_t got = 0;
+
     if (!path || !buf || !out_len) {
         return -1;
     }
-    return vfs_read_at(vfs_get_drive(), path, offset, buf, cap, out_len);
+    *out_len = 0;
+    if (vfs_open(vfs_get_drive(), path, VFS_O_READ, &f) != 0) {
+        return -1;
+    }
+    if (vfs_seek(&f, offset) != 0 || vfs_read(&f, buf, cap, &got) != 0) {
+        vfs_close(&f);
+        return -1;
+    }
+    *out_len = got;
+    vfs_close(&f);
+    return 0;
 }
 
 static int api_write_file(const char *path, const char *buf, size_t len) {
-    if (!path || !buf) {
+    vfs_file_t f;
+    uint32_t got = 0;
+    uint32_t n;
+
+    if (!path || (len > 0 && !buf)) {
         return -1;
     }
-    return vfs_write_file(vfs_get_drive(), path, buf, len);
+    if (vfs_open(vfs_get_drive(), path, VFS_O_WRITE | VFS_O_CREATE | VFS_O_TRUNC, &f) != 0) {
+        return -1;
+    }
+    n = len > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)len;
+    if (n > 0 && (vfs_write(&f, buf, n, &got) != 0 || got != n)) {
+        vfs_close(&f);
+        return -1;
+    }
+    return vfs_close(&f);
+}
+
+#define FOS_FD_MAX 16
+
+static vfs_file_t api_files[FOS_FD_MAX];
+static uint16_t api_fd_owner[FOS_FD_MAX];
+
+static vfs_file_t *api_fd(int fd) {
+    if (fd < 0 || fd >= FOS_FD_MAX || !api_files[fd].used) {
+        return 0;
+    }
+    return &api_files[fd];
+}
+
+static int api_fopen(const char *path, int flags) {
+    int fd;
+
+    if (!path || !path[0]) {
+        return -1;
+    }
+    for (fd = 0; fd < FOS_FD_MAX; fd++) {
+        if (!api_files[fd].used) {
+            break;
+        }
+    }
+    if (fd >= FOS_FD_MAX) {
+        return -1;
+    }
+    if (vfs_open(vfs_get_drive(), path, flags, &api_files[fd]) != 0) {
+        return -1;
+    }
+    api_fd_owner[fd] = heap_get_owner();
+    return fd;
+}
+
+static int api_fread(int fd, void *buf, uint32_t cap, uint32_t *out_len) {
+    vfs_file_t *f = api_fd(fd);
+    if (!f) {
+        return -1;
+    }
+    return vfs_read(f, buf, cap, out_len);
+}
+
+static int api_fwrite(int fd, const void *data, uint32_t len, uint32_t *out_len) {
+    vfs_file_t *f = api_fd(fd);
+    if (!f) {
+        return -1;
+    }
+    return vfs_write(f, data, len, out_len);
+}
+
+static int api_fseek(int fd, uint32_t offset) {
+    vfs_file_t *f = api_fd(fd);
+    if (!f) {
+        return -1;
+    }
+    return vfs_seek(f, offset);
+}
+
+static int api_ftell(int fd, uint32_t *offset) {
+    vfs_file_t *f = api_fd(fd);
+    if (!f || !offset) {
+        return -1;
+    }
+    *offset = vfs_tell(f);
+    return 0;
+}
+
+static int api_fsize(int fd, uint32_t *size) {
+    vfs_file_t *f = api_fd(fd);
+    if (!f || !size) {
+        return -1;
+    }
+    *size = vfs_file_size(f);
+    return 0;
+}
+
+static int api_fclose(int fd) {
+    vfs_file_t *f = api_fd(fd);
+    if (!f) {
+        return -1;
+    }
+    api_fd_owner[fd] = 0;
+    return vfs_close(f);
+}
+
+void fos_api_close_owner(uint16_t owner) {
+    int fd;
+    for (fd = 0; fd < FOS_FD_MAX; fd++) {
+        if (api_files[fd].used && api_fd_owner[fd] == owner) {
+            vfs_close(&api_files[fd]);
+            api_fd_owner[fd] = 0;
+        }
+    }
 }
 
 static int api_read_dir(const char *path, fos_dir_t *out) {
@@ -271,6 +411,13 @@ void fos_api_init(void) {
     api->mouse_poll = api_mouse_poll;
     api->hit_clear = console_hit_clear;
     api->hit_add = console_hit_add;
+    api->fopen = api_fopen;
+    api->fread = api_fread;
+    api->fwrite = api_fwrite;
+    api->fseek = api_fseek;
+    api->ftell = api_ftell;
+    api->fsize = api_fsize;
+    api->fclose = api_fclose;
     api->cmdline[0] = 0;
     api->pipe_in_len = 0;
 }

@@ -16,7 +16,7 @@
 %define KERNEL_RUNTIME     0x100000
 %define KERNEL_LBA         9
 ; Must fit the full kernel.bin — if the kernel grows, increase this and rebuild boot.bin.
-%define KERNEL_MAX_SECTORS 256
+%define KERNEL_MAX_SECTORS 288
 ; BIOS int 13h reads: stay well under 127 sectors and 64K DMA windows.
 %define KERNEL_CHUNK_SECTORS 32
 

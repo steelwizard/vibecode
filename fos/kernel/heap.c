@@ -237,6 +237,10 @@ uint16_t heap_set_owner(uint16_t owner) {
     return prev;
 }
 
+uint16_t heap_get_owner(void) {
+    return current_owner;
+}
+
 void heap_free_owner(uint16_t owner) {
     /* Freeing coalesces and can release runs, so restart the walk each time
      * rather than holding a pointer across the mutation. */

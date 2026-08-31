@@ -17,6 +17,7 @@ void *heap_realloc(void *ptr, size_t bytes);
 
 /* Blocks allocated from now on belong to `owner`; returns the previous owner. */
 uint16_t heap_set_owner(uint16_t owner);
+uint16_t heap_get_owner(void);
 void     heap_free_owner(uint16_t owner);
 
 void heap_stats(uint64_t *reserved_bytes, uint64_t *used_bytes, uint64_t *blocks);

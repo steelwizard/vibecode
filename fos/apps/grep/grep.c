@@ -217,11 +217,11 @@ static void grep_buf(grep_t *g, const char *buf, uint32_t n) {
 
 static int grep_file(grep_t *g, const char *path) {
     char chunk[512];
-    uint32_t off = 0;
+    int fd;
     uint32_t size = 0;
     int is_dir = 0;
 
-    if (!g->api->stat_file || !g->api->read_at) {
+    if (!g->api->stat_file || !g->api->fopen) {
         g->api->write_line("grep: file API missing");
         return -1;
     }
@@ -238,10 +238,18 @@ static int grep_file(grep_t *g, const char *path) {
         return -1;
     }
 
+    fd = g->api->fopen(path, FOS_O_READ);
+    if (fd < 0) {
+        g->api->write("grep: ");
+        g->api->write(path);
+        g->api->write_line(": not found");
+        return -1;
+    }
     grep_reset(g);
     for (;;) {
         uint32_t got = 0;
-        if (g->api->read_at(path, off, chunk, sizeof(chunk), &got) != 0) {
+        if (g->api->fread(fd, chunk, sizeof(chunk), &got) != 0) {
+            g->api->fclose(fd);
             g->api->write("grep: ");
             g->api->write(path);
             g->api->write_line(": read failed");
@@ -251,11 +259,11 @@ static int grep_file(grep_t *g, const char *path) {
             break;
         }
         feed(g, chunk, got);
-        off += got;
         if (got < sizeof(chunk)) {
             break;
         }
     }
+    g->api->fclose(fd);
     grep_finish(g);
     return 0;
 }

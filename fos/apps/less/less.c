@@ -646,8 +646,17 @@ static int load_content(fos_api_t *api) {
         return -1;
     }
 
-    if (api->read_file(path, text, sizeof(text) - 1, &loaded) != 0) {
-        return -1;
+    {
+        int fd = api->fopen(path, FOS_O_READ);
+        uint32_t n = 0;
+        if (fd < 0 || api->fread(fd, text, (uint32_t)sizeof(text) - 1, &n) != 0) {
+            if (fd >= 0) {
+                api->fclose(fd);
+            }
+            return -1;
+        }
+        api->fclose(fd);
+        loaded = n;
     }
     text_len = (int)loaded;
     text[text_len] = 0;

@@ -403,8 +403,16 @@ static int save_to(fos_api_t *api, const char *path) {
             *p++ = canvas[y][x] & 0x0F;
         }
     }
-    if (api->write_file(path, (const char *)filebuf, n) != 0) {
-        return -1;
+    {
+        int fd = api->fopen(path, FOS_O_WRITE | FOS_O_CREATE | FOS_O_TRUNC);
+        uint32_t put = 0;
+        if (fd < 0 || api->fwrite(fd, filebuf, (uint32_t)n, &put) != 0 || put != (uint32_t)n ||
+            api->fclose(fd) != 0) {
+            if (fd >= 0) {
+                api->fclose(fd);
+            }
+            return -1;
+        }
     }
     dirty = 0;
     return 0;
@@ -418,8 +426,18 @@ static int load_from(fos_api_t *api, const char *path) {
     int x;
     const uint8_t *p;
 
-    if (api->read_file(path, (char *)filebuf, sizeof(filebuf), &got) != 0 || got < HDR_SIZE) {
-        return -1;
+    {
+        int fd = api->fopen(path, FOS_O_READ);
+        uint32_t n = 0;
+        if (fd < 0 || api->fread(fd, filebuf, (uint32_t)sizeof(filebuf), &n) != 0 ||
+            n < HDR_SIZE) {
+            if (fd >= 0) {
+                api->fclose(fd);
+            }
+            return -1;
+        }
+        api->fclose(fd);
+        got = n;
     }
     if (filebuf[0] != 'F' || filebuf[1] != 'O' || filebuf[2] != 'S' || filebuf[3] != 'P') {
         return -1;

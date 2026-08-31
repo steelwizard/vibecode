@@ -87,16 +87,24 @@ static int parse_key_value(const char *line, char *key, size_t key_sz, char *val
 }
 
 void config_init(int drive) {
-    size_t len = 0;
-
     config_loaded = 0;
     config_buf[0] = 0;
 
     /* Missing SYSTEM.INI is fine — callers fall back to defaults. */
-    if (vfs_read_file(drive, "\\SYSTEM.INI", config_buf, sizeof(config_buf) - 1, &len) != 0) {
-        return;
+    {
+        vfs_file_t f;
+        uint32_t got = 0;
+
+        if (vfs_open(drive, "\\SYSTEM.INI", VFS_O_READ, &f) != 0) {
+            return;
+        }
+        if (vfs_read(&f, config_buf, (uint32_t)sizeof(config_buf) - 1, &got) != 0) {
+            vfs_close(&f);
+            return;
+        }
+        config_buf[got] = 0;
+        vfs_close(&f);
     }
-    config_buf[len] = 0;
     config_loaded = 1;
 }
 

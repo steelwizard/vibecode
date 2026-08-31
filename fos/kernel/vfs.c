@@ -42,6 +42,9 @@ static int num_drives;
 static int current_drive;  /* active drive for relative paths */
 static char cwd[VFS_MAX_DRIVES][VFS_PATH_MAX];  /* per-drive working directory */
 
+static int vfs_split_parent_file(const char *resolved, char *parent, char *file);
+static int vfs_fat32_dir_cluster(drive_vol_t *dv, const char *parent, uint32_t *out_cluster);
+
 static int try_mount_partition(int block_index, uint32_t lba, uint32_t sectors,
                                drive_vol_t *dv) {
     fat32_vol_t f;
@@ -361,23 +364,162 @@ int vfs_list_dir(int drive, const char *path) {
     return -1;
 }
 
-int vfs_read_file(int drive, const char *path, char *buf, size_t buf_sz, size_t *out_len) {
-    uint32_t cap;
-    uint32_t got = 0;
+int vfs_open(int drive, const char *path, int flags, vfs_file_t *out) {
+    char resolved[VFS_PATH_MAX];
+    char parent[VFS_PATH_MAX];
+    char file[64];
+    int d = drive;
+    drive_vol_t *dv;
 
-    if (!buf || buf_sz == 0) {
+    if (!path || !path[0] || !out) {
         return -1;
     }
-    cap = buf_sz > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)buf_sz;
-    cap--;
-    if (vfs_read_at(drive, path, 0, buf, cap, &got) != 0) {
+    memset(out, 0, sizeof(*out));
+    if (!(flags & (VFS_O_READ | VFS_O_WRITE))) {
         return -1;
     }
-    buf[got] = 0;
+    if (vfs_resolve(drive, path, &d, resolved, sizeof(resolved)) != 0) {
+        return -1;
+    }
+    dv = &drives[d];
+    if (!dv->mounted) {
+        return -1;
+    }
+    if (vfs_split_parent_file(resolved, parent, file) != 0) {
+        return -1;
+    }
+
+    if (dv->type == VFS_FS_FAT32) {
+        uint32_t dir_cluster;
+        if (vfs_fat32_dir_cluster(dv, parent, &dir_cluster) != 0) {
+            return -1;
+        }
+        if (fat32_file_open(&dv->fs.fat32, dir_cluster, file, flags, &out->u.fat32) != 0) {
+            return -1;
+        }
+        out->used = 1;
+        out->flags = flags;
+        out->drive = d;
+        out->type = VFS_FS_FAT32;
+        return 0;
+    }
+
+    if (dv->type == VFS_FS_EXFAT) {
+        uint32_t dir_cluster;
+        uint32_t cluster;
+        int is_dir;
+        uint64_t fsize;
+        uint64_t dummy;
+        int no_fat = 0;
+
+        if (flags & (VFS_O_WRITE | VFS_O_CREATE | VFS_O_TRUNC | VFS_O_APPEND)) {
+            return -1;
+        }
+        if (exfat_find_path(&dv->fs.exfat, dv->fs.exfat.root_cluster, parent,
+                            &dir_cluster, &is_dir, &dummy, NULL) != 0 || !is_dir) {
+            return -1;
+        }
+        if (exfat_find_path(&dv->fs.exfat, dir_cluster, file, &cluster, &is_dir, &fsize,
+                            &no_fat) != 0 || is_dir) {
+            return -1;
+        }
+        exfat_file_init(&out->u.exfat, cluster, fsize, no_fat);
+        out->used = 1;
+        out->flags = flags;
+        out->drive = d;
+        out->type = VFS_FS_EXFAT;
+        return 0;
+    }
+    return -1;
+}
+
+int vfs_read(vfs_file_t *f, void *buf, uint32_t cap, uint32_t *out_len) {
+    drive_vol_t *dv;
+
     if (out_len) {
-        *out_len = got;
+        *out_len = 0;
+    }
+    if (!f || !f->used || !buf) {
+        return -1;
+    }
+    dv = &drives[f->drive];
+    if (f->type == VFS_FS_FAT32) {
+        return fat32_file_read(&dv->fs.fat32, &f->u.fat32, buf, cap, out_len);
+    }
+    if (f->type == VFS_FS_EXFAT) {
+        return exfat_file_read(&dv->fs.exfat, &f->u.exfat, buf, cap, out_len);
+    }
+    return -1;
+}
+
+int vfs_write(vfs_file_t *f, const void *data, uint32_t len, uint32_t *out_len) {
+    drive_vol_t *dv;
+
+    if (out_len) {
+        *out_len = 0;
+    }
+    if (!f || !f->used) {
+        return -1;
+    }
+    if (f->type != VFS_FS_FAT32) {
+        return -1;
+    }
+    dv = &drives[f->drive];
+    return fat32_file_write(&dv->fs.fat32, &f->u.fat32, data, len, out_len);
+}
+
+int vfs_seek(vfs_file_t *f, uint32_t offset) {
+    if (!f || !f->used) {
+        return -1;
+    }
+    if (f->type == VFS_FS_FAT32) {
+        return fat32_file_seek(&f->u.fat32, offset);
+    }
+    if (f->type == VFS_FS_EXFAT) {
+        return exfat_file_seek(&f->u.exfat, offset);
+    }
+    return -1;
+}
+
+uint32_t vfs_tell(const vfs_file_t *f) {
+    if (!f || !f->used) {
+        return 0;
+    }
+    if (f->type == VFS_FS_FAT32) {
+        return f->u.fat32.pos;
+    }
+    if (f->type == VFS_FS_EXFAT) {
+        return f->u.exfat.pos > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)f->u.exfat.pos;
     }
     return 0;
+}
+
+uint32_t vfs_file_size(const vfs_file_t *f) {
+    if (!f || !f->used) {
+        return 0;
+    }
+    if (f->type == VFS_FS_FAT32) {
+        return f->u.fat32.size;
+    }
+    if (f->type == VFS_FS_EXFAT) {
+        return f->u.exfat.size > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)f->u.exfat.size;
+    }
+    return 0;
+}
+
+int vfs_close(vfs_file_t *f) {
+    int rc = 0;
+    drive_vol_t *dv;
+
+    if (!f || !f->used) {
+        return 0;
+    }
+    dv = &drives[f->drive];
+    if (f->type == VFS_FS_FAT32) {
+        rc = fat32_file_close(&dv->fs.fat32, &f->u.fat32);
+    }
+    memset(f, 0, sizeof(*f));
+    return rc;
 }
 
 static int vfs_split_parent_file(const char *resolved, char *parent, char *file) {
@@ -516,71 +658,6 @@ int vfs_locate_file(int hint, const char *path) {
     return -1;
 }
 
-int vfs_read_at(int drive, const char *path, uint32_t offset, void *buf, uint32_t cap,
-                uint32_t *out_len) {
-    drive_vol_t *dv;
-    uint32_t cluster;
-    uint64_t fsize;
-    uint32_t to_read;
-    int n;
-
-    if (!buf || !out_len) {
-        return -1;
-    }
-    *out_len = 0;
-    if (cap == 0) {
-        return 0;
-    }
-    if (vfs_lookup_file(drive, path, &dv, &cluster, &fsize) != 0) {
-        return -1;
-    }
-    if (offset >= fsize) {
-        return 0;
-    }
-    to_read = cap;
-    if ((uint64_t)offset + to_read > fsize) {
-        to_read = (uint32_t)(fsize - offset);
-    }
-
-    if (dv->type == VFS_FS_FAT32) {
-        n = fat32_read_file(&dv->fs.fat32, cluster, offset, buf, to_read, (uint32_t)fsize);
-    } else {
-        n = exfat_read_file(&dv->fs.exfat, cluster, offset, buf, to_read, fsize,
-                            dv->exfat_no_fat_chain);
-    }
-    if (n < 0) {
-        return -1;
-    }
-    *out_len = (uint32_t)n;
-    return 0;
-}
-
-int vfs_write_file(int drive, const char *path, const void *data, size_t len) {
-    char resolved[VFS_PATH_MAX];
-    int d = drive;
-    if (vfs_resolve(drive, path, &d, resolved, sizeof(resolved)) != 0) {
-        return -1;
-    }
-
-    drive_vol_t *dv = &drives[d];
-    if (!dv->mounted || dv->type != VFS_FS_FAT32) {
-        return -1;
-    }
-
-    char parent[VFS_PATH_MAX];
-    char file[64];
-    if (vfs_split_parent_file(resolved, parent, file) != 0) {
-        return -1;
-    }
-
-    uint32_t dir_cluster;
-    if (vfs_fat32_dir_cluster(dv, parent, &dir_cluster) != 0) {
-        return -1;
-    }
-
-    return fat32_write_file(&dv->fs.fat32, dir_cluster, file, data, (uint32_t)len);
-}
-
 int vfs_mkdir(int drive, const char *path) {
     char resolved[VFS_PATH_MAX];
     int d = drive;
@@ -633,7 +710,7 @@ int vfs_delete(int drive, const char *path) {
     return fat32_delete(&dv->fs.fat32, dir_cluster, name);
 }
 
-#define VFS_COPY_MAX 65536
+#define VFS_COPY_CHUNK 32768
 
 static int vfs_join_name(char *out, size_t out_sz, const char *dir, const char *name) {
     size_t n = 0;
@@ -720,39 +797,66 @@ static void vfs_xfer_finish(int rc) {
 
 static int vfs_copy_data(int drive, const char *src, const char *dest,
                          uint32_t size) {
+    vfs_file_t in;
+    vfs_file_t out;
     uint8_t *buf;
-    uint32_t off;
-    int rc;
+    uint32_t chunk;
+    uint32_t copied = 0;
+    int rc = -1;
 
+    if (vfs_open(drive, src, VFS_O_READ, &in) != 0) {
+        return -1;
+    }
+    if (vfs_open(drive, dest, VFS_O_WRITE | VFS_O_CREATE | VFS_O_TRUNC, &out) != 0) {
+        vfs_close(&in);
+        return -1;
+    }
     if (size == 0) {
         console_xfer_progress(1, 1, "Writing...");
-        return vfs_write_file(drive, dest, "", 0);
+        vfs_close(&in);
+        vfs_close(&out);
+        return 0;
     }
 
-    buf = heap_alloc(size);
+    chunk = size > VFS_COPY_CHUNK ? VFS_COPY_CHUNK : size;
+    if (chunk < 512) {
+        chunk = 512;
+    }
+    buf = heap_alloc(chunk);
     if (!buf) {
-        return -2;
-    }
-
-    off = 0;
-    while (off < size) {
-        uint32_t chunk = size - off > 0x8000u ? 0x8000u : size - off;
-        uint32_t got = 0;
-
-        if (vfs_read_at(drive, src, off, buf + off, chunk, &got) != 0 || got == 0) {
-            heap_free(buf);
-            return -1;
+        chunk = 512;
+        buf = heap_alloc(chunk);
+        if (!buf) {
+            vfs_close(&in);
+            vfs_close(&out);
+            return -2;
         }
-        off += got;
-        console_xfer_progress(off, size * 2, "Copying...");
     }
 
-    console_xfer_progress(size, size * 2, "Writing...");
-    rc = vfs_write_file(drive, dest, buf, size);
-    if (rc == 0) {
-        console_xfer_progress(size * 2, size * 2, "Writing...");
+    while (copied < size) {
+        uint32_t want = size - copied;
+        uint32_t got = 0;
+        uint32_t put = 0;
+
+        if (want > chunk) {
+            want = chunk;
+        }
+        if (vfs_read(&in, buf, want, &got) != 0 || got == 0) {
+            rc = -1;
+            goto done;
+        }
+        if (vfs_write(&out, buf, got, &put) != 0 || put != got) {
+            rc = -1;
+            goto done;
+        }
+        copied += put;
+        console_xfer_progress(copied, size, "Copying...");
     }
+    rc = 0;
+done:
     heap_free(buf);
+    vfs_close(&in);
+    vfs_close(&out);
     return rc;
 }
 

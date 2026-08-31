@@ -1,15 +1,35 @@
 #pragma once
 
 #include "types.h"
+#include "fat32.h"
+#include "exfat.h"
 
 #define VFS_MAX_DRIVES 4
 #define VFS_PATH_MAX   260
+
+#define VFS_O_READ   0x01
+#define VFS_O_WRITE  0x02
+#define VFS_O_RDWR   (VFS_O_READ | VFS_O_WRITE)
+#define VFS_O_CREATE 0x04
+#define VFS_O_TRUNC  0x08
+#define VFS_O_APPEND 0x10
 
 typedef enum {
     VFS_FS_NONE = 0,
     VFS_FS_FAT32,
     VFS_FS_EXFAT
 } vfs_fs_type_t;
+
+typedef struct {
+    int           used;
+    int           flags;
+    int           drive;
+    vfs_fs_type_t type;
+    union {
+        fat32_file_t fat32;
+        exfat_file_t exfat;
+    } u;
+} vfs_file_t;
 
 int  vfs_init(void);
 int  vfs_drive_count(void);
@@ -20,13 +40,17 @@ const char *vfs_get_cwd(void);
 int  vfs_set_cwd(const char *path);
 int  vfs_resolve(int drive, const char *path, int *out_drive, char *out_path, size_t out_sz);
 int  vfs_list_dir(int drive, const char *path);
-int  vfs_read_file(int drive, const char *path, char *buf, size_t buf_sz, size_t *out_len);
-int  vfs_read_at(int drive, const char *path, uint32_t offset, void *buf, uint32_t cap, uint32_t *out_len);
+int  vfs_open(int drive, const char *path, int flags, vfs_file_t *out);
+int  vfs_read(vfs_file_t *f, void *buf, uint32_t cap, uint32_t *out_len);
+int  vfs_write(vfs_file_t *f, const void *data, uint32_t len, uint32_t *out_len);
+int  vfs_seek(vfs_file_t *f, uint32_t offset);
+uint32_t vfs_tell(const vfs_file_t *f);
+uint32_t vfs_file_size(const vfs_file_t *f);
+int  vfs_close(vfs_file_t *f);
 int  vfs_stat(int drive, const char *path, uint32_t *size, int *is_dir);
 /* Drive that holds path: hint first, then other mounted volumes if the
  * path has no drive letter. -1 if the file is not found. */
 int  vfs_locate_file(int hint, const char *path);
-int  vfs_write_file(int drive, const char *path, const void *data, size_t len);
 int  vfs_mkdir(int drive, const char *path);
 int  vfs_delete(int drive, const char *path);
 int  vfs_copy(int drive, const char *src, const char *dst);
