@@ -1,20 +1,29 @@
 /*
- * edit.c — Simple nano-style text editor for FOS.
+ * edit.c — Nano-style text editor for FOS.
  *
- * Usage: edit <file>
- *   Ctrl+S  save
- *   Ctrl+X  exit
- *   Arrow keys / Home / End to move; Backspace/Delete edit at cursor.
+ * Usage: edit [file]
+ *   Ctrl+S  save          Ctrl+X  exit
+ *   Ctrl+C  copy          Ctrl+V  paste          Ctrl+A  select all
+ *   Arrows / Home / End / PgUp / PgDn / Tab
+ *   Mouse: click to move, drag to select; right-click copies a selection
+ *   or pastes if nothing is selected.
  */
 
 #include "fos_api.h"
 
 #define TEXT_MAX   32768
 #define MAX_COLS   320
-#define FG_STATUS  15 /* white on blue */
+#define TAB_SPACES 4
+#define FG_STATUS  15
 #define BG_STATUS  1
+#define FG_TEXT    7
+#define BG_TEXT    0
+#define FG_GUTTER  8
+#define FG_GUTTER_CUR 14
+#define FG_TILDE   8
+#define FG_SEL     0
+#define BG_SEL     3
 
-/* Console geometry, filled from the kernel at startup. */
 static int cols = 80;
 static int edit_rows = 23;
 static int status_row = 23;
@@ -25,6 +34,12 @@ static int cursor;
 static int modified;
 static char filename[256];
 static int scroll_line;
+static int scroll_col;
+static int sel_mark = -1; /* other end of the selection; -1 = none */
+static int mouse_left;
+static int last_mx = -1;
+static int last_my = -1;
+static uint64_t last_edge_ms;
 
 static size_t my_strlen(const char *s) {
     size_t n = 0;
@@ -58,6 +73,34 @@ static void my_memmove(char *dst, const char *src, size_t n) {
     }
 }
 
+static void append_str(char *dst, int *n, int cap, const char *s) {
+    while (s && *s && *n < cap) {
+        dst[(*n)++] = *s++;
+    }
+}
+
+static void append_dec(char *dst, int *n, int cap, int v) {
+    char tmp[12];
+    int i = 0;
+
+    if (v < 0) {
+        if (*n < cap) {
+            dst[(*n)++] = '-';
+        }
+        v = -v;
+    }
+    if (v == 0) {
+        tmp[i++] = '0';
+    }
+    while (v > 0 && i < (int)sizeof(tmp)) {
+        tmp[i++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    while (i > 0 && *n < cap) {
+        dst[(*n)++] = tmp[--i];
+    }
+}
+
 static int line_index(int line) {
     int i = 0;
     int n = 0;
@@ -86,6 +129,45 @@ static int count_lines(void) {
         }
     }
     return n;
+}
+
+static int gutter_width(void) {
+    int n = count_lines();
+    int w = 1;
+
+    if (n < 1) {
+        n = 1;
+    }
+    while (n >= 10) {
+        n /= 10;
+        w++;
+    }
+    if (w < 4) {
+        w = 4;
+    }
+    return w + 2;
+}
+
+static int text_cols(void) {
+    int gw = gutter_width();
+    int n = cols - gw;
+    return n < 8 ? 8 : n;
+}
+
+static int has_sel(void) {
+    return sel_mark >= 0 && sel_mark != cursor;
+}
+
+static int sel_lo(void) {
+    return sel_mark < cursor ? sel_mark : cursor;
+}
+
+static int sel_hi(void) {
+    return sel_mark < cursor ? cursor : sel_mark;
+}
+
+static void clear_sel(void) {
+    sel_mark = -1;
 }
 
 static void cursor_to_row_col(int *row, int *col) {
@@ -143,6 +225,54 @@ static void init_geometry(fos_api_t *api) {
     edit_rows = status_row;
 }
 
+static void paint_span(fos_api_t *api, int x, int y, int n, uint8_t fg, uint8_t bg, char ch) {
+    char buf[MAX_COLS + 1];
+    int i;
+
+    if (n <= 0 || y < 0 || y >= status_row + 1) {
+        return;
+    }
+    if (x < 0) {
+        n += x;
+        x = 0;
+    }
+    if (x + n > cols) {
+        n = cols - x;
+    }
+    if (n <= 0) {
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        buf[i] = ch;
+    }
+    buf[n] = 0;
+    api->goto_xy(x, y);
+    api->write_color(fg, bg, buf);
+}
+
+static void paint_run(fos_api_t *api, int x, int y, uint8_t fg, uint8_t bg,
+                     const char *s, int n) {
+    char buf[MAX_COLS + 1];
+    int i;
+
+    if (n <= 0) {
+        return;
+    }
+    if (x + n > cols) {
+        n = cols - x;
+    }
+    if (n <= 0) {
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        char ch = s[i];
+        buf[i] = (ch == '\t') ? ' ' : ch;
+    }
+    buf[n] = 0;
+    api->goto_xy(x, y);
+    api->write_color(fg, bg, buf);
+}
+
 /* Padded to the full width so the bar colour spans the whole row. */
 static void status_bar(fos_api_t *api, const char *s) {
     char line[MAX_COLS + 1];
@@ -160,60 +290,142 @@ static void status_bar(fos_api_t *api, const char *s) {
     api->write_color(FG_STATUS, BG_STATUS, line);
 }
 
-static void ensure_visible(int row) {
+static void ensure_visible(int row, int col) {
+    int tc = text_cols();
+
     if (row < scroll_line) {
         scroll_line = row;
     }
     if (row >= scroll_line + edit_rows) {
         scroll_line = row - edit_rows + 1;
     }
+    if (scroll_line < 0) {
+        scroll_line = 0;
+    }
+    if (col < scroll_col) {
+        scroll_col = col;
+    }
+    if (col >= scroll_col + tc) {
+        scroll_col = col - tc + 1;
+    }
+    if (scroll_col < 0) {
+        scroll_col = 0;
+    }
+}
+
+static int in_sel(int pos) {
+    return has_sel() && pos >= sel_lo() && pos < sel_hi();
+}
+
+static void fmt_gutter(char *out, int width, int num) {
+    int dw = width - 2;
+    int i;
+
+    out[width] = 0;
+    out[width - 2] = '|';
+    out[width - 1] = ' ';
+    for (i = dw - 1; i >= 0; i--) {
+        out[i] = (char)('0' + (num % 10));
+        num /= 10;
+        if (num == 0) {
+            while (i > 0) {
+                out[--i] = ' ';
+            }
+            break;
+        }
+    }
 }
 
 static void draw(fos_api_t *api) {
-    char line[MAX_COLS + 1];
     char status[MAX_COLS + 1];
+    char gbuf[16];
     int row;
     int col;
+    int total;
+    int gw;
+    int tc;
+    int n;
 
     cursor_to_row_col(&row, &col);
-    ensure_visible(row);
+    ensure_visible(row, col);
+    total = count_lines();
+    gw = gutter_width();
+    tc = text_cols();
 
-    api->clear_screen();
+    if (api->set_cursor_visible) {
+        api->set_cursor_visible(0);
+    }
 
     for (int vr = 0; vr < edit_rows; vr++) {
         int sr = scroll_line + vr;
-        int start = line_index(sr);
-        int i = 0;
+        int x = 0;
 
-        while (i < cols && start + i < text_len && text[start + i] != '\n') {
-            line[i] = text[start + i];
-            i++;
+        if (sr >= total) {
+            paint_span(api, 0, vr, gw, FG_TILDE, BG_TEXT, ' ');
+            api->goto_xy(0, vr);
+            api->write_color(FG_TILDE, BG_TEXT, "~");
+            paint_span(api, 1, vr, cols - 1, FG_TEXT, BG_TEXT, ' ');
+            continue;
         }
-        line[i] = 0;
+
+        fmt_gutter(gbuf, gw, sr + 1);
         api->goto_xy(0, vr);
-        api->write(line);
+        api->write_color(sr == row ? FG_GUTTER_CUR : FG_GUTTER, BG_TEXT, gbuf);
+        x = gw;
+
+        {
+            int start = line_index(sr);
+            int linelen = line_length(sr);
+            int vis = linelen - scroll_col;
+            int pos0 = start + scroll_col;
+            int i = 0;
+            int nl_pos = start + linelen;
+
+            if (vis < 0) {
+                vis = 0;
+            }
+            if (vis > tc) {
+                vis = tc;
+            }
+
+            while (i < vis) {
+                int sel = in_sel(pos0 + i);
+                int run = 1;
+                while (i + run < vis && in_sel(pos0 + i + run) == sel) {
+                    run++;
+                }
+                if (sel) {
+                    paint_run(api, x, vr, FG_SEL, BG_SEL, text + pos0 + i, run);
+                } else {
+                    paint_run(api, x, vr, FG_TEXT, BG_TEXT, text + pos0 + i, run);
+                }
+                x += run;
+                i += run;
+            }
+
+            /* A selected newline shows as one highlighted cell past the text. */
+            if (vis < tc && in_sel(nl_pos) && text[nl_pos] == '\n') {
+                paint_span(api, x, vr, 1, FG_SEL, BG_SEL, ' ');
+                x++;
+            }
+            if (x < cols) {
+                paint_span(api, x, vr, cols - x, FG_TEXT, BG_TEXT, ' ');
+            }
+        }
     }
 
-    status[0] = 0;
-    {
-        const char *mod = modified ? " [Modified]" : "";
-        const char *base = "^X Exit  ^S Save  Arrows/Home/End move";
-        const char *shown = filename[0] ? filename : "[New file]";
-        int n = 0;
-        for (const char *p = base; *p && n < cols; p++) {
-            status[n++] = *p;
-        }
-        for (const char *p = mod; *p && n < cols; p++) {
-            status[n++] = *p;
-        }
-        if (n < cols) {
-            status[n++] = ' ';
-        }
-        for (const char *p = shown; *p && n < cols; p++) {
-            status[n++] = *p;
-        }
-        status[n] = 0;
+    n = 0;
+    append_str(status, &n, cols, "^X quit  ^S save  ^C copy  ^V paste  ^A all  ");
+    append_dec(status, &n, cols, row + 1);
+    append_str(status, &n, cols, ":");
+    append_dec(status, &n, cols, col + 1);
+    if (modified) {
+        append_str(status, &n, cols, "  * ");
+    } else {
+        append_str(status, &n, cols, "  ");
     }
+    append_str(status, &n, cols, filename[0] ? filename : "[New file]");
+    status[n] = 0;
     status_bar(api, status);
 
     if (api->set_cursor_visible) {
@@ -221,7 +433,10 @@ static void draw(fos_api_t *api) {
     }
     {
         int cy = row - scroll_line;
-        int cx = col;
+        int cx = gw + col - scroll_col;
+        if (cx < gw) {
+            cx = gw;
+        }
         if (cx > cols - 1) {
             cx = cols - 1;
         }
@@ -233,45 +448,126 @@ static void draw(fos_api_t *api) {
     }
 }
 
-static void insert_char(fos_api_t *api, char c) {
-    if (text_len + 1 >= TEXT_MAX) {
+static void delete_range(int a, int b) {
+    if (a < 0) {
+        a = 0;
+    }
+    if (b > text_len) {
+        b = text_len;
+    }
+    if (b <= a) {
+        clear_sel();
         return;
     }
-    my_memmove(text + cursor + 1, text + cursor, (size_t)(text_len - cursor));
-    text[cursor] = c;
-    text_len++;
-    cursor++;
+    my_memmove(text + a, text + b, (size_t)(text_len - b));
+    text_len -= (b - a);
+    text[text_len] = 0;
+    cursor = a;
     modified = 1;
+    clear_sel();
+}
+
+static void insert_text(const char *s, int n) {
+    int i;
+    int w = 0;
+    int o;
+
+    if (has_sel()) {
+        delete_range(sel_lo(), sel_hi());
+    }
+    if (!s || n <= 0) {
+        return;
+    }
+
+    for (i = 0; i < n; i++) {
+        if (s[i] == '\0') {
+            continue;
+        }
+        if (s[i] == '\r' && i + 1 < n && s[i + 1] == '\n') {
+            continue;
+        }
+        w++;
+    }
+    if (text_len + w >= TEXT_MAX) {
+        w = TEXT_MAX - 1 - text_len;
+    }
+    if (w <= 0) {
+        return;
+    }
+
+    my_memmove(text + cursor + w, text + cursor, (size_t)(text_len - cursor));
+    o = 0;
+    for (i = 0; i < n && o < w; i++) {
+        char c = s[i];
+        if (c == '\0') {
+            continue;
+        }
+        if (c == '\r') {
+            if (i + 1 < n && s[i + 1] == '\n') {
+                continue;
+            }
+            c = '\n';
+        }
+        text[cursor + o] = c;
+        o++;
+    }
+    if (o < w) {
+        my_memmove(text + cursor + o, text + cursor + w, (size_t)(text_len - cursor));
+    }
+    cursor += o;
+    text_len += o;
+    text[text_len] = 0;
+    modified = 1;
+    clear_sel();
+}
+
+static void insert_char(fos_api_t *api, char c) {
+    insert_text(&c, 1);
     draw(api);
 }
 
 static void backspace(fos_api_t *api) {
+    if (has_sel()) {
+        delete_range(sel_lo(), sel_hi());
+        draw(api);
+        return;
+    }
     if (cursor <= 0) {
         return;
     }
     my_memmove(text + cursor - 1, text + cursor, (size_t)(text_len - cursor));
     cursor--;
     text_len--;
+    text[text_len] = 0;
     modified = 1;
     draw(api);
 }
 
 static void delete_char(fos_api_t *api) {
+    if (has_sel()) {
+        delete_range(sel_lo(), sel_hi());
+        draw(api);
+        return;
+    }
     if (cursor >= text_len) {
         return;
     }
     my_memmove(text + cursor, text + cursor + 1, (size_t)(text_len - cursor - 1));
     text_len--;
+    text[text_len] = 0;
     modified = 1;
     draw(api);
 }
 
 static void move_left(fos_api_t *api) {
-    if (cursor <= 0) {
-        return;
-    }
     int row;
     int col;
+
+    clear_sel();
+    if (cursor <= 0) {
+        draw(api);
+        return;
+    }
     cursor_to_row_col(&row, &col);
     if (col == 0 && row > 0) {
         cursor = line_index(row - 1) + line_length(row - 1);
@@ -282,39 +578,43 @@ static void move_left(fos_api_t *api) {
 }
 
 static void move_right(fos_api_t *api) {
-    if (cursor >= text_len) {
-        return;
+    clear_sel();
+    if (cursor < text_len) {
+        cursor++;
     }
-    cursor++;
     draw(api);
 }
 
 static void move_up(fos_api_t *api) {
     int row;
     int col;
+
+    clear_sel();
     cursor_to_row_col(&row, &col);
     if (row > 0) {
         row_col_to_cursor(row - 1, col);
-        ensure_visible(row - 1);
-        draw(api);
     }
+    draw(api);
 }
 
 static void move_down(fos_api_t *api) {
     int row;
     int col;
     int total = count_lines();
+
+    clear_sel();
     cursor_to_row_col(&row, &col);
     if (row + 1 < total) {
         row_col_to_cursor(row + 1, col);
-        ensure_visible(row + 1);
-        draw(api);
     }
+    draw(api);
 }
 
 static void move_home(fos_api_t *api) {
     int row;
     int col;
+
+    clear_sel();
     cursor_to_row_col(&row, &col);
     cursor = line_index(row);
     draw(api);
@@ -323,9 +623,172 @@ static void move_home(fos_api_t *api) {
 static void move_end(fos_api_t *api) {
     int row;
     int col;
+
+    clear_sel();
     cursor_to_row_col(&row, &col);
     cursor = line_index(row) + line_length(row);
     draw(api);
+}
+
+static void move_page(fos_api_t *api, int dir) {
+    int row;
+    int col;
+    int total = count_lines();
+    int step = edit_rows > 1 ? edit_rows - 1 : 1;
+
+    clear_sel();
+    cursor_to_row_col(&row, &col);
+    row += dir * step;
+    if (row < 0) {
+        row = 0;
+    }
+    if (row >= total) {
+        row = total - 1;
+    }
+    row_col_to_cursor(row, col);
+    draw(api);
+}
+
+static void select_all(fos_api_t *api) {
+    sel_mark = 0;
+    cursor = text_len;
+    draw(api);
+}
+
+static void copy_sel(fos_api_t *api) {
+    int a;
+    int b;
+
+    if (has_sel()) {
+        a = sel_lo();
+        b = sel_hi();
+    } else {
+        int row;
+        int col;
+        cursor_to_row_col(&row, &col);
+        a = line_index(row);
+        b = a + line_length(row);
+        if (b < text_len && text[b] == '\n') {
+            b++;
+        }
+    }
+    if (api->clip_set) {
+        api->clip_set(text + a, (size_t)(b - a));
+    }
+}
+
+static void paste_clip(fos_api_t *api) {
+    static char buf[TEXT_MAX];
+    size_t n;
+
+    if (!api->clip_get) {
+        return;
+    }
+    n = api->clip_get(buf, sizeof(buf));
+    if (n == 0) {
+        return;
+    }
+    insert_text(buf, (int)n);
+    draw(api);
+}
+
+static void mouse_to_cursor(int mx, int my) {
+    int gw = gutter_width();
+    int total = count_lines();
+    int row;
+    int col;
+
+    if (my < 0) {
+        my = 0;
+    }
+    if (my >= edit_rows) {
+        my = edit_rows - 1;
+    }
+    row = scroll_line + my;
+    if (row >= total) {
+        row = total - 1;
+        if (row < 0) {
+            row = 0;
+        }
+        col = line_length(row);
+    } else {
+        col = mx - gw + scroll_col;
+        if (col < 0) {
+            col = 0;
+        }
+    }
+    row_col_to_cursor(row, col);
+}
+
+static void handle_mouse(fos_api_t *api) {
+    fos_mouse_t m;
+    int edge = 0;
+    int changed = 0;
+    uint64_t now = 0;
+
+    if (!api->mouse_poll || !api->mouse_poll(&m)) {
+        mouse_left = 0;
+        return;
+    }
+
+    if (api->get_ticks_ms) {
+        now = api->get_ticks_ms();
+    }
+
+    if (m.buttons & 1) {
+        if (!mouse_left) {
+            if (m.y >= 0 && m.y < edit_rows) {
+                mouse_left = 1;
+                mouse_to_cursor(m.x, m.y);
+                sel_mark = cursor;
+                last_mx = m.x;
+                last_my = m.y;
+                last_edge_ms = now;
+                changed = 1;
+            }
+        } else {
+            if (m.y <= 0 && scroll_line > 0) {
+                edge = -1;
+            } else if (m.y >= edit_rows - 1) {
+                int total = count_lines();
+                if (scroll_line + edit_rows < total) {
+                    edge = 1;
+                }
+            }
+            if (edge && now != 0 && now - last_edge_ms >= 80) {
+                scroll_line += edge;
+                last_edge_ms = now;
+                changed = 1;
+            }
+            if (m.x != last_mx || m.y != last_my || changed) {
+                mouse_to_cursor(m.x, m.y);
+                last_mx = m.x;
+                last_my = m.y;
+                changed = 1;
+            }
+        }
+    } else if (mouse_left) {
+        mouse_left = 0;
+        if (!has_sel()) {
+            clear_sel();
+        }
+        last_mx = -1;
+        last_my = -1;
+        changed = 1;
+    }
+
+    if (m.pending & 2) {
+        if (has_sel()) {
+            copy_sel(api);
+        } else {
+            paste_clip(api);
+            return;
+        }
+    }
+
+    if (changed) {
+        draw(api);
+    }
 }
 
 static int save_file(fos_api_t *api) {
@@ -490,6 +953,7 @@ static void normalize_path(char *path, const char *arg) {
 void com_main(void) {
     fos_api_t *api = (fos_api_t *)FOS_API_ADDR;
     size_t loaded = 0;
+    int opened = 0;
 
     init_geometry(api);
     normalize_path(filename, api->cmdline);
@@ -498,6 +962,8 @@ void com_main(void) {
     cursor = 0;
     modified = filename[0] == 0;
     scroll_line = 0;
+    scroll_col = 0;
+    sel_mark = -1;
 
     if (filename[0] != 0) {
         int fd = api->fopen(filename, FOS_O_READ);
@@ -506,9 +972,14 @@ void com_main(void) {
             loaded = n;
             text_len = (int)loaded;
             modified = 0;
+            opened = 1;
         }
         if (fd >= 0) {
             api->fclose(fd);
+        }
+        if (!opened) {
+            /* Named file that does not exist yet — treat as new. */
+            modified = 1;
         }
     }
     text[text_len] = 0;
@@ -516,15 +987,10 @@ void com_main(void) {
     draw(api);
 
     for (;;) {
-        while (!api->has_key()) {
-            fos_mouse_t m;
-            if (api->mouse_poll && api->mouse_poll(&m) && (m.pending & 1)) {
-                if (m.y >= 0 && m.y < edit_rows) {
-                    row_col_to_cursor(scroll_line + m.y, m.x);
-                    draw(api);
-                }
-            }
+        handle_mouse(api);
+        if (!api->has_key()) {
             __asm__ volatile("pause");
+            continue;
         }
 
         fos_key_event_t ev = api->read_key();
@@ -533,10 +999,10 @@ void com_main(void) {
         }
 
         if (ev.type == FOS_KEY_CHAR) {
-            if (ev.ch == 24) {
+            if (ev.ch == 24) { /* Ctrl+X */
                 break;
             }
-            if (ev.ch == 19) {
+            if (ev.ch == 19) { /* Ctrl+S */
                 if (filename[0] == 0) {
                     prompt_save_as(api);
                 } else {
@@ -544,9 +1010,27 @@ void com_main(void) {
                 }
                 continue;
             }
+            if (ev.ch == 3) { /* Ctrl+C */
+                copy_sel(api);
+                continue;
+            }
+            if (ev.ch == 22) { /* Ctrl+V */
+                paste_clip(api);
+                continue;
+            }
+            if (ev.ch == 1) { /* Ctrl+A */
+                select_all(api);
+                continue;
+            }
             if (ev.ch >= 32 && ev.ch <= 126) {
                 insert_char(api, ev.ch);
             }
+            continue;
+        }
+
+        if (ev.type == FOS_KEY_TAB) {
+            insert_text("    ", TAB_SPACES);
+            draw(api);
             continue;
         }
 
@@ -592,6 +1076,16 @@ void com_main(void) {
 
         if (ev.type == FOS_KEY_END) {
             move_end(api);
+            continue;
+        }
+
+        if (ev.type == FOS_KEY_PAGEUP) {
+            move_page(api, -1);
+            continue;
+        }
+
+        if (ev.type == FOS_KEY_PAGEDOWN) {
+            move_page(api, 1);
             continue;
         }
     }

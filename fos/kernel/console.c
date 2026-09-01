@@ -87,7 +87,7 @@ static uint16_t cursor_under;
 static uint64_t cursor_blink_at;
 static uint16_t screen_cell[CONSOLE_MAX_ROWS][CONSOLE_MAX_COLS];
 
-#define CLIP_MAX 512
+#define CLIP_MAX CONSOLE_CLIP_MAX
 #define HIT_MAX  8
 #define HIT_ENTER 1
 #define HIT_ESC   2
@@ -370,6 +370,36 @@ static void clip_add(char c) {
         clip[clip_n++] = c;
         clip[clip_n] = 0;
     }
+}
+
+void console_clip_set(const char *s, size_t n) {
+    if (!s) {
+        n = 0;
+    }
+    if (n > (size_t)(CLIP_MAX - 1)) {
+        n = CLIP_MAX - 1;
+    }
+    if (n > 0) {
+        memcpy(clip, s, n);
+    }
+    clip[n] = 0;
+    clip_n = (int)n;
+}
+
+size_t console_clip_get(char *buf, size_t cap) {
+    size_t n = (size_t)clip_n;
+
+    if (!buf || cap == 0) {
+        return n;
+    }
+    if (n >= cap) {
+        n = cap - 1;
+    }
+    if (n > 0) {
+        memcpy(buf, clip, n);
+    }
+    buf[n] = 0;
+    return n;
 }
 
 static void selection_copy(void) {

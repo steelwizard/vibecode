@@ -64,7 +64,7 @@ static int altgr_down;     /* right Alt, not left Alt (0x38 vs E0 38) */
 static int serial_esc_state; /* 0=normal, 1=ESC, 2=[/O, 3=digits before ~ */
 static int serial_esc_num;
 
-#define INJ_MAX 64
+#define INJ_MAX 4096
 static key_type_t inj_type[INJ_MAX];
 static char inj_ch[INJ_MAX];
 static int inj_r;

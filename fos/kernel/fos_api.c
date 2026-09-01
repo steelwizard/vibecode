@@ -418,6 +418,8 @@ void fos_api_init(void) {
     api->ftell = api_ftell;
     api->fsize = api_fsize;
     api->fclose = api_fclose;
+    api->clip_set = console_clip_set;
+    api->clip_get = console_clip_get;
     api->cmdline[0] = 0;
     api->pipe_in_len = 0;
 }

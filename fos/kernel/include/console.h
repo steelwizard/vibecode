@@ -51,6 +51,11 @@ int  console_hit_click(int x, int y);
 void console_hit_clear(void);
 void console_hit_add(int x, int y, int w, int h, int action);
 
+/* Shared clipboard (shell mouse copy and .COM clip_set/clip_get). */
+#define CONSOLE_CLIP_MAX 32768
+void console_clip_set(const char *s, size_t n);
+size_t console_clip_get(char *buf, size_t cap);
+
 /* Modal error: red screen, blue box, bomb + [ OK ]. Enter/Space dismisses.
  * Restores the previous screen afterwards. While capturing (pipes/redirects)
  * this just writes the message as a line so scripts still see it. */

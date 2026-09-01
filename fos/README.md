@@ -57,7 +57,7 @@ Audio backend defaults to **PipeWire** when that session socket exists, otherwis
 |---------|-------------|
 | `SHELL.COM` | Interactive shell (also built into the kernel) |
 | `\FOS\ECHO.COM` | Sample FOSCOM program |
-| `\FOS\EDIT.COM` | Text editor — Ctrl+S save, Ctrl+X exit, arrows, Delete |
+| `\FOS\EDIT.COM` | Text editor — line numbers, mouse select, Ctrl+C/V copy/paste, Ctrl+S save, Ctrl+X exit |
 | `\FOS\LESS.COM` | File pager — Space/b page, q quit (`more` alias in shell) |
 | `\FOS\FM.COM` | File manager — boxed TUI, Enter runs `.COM` / `.BAT` (line output on a grey OK screen), `0-3` drive, `c`/`r` copy/move, `d` delete |
 | `\FOS\DATE.COM` | Show or set the CMOS RTC (`date YYYY-MM-DD HH:MM:SS`) |
@@ -91,7 +91,7 @@ A `.COM` can be 32 MiB of code+data+BSS at `0x300000`, with an 8 MiB stack. Larg
 | `move` / `ren <src> <dst>` | Move or rename file (FAT32) — same window |
 | `type` / `cat <path>` | Print file (or piped input) |
 | `drives` / `df` | List physical disks and mounted volumes |
-| `edit [file]` | Run the text editor |
+| `edit [file]` | Run the text editor (line numbers, mouse, ^C/^V copy/paste) |
 | `less [file]` / `more` | Page through a file (`cat file \| less`) |
 | `fm` | Run the file manager |
 | `date [stamp]` | RTC via `date.com` |
@@ -122,7 +122,7 @@ Prompt shows the current path, e.g. `0:\>` or `0:\docs>`. It is green after a su
 
 ### Mouse
 
-A yellow arrow follows the host mouse in QEMU (no grab — `make run` adds `-device vmmouse`). Left-drag selects text; right-click copies the selection, or pastes if nothing is selected. Left-click activates `[ OK ]` / Y/N buttons, moves the caret in the shell and editor, opens FM entries on double-click, and pages `less` (upper/lower half). Click the bottom row in `play` to quit. In `paint`, left-drag draws, right-drag erases, `B` or **Fill** flood-fills, and the bottom swatches pick a colour. In `bench`, click a menu row to select and click again to run; in the hardware monitor, click the load bar to set synthetic CPU load. In `tetris`, click the well to rotate, the sides to nudge, or the bottom bar.
+A yellow arrow follows the host mouse in QEMU (no grab — `make run` adds `-device vmmouse`). Left-drag selects text; right-click copies the selection, or pastes if nothing is selected. Left-click activates `[ OK ]` / Y/N buttons, moves the caret in the shell and editor, opens FM entries on double-click, and pages `less` (upper/lower half). In `edit`, the gutter shows line numbers; left-click moves the caret, left-drag selects (without copying the gutter), and right-click / Ctrl+C / Ctrl+V use the same clipboard as the shell. Click the bottom row in `play` to quit. In `paint`, left-drag draws, right-drag erases, `B` or **Fill** flood-fills, and the bottom swatches pick a colour. In `bench`, click a menu row to select and click again to run; in the hardware monitor, click the load bar to set synthetic CPU load. In `tetris`, click the well to rotate, the sides to nudge, or the bottom bar.
 
 ### Scripts (`if` / `for` / `while` / `.BAT`)
 

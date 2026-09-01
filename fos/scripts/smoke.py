@@ -45,6 +45,10 @@ CASES = [
     ("echo z$k", 10, None, None, "zhello"),
     ("echo STREAMOK > TST.TXT", 10, None, None, None),
     ("type TST.TXT", 10, None, None, "STREAMOK"),
+    ("echo HELLO > CLIP.TXT", 10, None, None, None),
+    # Ctrl+A, Ctrl+C, End, X, Ctrl+V, Ctrl+S, Ctrl+X → HELLO / XHELLO
+    ("edit CLIP.TXT", 25, 3.0, "\x01\x03\x1b[FX\x16\x13\x18", None),
+    ("type CLIP.TXT", 10, None, None, "XHELLO"),
     ("copy TST.TXT TST2.TXT", 15, None, None, None),
     ("type TST2.TXT", 10, None, None, "STREAMOK"),
     ("grep Flash README.TXT", 10, None, None, "Flash Operating System"),

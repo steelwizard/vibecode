@@ -208,6 +208,10 @@ typedef struct {
     int (*ftell)(int fd, uint32_t *offset);
     int (*fsize)(int fd, uint32_t *size);
     int (*fclose)(int fd);
+    /* Shared clipboard. Same buffer as shell mouse copy/paste. clip_get
+     * NUL-terminates buf when cap > 0. Pass buf=NULL to read the length. */
+    void (*clip_set)(const char *s, size_t n);
+    size_t (*clip_get)(char *buf, size_t cap);
 } fos_api_t;
 
 void fos_api_init(void);
