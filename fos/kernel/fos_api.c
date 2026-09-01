@@ -39,8 +39,9 @@ _Static_assert(FOS_O_READ == VFS_O_READ && FOS_O_WRITE == VFS_O_WRITE &&
 
 static fos_key_event_t api_read_key(void) {
     key_event_t ev = keyboard_read_event();
-    fos_key_event_t out = {FOS_KEY_NONE, 0};
+    fos_key_event_t out = {FOS_KEY_NONE, 0, 0};
 
+    out.mods = ev.mods;
     switch (ev.type) {
     case KEY_CHAR:
         out.type = FOS_KEY_CHAR;
@@ -342,6 +343,10 @@ static int api_run_bat(const char *path, const char *args) {
     return shell_run_bat(path, args ? args : "");
 }
 
+static int api_drive_writable(int drive) {
+    return vfs_drive_type(drive) == VFS_FS_FAT32;
+}
+
 static int api_mouse_poll(fos_mouse_t *out) {
     return mouse_get((mouse_state_t *)out);
 }
@@ -420,6 +425,7 @@ void fos_api_init(void) {
     api->fclose = api_fclose;
     api->clip_set = console_clip_set;
     api->clip_get = console_clip_get;
+    api->drive_writable = api_drive_writable;
     api->cmdline[0] = 0;
     api->pipe_in_len = 0;
 }

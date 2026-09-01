@@ -17,12 +17,13 @@ const LEVELS = [
       [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
     ],
     enemies: [
-      { x: 4.5, y: 3.5 },
+      { x: 6.5, y: 3.5 },
       { x: 8.5, y: 2.5 },
       { x: 9.5, y: 6.5 },
-      { x: 3.5, y: 7.5 }
+      { x: 7.5, y: 7.5 }
     ],
     healthItems: [
+      { x: 3.5, y: 5.5 },
       { x: 6.5, y: 1.5 },
       { x: 10.5, y: 5.5 }
     ]
@@ -44,13 +45,14 @@ const LEVELS = [
     enemies: [
       { x: 5.5, y: 2.5 },
       { x: 9.5, y: 1.5 },
-      { x: 8.5, y: 5.5 },
-      { x: 3.5, y: 6.5 },
-      { x: 9.5, y: 7.5 }
+      { x: 9.5, y: 5.5 },
+      { x: 7.5, y: 3.5 },
+      { x: 10.5, y: 7.5 }
     ],
     healthItems: [
+      { x: 2.5, y: 7.5 },
       { x: 2.5, y: 3.5 },
-      { x: 6.5, y: 6.5 }
+      { x: 5.5, y: 6.5 }
     ]
   },
   {
@@ -68,17 +70,16 @@ const LEVELS = [
       [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4]
     ],
     enemies: [
-      { x: 5.5, y: 1.5 },
-      { x: 8.5, y: 2.5 },
-      { x: 2.5, y: 4.5 },
-      { x: 8.5, y: 4.5 },
-      { x: 2.5, y: 6.5 },
-      { x: 9.5, y: 6.5 }
+      { x: 3.5, y: 3.5 },
+      { x: 3.5, y: 5.5 },
+      { x: 7.5, y: 3.5 },
+      { x: 7.5, y: 5.5 },
+      { x: 10.5, y: 3.5 }
     ],
     healthItems: [
       { x: 1.5, y: 7.5 },
-      { x: 6.5, y: 4.5 },
-      { x: 10.5, y: 3.5 }
+      { x: 5.5, y: 4.5 },
+      { x: 10.5, y: 5.5 }
     ]
   }
 ];
@@ -89,19 +90,23 @@ let mapW = 0;
 let mapH = 0;
 const FOV = Math.PI / 3;
 const MAX_DIST = 24;
-const MOVE_SPEED = 3;
+const MOVE_SPEED = 3.25;
 const TURN_SPEED = 2.2;
 const PLAYER_RADIUS = 0.2;
 const SHOT_COOLDOWN = 0.2;
 const ENEMY_RADIUS = 0.28;
-const ENEMY_HEALTH = 3;
-const ENEMY_SPEED = 1.15;
-const ENEMY_SHOOT_RANGE = 6.5;
-const ENEMY_STOP_RANGE = 1.8;
-const ENEMY_FIRE_COOLDOWN = 0.95;
+const ENEMY_SHOT_HIT_RADIUS = 0.48;
+const ENEMY_HEALTH = 2;
+const ENEMY_SPEED = 0.95;
+const ENEMY_SHOOT_RANGE = 5.0;
+const ENEMY_STOP_RANGE = 2.1;
+const ENEMY_FIRE_COOLDOWN = 1.45;
+const ENEMY_REACTION_TIME = 0.45;
 const PLAYER_HEALTH_MAX = 100;
-const PLAYER_HIT_DAMAGE = 12;
-const HEALTH_ITEM_AMOUNT = 30;
+const PLAYER_HIT_DAMAGE = 7;
+const PLAYER_IFRAMES = 0.6;
+const PLAYER_SPAWN_PROTECT = 1.35;
+const HEALTH_ITEM_AMOUNT = 40;
 const HEALTH_ITEM_PICKUP_DIST = 0.55;
 
 const player = {
@@ -110,6 +115,7 @@ const player = {
   angle: 0,
   health: PLAYER_HEALTH_MAX,
   hurtTimer: 0,
+  iframeTimer: 0,
   dead: false
 };
 
@@ -233,6 +239,7 @@ function update(dt) {
   muzzleFlashTimer = Math.max(0, muzzleFlashTimer - dt);
   hitFlashTimer = Math.max(0, hitFlashTimer - dt);
   player.hurtTimer = Math.max(0, player.hurtTimer - dt);
+  player.iframeTimer = Math.max(0, player.iframeTimer - dt);
   for (const enemy of enemies) {
     enemy.hitTimer = Math.max(0, enemy.hitTimer - dt);
     enemy.fireCooldown = Math.max(0, enemy.fireCooldown - dt);
@@ -544,7 +551,7 @@ function findEnemyHit(maxDist) {
     }
 
     const offset = Math.abs(dx * rightX + dy * rightY);
-    if (offset > ENEMY_RADIUS) {
+    if (offset > ENEMY_SHOT_HIT_RADIUS) {
       continue;
     }
 
@@ -581,11 +588,12 @@ function hasLineOfSight(x0, y0, x1, y1) {
 }
 
 function damagePlayer(amount) {
-  if (player.dead) {
+  if (player.dead || player.iframeTimer > 0) {
     return;
   }
   player.health = Math.max(0, player.health - amount);
-  player.hurtTimer = 0.2;
+  player.hurtTimer = 0.22;
+  player.iframeTimer = PLAYER_IFRAMES;
   if (player.health <= 0) {
     player.dead = true;
   }
@@ -602,6 +610,12 @@ function updateEnemies(dt) {
     const dist = Math.hypot(toPlayerX, toPlayerY);
     const seesPlayer = hasLineOfSight(enemy.x, enemy.y, player.x, player.y);
 
+    if (seesPlayer) {
+      enemy.alertTime += dt;
+    } else {
+      enemy.alertTime = Math.max(0, enemy.alertTime - dt * 2.5);
+    }
+
     if (seesPlayer && dist > ENEMY_STOP_RANGE) {
       const dirX = toPlayerX / Math.max(0.0001, dist);
       const dirY = toPlayerY / Math.max(0.0001, dist);
@@ -617,7 +631,12 @@ function updateEnemies(dt) {
       }
     }
 
-    if (seesPlayer && dist <= ENEMY_SHOOT_RANGE && enemy.fireCooldown <= 0) {
+    if (
+      seesPlayer &&
+      dist <= ENEMY_SHOOT_RANGE &&
+      enemy.fireCooldown <= 0 &&
+      enemy.alertTime >= ENEMY_REACTION_TIME
+    ) {
       enemy.fireCooldown = ENEMY_FIRE_COOLDOWN;
       damagePlayer(PLAYER_HIT_DAMAGE);
     }
@@ -997,7 +1016,8 @@ function loadLevel(levelIndex) {
       health: ENEMY_HEALTH,
       hitTimer: 0,
       alive: true,
-      fireCooldown: 0
+      alertTime: 0,
+      fireCooldown: 0.35 + Math.random() * 0.55
     });
   }
 
@@ -1018,6 +1038,7 @@ function loadLevel(levelIndex) {
   player.y = level.playerStart.y;
   player.angle = level.playerStart.angle;
   player.hurtTimer = 0;
+  player.iframeTimer = PLAYER_SPAWN_PROTECT;
   shootCooldown = 0;
   muzzleFlashTimer = 0;
   hitFlashTimer = 0;

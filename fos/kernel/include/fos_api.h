@@ -43,9 +43,14 @@ typedef enum {
     FOS_KEY_PAGEDOWN
 } fos_key_type_t;
 
+#define FOS_MOD_SHIFT 1u
+#define FOS_MOD_CTRL  2u
+#define FOS_MOD_ALT   4u
+
 typedef struct {
     fos_key_type_t type;
     char           ch;
+    uint8_t        mods; /* FOS_MOD_* */
 } fos_key_event_t;
 
 typedef struct {
@@ -212,6 +217,8 @@ typedef struct {
      * NUL-terminates buf when cap > 0. Pass buf=NULL to read the length. */
     void (*clip_set)(const char *s, size_t n);
     size_t (*clip_get)(char *buf, size_t cap);
+    /* 1 if drive is a writable volume (FAT32). 0 for exFAT / unmounted. */
+    int (*drive_writable)(int drive);
 } fos_api_t;
 
 void fos_api_init(void);

@@ -429,7 +429,7 @@ static void cmd_help(void) {
     console_write_line("  reboot               Reboot");
     console_write_line("  <name>.com [args]    Run .COM program (e.g. echo hello)");
     console_write_line("  <name>.bat [args]    Run a .BAT script (also: call name)");
-    console_write_line("  edit [file]          Text editor (^S save, ^X exit, ^C/^V copy/paste)");
+    console_write_line("  edit [file]          Text editor (^S save, ^X quit, ^C/^K/^V clip)");
     console_write_line("  less [file]          Page through a file (q to quit)");
     console_write_line("  fm                   File manager (m = mkdir)");
     console_write_line("  date [when]          Show or set RTC (date.com)");

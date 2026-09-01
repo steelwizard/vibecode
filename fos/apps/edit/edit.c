@@ -2,9 +2,9 @@
  * edit.c — Nano-style text editor for FOS.
  *
  * Usage: edit [file]
- *   Ctrl+S  save          Ctrl+X  exit
- *   Ctrl+C  copy          Ctrl+V  paste          Ctrl+A  select all
- *   Arrows / Home / End / PgUp / PgDn / Tab
+ *   Ctrl+S  save          Ctrl+X  exit (prompts if unsaved and writable)
+ *   Ctrl+C  copy          Ctrl+K  cut           Ctrl+V  paste
+ *   Ctrl+A  select all    Shift+arrows/Home/End/PgUp/PgDn select
  *   Mouse: click to move, drag to select; right-click copies a selection
  *   or pastes if nothing is selected.
  */
@@ -14,15 +14,15 @@
 #define TEXT_MAX   32768
 #define MAX_COLS   320
 #define TAB_SPACES 4
-#define FG_STATUS  15
-#define BG_STATUS  1
-#define FG_TEXT    7
-#define BG_TEXT    0
-#define FG_GUTTER  8
+#define FG_STATUS  0  /* black on teal */
+#define BG_STATUS  3  /* VGA cyan/teal #00AAAA */
+#define FG_TEXT    15
+#define BG_TEXT    1  /* dark blue */
+#define FG_GUTTER  9  /* bright blue */
 #define FG_GUTTER_CUR 14
-#define FG_TILDE   8
+#define FG_TILDE   9
 #define FG_SEL     0
-#define BG_SEL     3
+#define BG_SEL     11 /* bright cyan — distinct from the teal bar */
 
 static int cols = 80;
 static int edit_rows = 23;
@@ -415,7 +415,7 @@ static void draw(fos_api_t *api) {
     }
 
     n = 0;
-    append_str(status, &n, cols, "^X quit  ^S save  ^C copy  ^V paste  ^A all  ");
+    append_str(status, &n, cols, "^X quit  ^S save  ^C copy  ^K cut  ^V paste  ^A all  ");
     append_dec(status, &n, cols, row + 1);
     append_str(status, &n, cols, ":");
     append_dec(status, &n, cols, col + 1);
@@ -559,11 +559,21 @@ static void delete_char(fos_api_t *api) {
     draw(api);
 }
 
-static void move_left(fos_api_t *api) {
+static void begin_nav_sel(int shift) {
+    if (shift) {
+        if (sel_mark < 0) {
+            sel_mark = cursor;
+        }
+    } else {
+        clear_sel();
+    }
+}
+
+static void move_left(fos_api_t *api, int shift) {
     int row;
     int col;
 
-    clear_sel();
+    begin_nav_sel(shift);
     if (cursor <= 0) {
         draw(api);
         return;
@@ -577,19 +587,19 @@ static void move_left(fos_api_t *api) {
     draw(api);
 }
 
-static void move_right(fos_api_t *api) {
-    clear_sel();
+static void move_right(fos_api_t *api, int shift) {
+    begin_nav_sel(shift);
     if (cursor < text_len) {
         cursor++;
     }
     draw(api);
 }
 
-static void move_up(fos_api_t *api) {
+static void move_up(fos_api_t *api, int shift) {
     int row;
     int col;
 
-    clear_sel();
+    begin_nav_sel(shift);
     cursor_to_row_col(&row, &col);
     if (row > 0) {
         row_col_to_cursor(row - 1, col);
@@ -597,12 +607,12 @@ static void move_up(fos_api_t *api) {
     draw(api);
 }
 
-static void move_down(fos_api_t *api) {
+static void move_down(fos_api_t *api, int shift) {
     int row;
     int col;
     int total = count_lines();
 
-    clear_sel();
+    begin_nav_sel(shift);
     cursor_to_row_col(&row, &col);
     if (row + 1 < total) {
         row_col_to_cursor(row + 1, col);
@@ -610,33 +620,33 @@ static void move_down(fos_api_t *api) {
     draw(api);
 }
 
-static void move_home(fos_api_t *api) {
+static void move_home(fos_api_t *api, int shift) {
     int row;
     int col;
 
-    clear_sel();
+    begin_nav_sel(shift);
     cursor_to_row_col(&row, &col);
     cursor = line_index(row);
     draw(api);
 }
 
-static void move_end(fos_api_t *api) {
+static void move_end(fos_api_t *api, int shift) {
     int row;
     int col;
 
-    clear_sel();
+    begin_nav_sel(shift);
     cursor_to_row_col(&row, &col);
     cursor = line_index(row) + line_length(row);
     draw(api);
 }
 
-static void move_page(fos_api_t *api, int dir) {
+static void move_page(fos_api_t *api, int dir, int shift) {
     int row;
     int col;
     int total = count_lines();
     int step = edit_rows > 1 ? edit_rows - 1 : 1;
 
-    clear_sel();
+    begin_nav_sel(shift);
     cursor_to_row_col(&row, &col);
     row += dir * step;
     if (row < 0) {
@@ -655,26 +665,46 @@ static void select_all(fos_api_t *api) {
     draw(api);
 }
 
+static void sel_or_line_range(int *a, int *b) {
+    if (has_sel()) {
+        *a = sel_lo();
+        *b = sel_hi();
+        return;
+    }
+    {
+        int row;
+        int col;
+        cursor_to_row_col(&row, &col);
+        *a = line_index(row);
+        *b = *a + line_length(row);
+        if (*b < text_len && text[*b] == '\n') {
+            (*b)++;
+        }
+    }
+}
+
 static void copy_sel(fos_api_t *api) {
     int a;
     int b;
 
-    if (has_sel()) {
-        a = sel_lo();
-        b = sel_hi();
-    } else {
-        int row;
-        int col;
-        cursor_to_row_col(&row, &col);
-        a = line_index(row);
-        b = a + line_length(row);
-        if (b < text_len && text[b] == '\n') {
-            b++;
-        }
-    }
+    sel_or_line_range(&a, &b);
     if (api->clip_set) {
         api->clip_set(text + a, (size_t)(b - a));
     }
+}
+
+static void cut_sel(fos_api_t *api) {
+    int a;
+    int b;
+
+    sel_or_line_range(&a, &b);
+    if (api->clip_set) {
+        api->clip_set(text + a, (size_t)(b - a));
+    }
+    if (b > a) {
+        delete_range(a, b);
+    }
+    draw(api);
 }
 
 static void paste_clip(fos_api_t *api) {
@@ -937,6 +967,75 @@ static int prompt_save_as(fos_api_t *api) {
     return save_file(api);
 }
 
+static int file_drive(fos_api_t *api) {
+    if (filename[0] >= '0' && filename[0] <= '9' && filename[1] == ':') {
+        return filename[0] - '0';
+    }
+    if (api->get_drive) {
+        return api->get_drive();
+    }
+    return 0;
+}
+
+/* FAT32 can be written; exFAT (drive 1: in the default image) cannot. */
+static int theoretically_writable(fos_api_t *api) {
+    if (api->drive_writable) {
+        return api->drive_writable(file_drive(api));
+    }
+    return 1;
+}
+
+/* 1 = leave the editor, 0 = stay. */
+static int confirm_quit(fos_api_t *api) {
+    if (!modified || !theoretically_writable(api)) {
+        return 1;
+    }
+    status_bar(api, "Save changes?  Y save  N discard  Esc cancel");
+    if (api->set_cursor_visible) {
+        api->set_cursor_visible(0);
+    }
+    if (api->hit_clear) {
+        api->hit_clear();
+    }
+    if (api->hit_add) {
+        api->hit_add(15, status_row, 6, 1, FOS_HIT_Y);
+        api->hit_add(23, status_row, 9, 1, FOS_HIT_N);
+        api->hit_add(34, status_row, 10, 1, FOS_HIT_ESC);
+    }
+    for (;;) {
+        while (!api->has_key()) {
+            __asm__ volatile("pause");
+        }
+        fos_key_event_t ev = api->read_key();
+        if (ev.type == FOS_KEY_NONE) {
+            continue;
+        }
+        if (ev.type == FOS_KEY_CHAR && (ev.ch == 'y' || ev.ch == 'Y')) {
+            if (api->hit_clear) {
+                api->hit_clear();
+            }
+            if (filename[0] == 0) {
+                return prompt_save_as(api) == 0;
+            }
+            return save_file(api) == 0;
+        }
+        if (ev.type == FOS_KEY_CHAR && (ev.ch == 'n' || ev.ch == 'N')) {
+            if (api->hit_clear) {
+                api->hit_clear();
+            }
+            return 1;
+        }
+        if (ev.type == FOS_KEY_CHAR &&
+            (ev.ch == 27 || ev.ch == 3 || ev.ch == 24)) {
+            if (api->hit_clear) {
+                api->hit_clear();
+            }
+            draw(api);
+            return 0;
+        }
+    }
+}
+
 /* Pass the name through. vfs_resolve already joins cwd and parses 1:\file.
  * Prepending cwd here turned drive-qualified names into \1:\file. */
 static void normalize_path(char *path, const char *arg) {
@@ -1000,6 +1099,9 @@ void com_main(void) {
 
         if (ev.type == FOS_KEY_CHAR) {
             if (ev.ch == 24) { /* Ctrl+X */
+                if (!confirm_quit(api)) {
+                    continue;
+                }
                 break;
             }
             if (ev.ch == 19) { /* Ctrl+S */
@@ -1012,6 +1114,10 @@ void com_main(void) {
             }
             if (ev.ch == 3) { /* Ctrl+C */
                 copy_sel(api);
+                continue;
+            }
+            if (ev.ch == 11) { /* Ctrl+K */
+                cut_sel(api);
                 continue;
             }
             if (ev.ch == 22) { /* Ctrl+V */
@@ -1045,48 +1151,48 @@ void com_main(void) {
         }
 
         if (ev.type == FOS_KEY_DELETE) {
-            delete_char(api);
+            if (ev.mods & FOS_MOD_SHIFT) {
+                cut_sel(api);
+            } else {
+                delete_char(api);
+            }
             continue;
         }
 
-        if (ev.type == FOS_KEY_UP) {
-            move_up(api);
-            continue;
-        }
-
-        if (ev.type == FOS_KEY_DOWN) {
-            move_down(api);
-            continue;
-        }
-
-        if (ev.type == FOS_KEY_LEFT) {
-            move_left(api);
-            continue;
-        }
-
-        if (ev.type == FOS_KEY_RIGHT) {
-            move_right(api);
-            continue;
-        }
-
-        if (ev.type == FOS_KEY_HOME) {
-            move_home(api);
-            continue;
-        }
-
-        if (ev.type == FOS_KEY_END) {
-            move_end(api);
-            continue;
-        }
-
-        if (ev.type == FOS_KEY_PAGEUP) {
-            move_page(api, -1);
-            continue;
-        }
-
-        if (ev.type == FOS_KEY_PAGEDOWN) {
-            move_page(api, 1);
-            continue;
+        {
+            int shift = (ev.mods & FOS_MOD_SHIFT) != 0;
+            if (ev.type == FOS_KEY_UP) {
+                move_up(api, shift);
+                continue;
+            }
+            if (ev.type == FOS_KEY_DOWN) {
+                move_down(api, shift);
+                continue;
+            }
+            if (ev.type == FOS_KEY_LEFT) {
+                move_left(api, shift);
+                continue;
+            }
+            if (ev.type == FOS_KEY_RIGHT) {
+                move_right(api, shift);
+                continue;
+            }
+            if (ev.type == FOS_KEY_HOME) {
+                move_home(api, shift);
+                continue;
+            }
+            if (ev.type == FOS_KEY_END) {
+                move_end(api, shift);
+                continue;
+            }
+            if (ev.type == FOS_KEY_PAGEUP) {
+                move_page(api, -1, shift);
+                continue;
+            }
+            if (ev.type == FOS_KEY_PAGEDOWN) {
+                move_page(api, 1, shift);
+                continue;
+            }
         }
     }
 

@@ -49,6 +49,14 @@ CASES = [
     # Ctrl+A, Ctrl+C, End, X, Ctrl+V, Ctrl+S, Ctrl+X → HELLO / XHELLO
     ("edit CLIP.TXT", 25, 3.0, "\x01\x03\x1b[FX\x16\x13\x18", None),
     ("type CLIP.TXT", 10, None, None, "XHELLO"),
+    # Quit with unsaved changes: Y saves
+    ("echo QUITME > Q.TXT", 10, None, None, None),
+    ("edit Q.TXT", 25, 2.5, "Z\x18y", None),
+    ("type Q.TXT", 10, None, None, "ZQUITME"),
+    # Shift+Right x3, Ctrl+K cut, save, quit → leftover LO from HELLO
+    ("echo HELLO > CUT.TXT", 10, None, None, None),
+    ("edit CUT.TXT", 25, 2.5, "\x1b[1;2C\x1b[1;2C\x1b[1;2C\x0b\x13\x18", None),
+    ("type CUT.TXT", 10, None, None, "LO"),
     ("copy TST.TXT TST2.TXT", 15, None, None, None),
     ("type TST2.TXT", 10, None, None, "STREAMOK"),
     ("grep Flash README.TXT", 10, None, None, "Flash Operating System"),

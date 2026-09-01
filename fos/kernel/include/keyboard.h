@@ -20,9 +20,14 @@ typedef enum {
     KEY_PAGEDOWN
 } key_type_t;
 
+#define KEY_MOD_SHIFT 1u
+#define KEY_MOD_CTRL  2u
+#define KEY_MOD_ALT   4u
+
 typedef struct {
     key_type_t type;
     char       ch;
+    uint8_t    mods; /* KEY_MOD_* */
 } key_event_t;
 
 void keyboard_init(void);

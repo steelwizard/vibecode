@@ -61,8 +61,9 @@ static int shift_count;    /* both shift keys tracked (0..2) */
 static int caps_lock;
 static int ctrl_count;
 static int altgr_down;     /* right Alt, not left Alt (0x38 vs E0 38) */
-static int serial_esc_state; /* 0=normal, 1=ESC, 2=[/O, 3=digits before ~ */
+static int serial_esc_state; /* 0=normal, 1=ESC, 2=[/O, 3=param, 4=mod */
 static int serial_esc_num;
+static int serial_esc_mod;
 
 #define INJ_MAX 4096
 static key_type_t inj_type[INJ_MAX];
@@ -345,6 +346,7 @@ static void ps2_init_controller(void) {
     altgr_down = 0;
     serial_esc_state = 0;
     serial_esc_num = 0;
+    serial_esc_mod = 0;
 }
 
 void keyboard_init(void) {
@@ -352,6 +354,7 @@ void keyboard_init(void) {
     ps2_init_controller();
     serial_esc_state = 0;
     serial_esc_num = 0;
+    serial_esc_mod = 0;
     while (serial_has_byte()) {
         (void)serial_read_char();
     }
@@ -419,7 +422,7 @@ int keyboard_has_key(void) {
 }
 
 static key_event_t key_from_scancode(uint8_t sc) {
-    key_event_t ev = {KEY_NONE, 0};
+    key_event_t ev = {KEY_NONE, 0, 0};
 
     if (sc >= 128) {
         return ev;
@@ -443,11 +446,17 @@ static key_event_t key_from_scancode(uint8_t sc) {
         ev.type = KEY_CHAR;
         ev.ch = c;
     }
+    if (shift_count > 0) {
+        ev.mods |= KEY_MOD_SHIFT;
+    }
+    if (ctrl_count > 0) {
+        ev.mods |= KEY_MOD_CTRL;
+    }
     return ev;
 }
 
 static key_event_t ps2_read_event(void) {
-    key_event_t ev = {KEY_NONE, 0};
+    key_event_t ev = {KEY_NONE, 0, 0};
     uint8_t sc = inb(PS2_DATA);
 
     if (sc == 0xE0) {
@@ -485,37 +494,44 @@ static key_event_t ps2_read_event(void) {
         switch (sc) {
         case 0x48:
             ev.type = KEY_UP;
-            return ev;
+            break;
         case 0x50:
             ev.type = KEY_DOWN;
-            return ev;
+            break;
         case 0x4B:
             ev.type = KEY_LEFT;
-            return ev;
+            break;
         case 0x4D:
             ev.type = KEY_RIGHT;
-            return ev;
+            break;
         case 0x47:
             ev.type = KEY_HOME;
-            return ev;
+            break;
         case 0x4F:
             ev.type = KEY_END;
-            return ev;
+            break;
         case 0x49:
             ev.type = KEY_PAGEUP;
-            return ev;
+            break;
         case 0x51:
             ev.type = KEY_PAGEDOWN;
-            return ev;
+            break;
         case 0x53:
             ev.type = KEY_DELETE;
-            return ev;
+            break;
         case 0x56:
             /* ISO extra key: < > | on DE, \ | on US ISO */
             return key_from_scancode(0x56);
         default:
             return ev;
         }
+        if (shift_count > 0) {
+            ev.mods |= KEY_MOD_SHIFT;
+        }
+        if (ctrl_count > 0) {
+            ev.mods |= KEY_MOD_CTRL;
+        }
+        return ev;
     }
 
     if (sc == 0x1D) {
@@ -551,10 +567,69 @@ static key_event_t ps2_read_event(void) {
 static void serial_esc_reset(void) {
     serial_esc_state = 0;
     serial_esc_num = 0;
+    serial_esc_mod = 0;
+}
+
+static void serial_apply_mod(key_event_t *ev) {
+    int bits;
+
+    if (serial_esc_mod < 2) {
+        return;
+    }
+    bits = serial_esc_mod - 1;
+    if (bits & 1) {
+        ev->mods |= KEY_MOD_SHIFT;
+    }
+    if (bits & 2) {
+        ev->mods |= KEY_MOD_ALT;
+    }
+    if (bits & 4) {
+        ev->mods |= KEY_MOD_CTRL;
+    }
+}
+
+static key_event_t serial_finish_csi(char final) {
+    key_event_t ev = {KEY_NONE, 0, 0};
+    int p1 = serial_esc_num;
+
+    serial_apply_mod(&ev);
+    serial_esc_reset();
+    if (final == '~') {
+        if (p1 == 1 || p1 == 7) {
+            ev.type = KEY_HOME;
+        } else if (p1 == 3) {
+            ev.type = KEY_DELETE;
+        } else if (p1 == 4 || p1 == 8) {
+            ev.type = KEY_END;
+        } else if (p1 == 5) {
+            ev.type = KEY_PAGEUP;
+        } else if (p1 == 6) {
+            ev.type = KEY_PAGEDOWN;
+        }
+        return ev;
+    }
+    if (final >= 'a' && final <= 'z') {
+        ev.mods |= KEY_MOD_SHIFT;
+        final = (char)(final - 'a' + 'A');
+    }
+    if (final == 'A') {
+        ev.type = KEY_UP;
+    } else if (final == 'B') {
+        ev.type = KEY_DOWN;
+    } else if (final == 'C') {
+        ev.type = KEY_RIGHT;
+    } else if (final == 'D') {
+        ev.type = KEY_LEFT;
+    } else if (final == 'H') {
+        ev.type = KEY_HOME;
+    } else if (final == 'F') {
+        ev.type = KEY_END;
+    }
+    return ev;
 }
 
 static key_event_t serial_read_event(void) {
-    key_event_t ev = {KEY_NONE, 0};
+    key_event_t ev = {KEY_NONE, 0, 0};
     char c = serial_read_char();
 
     if (c == '\r') {
@@ -584,23 +659,11 @@ static key_event_t serial_read_event(void) {
             serial_esc_state = 3;
             return ev;
         }
-        serial_esc_reset();
-        if (c == 'A') {
-            ev.type = KEY_UP;
-        } else if (c == 'B') {
-            ev.type = KEY_DOWN;
-        } else if (c == 'C') {
-            ev.type = KEY_RIGHT;
-        } else if (c == 'D') {
-            ev.type = KEY_LEFT;
-        } else if (c == 'H') {
-            ev.type = KEY_HOME;
-        } else if (c == 'F') {
-            ev.type = KEY_END;
-        } else {
-            goto normal_char;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+            return serial_finish_csi(c);
         }
-        return ev;
+        serial_esc_reset();
+        goto normal_char;
     }
 
     if (serial_esc_state == 3) {
@@ -608,17 +671,29 @@ static key_event_t serial_read_event(void) {
             serial_esc_num = serial_esc_num * 10 + (c - '0');
             return ev;
         }
-        if (c == '~') {
-            int num = serial_esc_num;
-            serial_esc_reset();
-            if (num == 3) {
-                ev.type = KEY_DELETE;
-            } else if (num == 5) {
-                ev.type = KEY_PAGEUP;
-            } else if (num == 6) {
-                ev.type = KEY_PAGEDOWN;
-            }
+        if (c == ';') {
+            serial_esc_mod = 0;
+            serial_esc_state = 4;
             return ev;
+        }
+        if (c == '~' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+            return serial_finish_csi(c);
+        }
+        serial_esc_reset();
+        goto normal_char;
+    }
+
+    if (serial_esc_state == 4) {
+        if (c >= '0' && c <= '9') {
+            serial_esc_mod = serial_esc_mod * 10 + (c - '0');
+            return ev;
+        }
+        if (c == ';') {
+            /* Ignore extra params (xterm can send more than two). */
+            return ev;
+        }
+        if (c == '~' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+            return serial_finish_csi(c);
         }
         serial_esc_reset();
         goto normal_char;
@@ -665,6 +740,7 @@ key_event_t keyboard_read_event(void) {
         key_event_t ev;
         ev.type = inj_type[inj_r];
         ev.ch = inj_ch[inj_r];
+        ev.mods = 0;
         inj_r = (inj_r + 1) % INJ_MAX;
         inj_n--;
         return ev;
@@ -677,7 +753,7 @@ key_event_t keyboard_read_event(void) {
     if (ps2_kbd_ready()) {
         return ps2_read_event();
     }
-    return (key_event_t){KEY_NONE, 0};
+    return (key_event_t){KEY_NONE, 0, 0};
 }
 
 char keyboard_read(void) {
