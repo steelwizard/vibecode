@@ -18,6 +18,8 @@ struct Col {
     unsigned long pix;
 };
 
+enum class Snap { Off, Left, Right, Top, TL, TR, BL, BR };
+
 struct Client {
     Window frame = 0;
     Window win = 0;
@@ -25,6 +27,8 @@ struct Client {
     int rx = 0, ry = 0, rw = 0, rh = 0;
     int last_mon = 0;
     bool maxed = false;
+    bool tiled = false;
+    Snap snap = Snap::Off;
     bool iconic = false;
     int ignore_unmap = 0;
     std::string name;
@@ -73,6 +77,12 @@ extern MenuItem kMenu[];
 extern const int kMenuN;
 int menu_height();
 
+struct WallChoice {
+    std::string name;
+    int pattern = 0;
+    std::string file;
+};
+
 struct WM {
     Display *dpy = nullptr;
     int screen = 0;
@@ -97,13 +107,28 @@ struct WM {
     Atom net_number_desktops = 0, net_current_desktop = 0, net_desktop_geometry = 0;
     Atom net_wm_state_hidden = 0, net_wm_state_maxv = 0, net_wm_state_maxh = 0;
     Atom net_active_window = 0, motif_hints = 0;
+    Atom net_system_tray = 0, net_system_tray_opcode = 0, net_system_tray_orientation = 0;
+    Atom net_system_tray_visual = 0, xembed = 0, xembed_info = 0, manager = 0;
 
     Window checkwin = 0;
-    Window rundlg = 0, shutdlg = 0;
-    bool run_open = false, shut_open = false;
+    Window rundlg = 0, shutdlg = 0, setdlg = 0, snapwin = 0, traywin = 0;
+    bool run_open = false, shut_open = false, set_open = false;
     int dialog_mon = 0;
     std::string run_text;
     int run_cursor = 0;
+    std::vector<Window> tray_icons;
+    unsigned super_mask = 0;
+    bool super_held = false;
+    bool super_chord = false;
+    bool volicon_launched = false;
+
+    int scheme_i = 0;
+    int wall_i = 0;
+    int set_save_scheme = 0;
+    int set_save_wall = 0;
+    std::vector<WallChoice> walls;
+    Pixmap wall_tile = 0;
+    int wall_tw = 0, wall_th = 0;
 
     std::vector<Monitor> mons;
     std::vector<std::unique_ptr<Client>> clients;
@@ -149,6 +174,7 @@ struct WM {
     int monitor_for(Client *c);
     Monitor *mon_by_window(Window w);
     int mon_index(const Monitor *m);
+    Monitor *primary_mon();
 
     bool is_internal(Window w);
     Client *find_client(Window w);
@@ -163,6 +189,14 @@ struct WM {
     void minimize(Client *c);
     void restore(Client *c);
     void maximize_toggle(Client *c);
+    void remember_float(Client *c);
+    void float_for_drag(Client *c, int px, int py);
+    Snap snap_at(int px, int py);
+    void snap_rect(Snap s, int px, int py, int &x, int &y, int &w, int &h);
+    void apply_snap(Client *c, Snap s, int px, int py);
+    void show_snap_preview(Snap s, int px, int py);
+    void hide_snap_preview();
+    void draw_snap_preview();
     void set_wm_state(Client *c, long state);
     void apply_geom(Client *c);
     void send_configure(Client *c);
@@ -179,10 +213,40 @@ struct WM {
     void draw_caption_btn(Drawable d, int x, int y, int kind, bool maxed);
     void draw_desktop(Monitor &m);
     void draw_taskbar(Monitor &m);
+    void draw_clock(Drawable d, int x, int y, int w, int h);
+    void draw_tray();
     void draw_startmenu(Monitor &m);
     void draw_submenu(Monitor &m);
     void draw_rundlg();
     void draw_shutdlg();
+    void draw_setdlg();
+    void draw_dlg_btn(Drawable d, int x, int y, int w, int h, const char *lab);
+    void draw_listbox(Drawable d, int x, int y, int w, int h, int sel, int n, const char *(*label)(int));
+    void tile_wall(Drawable d, int x, int y, int w, int h);
+
+    int tray_width(const Monitor &m);
+    void tray_create();
+    void tray_stash();
+    void tray_claim();
+    void tray_layout();
+    void tray_dock(Window w);
+    void tray_undock(Window w);
+    bool is_tray_icon(Window w);
+    void tray_send_xembed(Window w, long msg, long detail, long d1, long d2);
+
+    unsigned mod_mask_for(KeySym ks);
+    void grab_key(KeySym ks, unsigned mod);
+    void close_run();
+    void close_settings(bool revert);
+    void open_settings(int mi);
+    void rebuild_walls();
+    void make_wall_tile();
+    void apply_scheme(int i);
+    void apply_wall(int i);
+    void refresh_chrome();
+    void save_display();
+    void load_display();
+    int pointer_mon();
 
     Hit hit_frame(Client *c, int x, int y);
     Cursor cursor_for(Hit h);

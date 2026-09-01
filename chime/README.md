@@ -42,4 +42,4 @@ The live image uses **Xfbdev** (one framebuffer). For real multi-head, run `./ch
 | Alt+F4 | close |
 | Ctrl+Esc / Super | Start menu on the pointer's monitor |
 
-Start menu: Programs (MS-DOS Prompt / Editor / Cabinet), Run, Shut Down.
+Start menu: Programs (Terminal / Editor / Cabinet), Run, Shut Down.

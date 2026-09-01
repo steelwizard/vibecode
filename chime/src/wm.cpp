@@ -4,10 +4,16 @@
 
 #include <algorithm>
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <dirent.h>
+#include <strings.h>
+#include <string>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static WM *g_wm;
@@ -76,6 +82,15 @@ void WM::intern_atoms()
     net_wm_state_maxh = XInternAtom(dpy, "_NET_WM_STATE_MAXIMIZED_HORZ", False);
     net_active_window = net_active;
     motif_hints = XInternAtom(dpy, "_MOTIF_WM_HINTS", False);
+    char tray_sel[32];
+    std::snprintf(tray_sel, sizeof(tray_sel), "_NET_SYSTEM_TRAY_S%d", screen);
+    net_system_tray = XInternAtom(dpy, tray_sel, False);
+    net_system_tray_opcode = XInternAtom(dpy, "_NET_SYSTEM_TRAY_OPCODE", False);
+    net_system_tray_orientation = XInternAtom(dpy, "_NET_SYSTEM_TRAY_ORIENTATION", False);
+    net_system_tray_visual = XInternAtom(dpy, "_NET_SYSTEM_TRAY_VISUAL", False);
+    xembed = XInternAtom(dpy, "_XEMBED", False);
+    xembed_info = XInternAtom(dpy, "_XEMBED_INFO", False);
+    manager = XInternAtom(dpy, "MANAGER", False);
 }
 
 void WM::ewmh_init()
@@ -284,20 +299,18 @@ void WM::sync_monitors()
         return;
     }
     close_menus();
+    tray_stash();
     for (auto &m : mons)
         destroy_shell(m);
     mons = std::move(geoms);
     for (auto &m : mons)
         create_shell(m);
     for (auto &c : clients) {
-        if (c->maxed) {
-            int mi = monitor_at(c->x + c->w / 2, c->y + c->h / 2);
-            Monitor &mon = mons[mi];
-            c->x = mon.x;
-            c->y = mon.y;
-            c->w = mon.w;
-            c->h = mon.h - w95::kTaskbarH;
-            apply_geom(c.get());
+        if (c->maxed || c->tiled) {
+            Snap s = c->maxed ? Snap::Top : c->snap;
+            if (s == Snap::Off)
+                s = Snap::Top;
+            apply_snap(c.get(), s, c->x + c->w / 2, c->y + 8);
         } else {
             int mi = monitor_at(c->x + 16, c->y + 16);
             Monitor &mon = mons[mi];
@@ -314,6 +327,7 @@ void WM::sync_monitors()
         c->last_mon = monitor_for(c.get());
     }
     restack_shell();
+    tray_create();
     for (auto &m : mons) {
         draw_desktop(m);
         draw_taskbar(m);
@@ -339,6 +353,8 @@ void WM::restack_shell()
         XRaiseWindow(dpy, rundlg);
     if (shut_open)
         XRaiseWindow(dpy, shutdlg);
+    if (set_open)
+        XRaiseWindow(dpy, setdlg);
 }
 
 int WM::monitor_at(int x, int y)
@@ -388,11 +404,172 @@ int WM::mon_index(const Monitor *m)
     return 0;
 }
 
+Monitor *WM::primary_mon()
+{
+    if (mons.empty())
+        return nullptr;
+    for (auto &m : mons)
+        if (m.primary)
+            return &m;
+    return &mons[0];
+}
+
+int WM::pointer_mon()
+{
+    Window rr, cr;
+    int rx, ry, wx, wy;
+    unsigned mask;
+    XQueryPointer(dpy, root, &rr, &cr, &rx, &ry, &wx, &wy, &mask);
+    return monitor_at(rx, ry);
+}
+
+int WM::tray_width(const Monitor &m)
+{
+    int w = w95::kClockW;
+    if (m.primary && !tray_icons.empty())
+        w += 4 + (int)tray_icons.size() * w95::kTraySlot;
+    return w;
+}
+
+bool WM::is_tray_icon(Window w)
+{
+    for (Window t : tray_icons)
+        if (t == w)
+            return true;
+    return false;
+}
+
+void WM::tray_send_xembed(Window w, long msg, long detail, long d1, long d2)
+{
+    XEvent ev{};
+    ev.xclient.type = ClientMessage;
+    ev.xclient.window = w;
+    ev.xclient.message_type = xembed;
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = CurrentTime;
+    ev.xclient.data.l[1] = msg;
+    ev.xclient.data.l[2] = detail;
+    ev.xclient.data.l[3] = d1;
+    ev.xclient.data.l[4] = d2;
+    XSendEvent(dpy, w, False, NoEventMask, &ev);
+}
+
+void WM::tray_stash()
+{
+    for (Window w : tray_icons) {
+        XSelectInput(dpy, w, StructureNotifyMask);
+        XReparentWindow(dpy, w, root, 0, 0);
+        XUnmapWindow(dpy, w);
+    }
+    traywin = 0;
+}
+
+void WM::tray_claim()
+{
+    if (!traywin)
+        return;
+    long orient = 0;
+    XChangeProperty(dpy, traywin, net_system_tray_orientation, XA_CARDINAL, 32, PropModeReplace,
+                    (unsigned char *)&orient, 1);
+    VisualID vid = XVisualIDFromVisual(vis);
+    XChangeProperty(dpy, traywin, net_system_tray_visual, XA_VISUALID, 32, PropModeReplace, (unsigned char *)&vid, 1);
+    XSetSelectionOwner(dpy, net_system_tray, traywin, CurrentTime);
+    if (XGetSelectionOwner(dpy, net_system_tray) != traywin)
+        return;
+    XEvent ev{};
+    ev.xclient.type = ClientMessage;
+    ev.xclient.window = root;
+    ev.xclient.message_type = manager;
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = CurrentTime;
+    ev.xclient.data.l[1] = (long)net_system_tray;
+    ev.xclient.data.l[2] = (long)traywin;
+    XSendEvent(dpy, root, False, StructureNotifyMask, &ev);
+    if (!volicon_launched) {
+        volicon_launched = true;
+        launch("volicon || true");
+    }
+}
+
+void WM::tray_create()
+{
+    Monitor *p = primary_mon();
+    if (!p || !p->taskbar)
+        return;
+    int tw = std::max(w95::kClockW, tray_width(*p));
+    int th = w95::kTaskbarH - 6;
+    int x = p->w - tw - 4;
+    XSetWindowAttributes swa{};
+    swa.background_pixel = face.pix;
+    swa.event_mask = ExposureMask | SubstructureNotifyMask | SubstructureRedirectMask;
+    swa.colormap = cmap;
+    swa.border_pixel = 0;
+    swa.cursor = cur_left;
+    traywin = XCreateWindow(dpy, p->taskbar, x, 3, (unsigned)tw, (unsigned)th, 0, depth, InputOutput, vis,
+                            CWBackPixel | CWEventMask | CWColormap | CWBorderPixel | CWCursor, &swa);
+    XMapWindow(dpy, traywin);
+    for (Window w : tray_icons) {
+        XReparentWindow(dpy, w, traywin, 0, 0);
+        XMapWindow(dpy, w);
+    }
+    tray_claim();
+    tray_layout();
+}
+
+void WM::tray_layout()
+{
+    Monitor *p = primary_mon();
+    if (!p || !traywin || !p->taskbar)
+        return;
+    int tw = tray_width(*p);
+    int th = w95::kTaskbarH - 6;
+    int x = p->w - tw - 4;
+    XMoveResizeWindow(dpy, traywin, x, 3, (unsigned)tw, (unsigned)th);
+    int ix = 3;
+    int iy = (th - w95::kTrayIcon) / 2;
+    for (Window w : tray_icons) {
+        XMoveResizeWindow(dpy, w, ix, iy, w95::kTrayIcon, w95::kTrayIcon);
+        XMapWindow(dpy, w);
+        ix += w95::kTraySlot;
+    }
+    draw_tray();
+    draw_taskbar(*p);
+}
+
+void WM::tray_dock(Window w)
+{
+    if (!w || w == traywin || is_internal(w) || is_tray_icon(w))
+        return;
+    if (Client *c = find_client(w))
+        unmanage(c, false);
+    if (!traywin)
+        tray_create();
+    if (!traywin)
+        return;
+    XSelectInput(dpy, w, StructureNotifyMask | PropertyChangeMask);
+    XAddToSaveSet(dpy, w);
+    XSetWindowBorderWidth(dpy, w, 0);
+    XReparentWindow(dpy, w, traywin, 0, 0);
+    XMapRaised(dpy, w);
+    tray_send_xembed(w, 0, 0, (long)traywin, 0);
+    tray_icons.push_back(w);
+    tray_layout();
+}
+
+void WM::tray_undock(Window w)
+{
+    auto it = std::find(tray_icons.begin(), tray_icons.end(), w);
+    if (it == tray_icons.end())
+        return;
+    tray_icons.erase(it);
+    tray_layout();
+}
+
 bool WM::is_internal(Window w)
 {
-    if (w == rundlg || w == shutdlg || w == checkwin || w == root)
+    if (w == rundlg || w == shutdlg || w == setdlg || w == checkwin || w == snapwin || w == traywin || w == root)
         return true;
-    return mon_by_window(w) != nullptr;
+    return mon_by_window(w) != nullptr || is_tray_icon(w);
 }
 
 Client *WM::find_client(Window w)
@@ -462,7 +639,7 @@ void WM::apply_geom(Client *c)
 
 void WM::manage(Window w)
 {
-    if (is_internal(w) || find_client(w) || find_frame(w))
+    if (is_internal(w) || find_client(w) || find_frame(w) || is_tray_icon(w) || w == traywin)
         return;
     XWindowAttributes wa{};
     if (!XGetWindowAttributes(dpy, w, &wa))
@@ -521,6 +698,7 @@ void WM::unmanage(Client *c, bool destroyed)
     if (focused == c)
         focused = nullptr;
     if (drag_c == c) {
+        hide_snap_preview();
         drag = DragMode::Off;
         drag_c = nullptr;
         XUngrabPointer(dpy, CurrentTime);
@@ -557,6 +735,13 @@ void WM::focus(Client *c)
     for (auto &m : mons)
         draw_taskbar(m);
     ewmh_update();
+    if (run_open) {
+        XSetInputFocus(dpy, rundlg, RevertToPointerRoot, CurrentTime);
+        XGrabKeyboard(dpy, rundlg, True, GrabModeAsync, GrabModeAsync, CurrentTime);
+    } else if (set_open) {
+        XSetInputFocus(dpy, setdlg, RevertToPointerRoot, CurrentTime);
+        XGrabKeyboard(dpy, setdlg, True, GrabModeAsync, GrabModeAsync, CurrentTime);
+    }
 }
 
 void WM::raise_client(Client *c)
@@ -603,31 +788,199 @@ void WM::restore(Client *c)
     focus(c);
 }
 
+void WM::remember_float(Client *c)
+{
+    if (!c || c->maxed || c->tiled)
+        return;
+    c->rx = c->x;
+    c->ry = c->y;
+    c->rw = c->w;
+    c->rh = c->h;
+}
+
+void WM::float_for_drag(Client *c, int px, int py)
+{
+    if (!c || (!c->maxed && !c->tiled))
+        return;
+    int rw = c->rw > 80 ? c->rw : 320;
+    int rh = c->rh > 50 ? c->rh : 240;
+    int relx = rw / 2;
+    if (c->w > 16) {
+        relx = px - c->x;
+        if (relx < 0)
+            relx = 0;
+        if (relx > c->w)
+            relx = c->w;
+        relx = (int)((long)relx * rw / c->w);
+    }
+    c->w = rw;
+    c->h = rh;
+    c->x = px - relx;
+    c->y = py - (w95::kFrameB + w95::kTitleH / 2);
+    c->maxed = false;
+    c->tiled = false;
+    c->snap = Snap::Off;
+    apply_geom(c);
+}
+
+Snap WM::snap_at(int px, int py)
+{
+    if (mons.empty())
+        return Snap::Off;
+    Monitor &m = mons[monitor_at(px, py)];
+    int x = m.x, y = m.y, w = m.w, h = m.h - w95::kTaskbarH;
+    const int E = w95::kSnapEdge;
+    bool L = px < x + E;
+    bool R = px >= x + w - E;
+    bool T = py < y + E;
+    bool B = py >= y + h - E || py >= m.y + m.h - w95::kTaskbarH;
+    if (L && T)
+        return Snap::TL;
+    if (R && T)
+        return Snap::TR;
+    if (L && B)
+        return Snap::BL;
+    if (R && B)
+        return Snap::BR;
+    if (L)
+        return Snap::Left;
+    if (R)
+        return Snap::Right;
+    if (T)
+        return Snap::Top;
+    return Snap::Off;
+}
+
+void WM::snap_rect(Snap s, int px, int py, int &x, int &y, int &w, int &h)
+{
+    Monitor &m = mons[monitor_at(px, py)];
+    x = m.x;
+    y = m.y;
+    w = m.w;
+    h = m.h - w95::kTaskbarH;
+    int hw = w / 2;
+    int hh = h / 2;
+    switch (s) {
+    case Snap::Left:
+        w = hw;
+        break;
+    case Snap::Right:
+        x += hw;
+        w -= hw;
+        break;
+    case Snap::TL:
+        w = hw;
+        h = hh;
+        break;
+    case Snap::TR:
+        x += hw;
+        w -= hw;
+        h = hh;
+        break;
+    case Snap::BL:
+        y += hh;
+        w = hw;
+        h -= hh;
+        break;
+    case Snap::BR:
+        x += hw;
+        y += hh;
+        w -= hw;
+        h -= hh;
+        break;
+    case Snap::Top:
+    case Snap::Off:
+        break;
+    }
+}
+
+void WM::apply_snap(Client *c, Snap s, int px, int py)
+{
+    if (!c || s == Snap::Off || mons.empty())
+        return;
+    remember_float(c);
+    int x, y, w, h;
+    snap_rect(s, px, py, x, y, w, h);
+    c->x = x;
+    c->y = y;
+    c->w = w;
+    c->h = h;
+    c->snap = s;
+    c->maxed = (s == Snap::Top);
+    c->tiled = (s != Snap::Top);
+    apply_geom(c);
+    c->last_mon = monitor_for(c);
+    for (auto &mon : mons)
+        draw_taskbar(mon);
+}
+
+void WM::show_snap_preview(Snap s, int px, int py)
+{
+    if (!snapwin || s == Snap::Off) {
+        hide_snap_preview();
+        return;
+    }
+    int x, y, w, h;
+    snap_rect(s, px, py, x, y, w, h);
+    if (w < 8)
+        w = 8;
+    if (h < 8)
+        h = 8;
+    XMoveResizeWindow(dpy, snapwin, x, y, (unsigned)w, (unsigned)h);
+    XMapWindow(dpy, snapwin);
+    XRaiseWindow(dpy, snapwin);
+    if (drag_c)
+        XRaiseWindow(dpy, drag_c->frame);
+    for (auto &m : mons)
+        if (m.taskbar)
+            XRaiseWindow(dpy, m.taskbar);
+    draw_snap_preview();
+}
+
+void WM::hide_snap_preview()
+{
+    if (snapwin)
+        XUnmapWindow(dpy, snapwin);
+}
+
+void WM::draw_snap_preview()
+{
+    if (!snapwin)
+        return;
+    XWindowAttributes wa{};
+    if (!XGetWindowAttributes(dpy, snapwin, &wa) || wa.map_state == IsUnmapped)
+        return;
+    int w = wa.width, h = wa.height;
+    fill(snapwin, 0, 0, w, h, title.pix);
+    bevel(snapwin, 0, 0, w, h, true);
+    if (w > 16 && h > 16) {
+        fill(snapwin, 4, 4, w - 8, h - 8, face.pix);
+        bevel(snapwin, 4, 4, w - 8, h - 8, false);
+        fill(snapwin, 6, 6, w - 12, w95::kTitleH, title.pix);
+    }
+}
+
 void WM::maximize_toggle(Client *c)
 {
     if (!c)
         return;
-    int mi = monitor_for(c);
-    Monitor &m = mons[mi];
-    if (!c->maxed) {
-        c->rx = c->x;
-        c->ry = c->y;
-        c->rw = c->w;
-        c->rh = c->h;
-        c->x = m.x;
-        c->y = m.y;
-        c->w = m.w;
-        c->h = m.h - w95::kTaskbarH;
-        c->maxed = true;
-    } else {
+    if (c->maxed) {
         c->x = c->rx;
         c->y = c->ry;
         c->w = c->rw;
         c->h = c->rh;
         c->maxed = false;
+        c->tiled = false;
+        c->snap = Snap::Off;
+        apply_geom(c);
+        c->last_mon = monitor_for(c);
+    } else {
+        Window rr, cr;
+        int px, py, wx, wy;
+        unsigned mask;
+        XQueryPointer(dpy, root, &rr, &cr, &px, &py, &wx, &wy, &mask);
+        apply_snap(c, Snap::Top, px, py);
     }
-    apply_geom(c);
-    c->last_mon = mi;
     for (auto &mon : mons)
         draw_taskbar(mon);
 }
@@ -732,19 +1085,34 @@ void WM::open_start(Monitor &m)
     draw_taskbar(m);
 }
 
+void WM::close_run()
+{
+    if (!run_open)
+        return;
+    run_open = false;
+    XUngrabKeyboard(dpy, CurrentTime);
+    XUnmapWindow(dpy, rundlg);
+}
+
 void WM::open_run(int mi)
 {
     close_menus();
+    if (mons.empty())
+        return;
+    if (mi < 0 || mi >= (int)mons.size())
+        mi = 0;
     dialog_mon = mi;
     Monitor &m = mons[mi];
-    int w = 380, h = 148;
+    int w = w95::kRunW, h = w95::kRunH;
     int x = m.x + (m.w - w) / 2;
     int y = m.y + (m.h - w95::kTaskbarH - h) / 3;
     XMoveResizeWindow(dpy, rundlg, x, y, (unsigned)w, (unsigned)h);
+    if (!run_open)
+        run_text.clear();
     run_open = true;
-    run_text.clear();
     XMapRaised(dpy, rundlg);
     XSetInputFocus(dpy, rundlg, RevertToPointerRoot, CurrentTime);
+    XGrabKeyboard(dpy, rundlg, True, GrabModeAsync, GrabModeAsync, CurrentTime);
     draw_rundlg();
 }
 
@@ -760,6 +1128,304 @@ void WM::open_shut(int mi)
     shut_open = true;
     XMapRaised(dpy, shutdlg);
     draw_shutdlg();
+}
+
+static void add_wall_dir(std::vector<WallChoice> &walls, const char *dir)
+{
+    DIR *d = opendir(dir);
+    if (!d)
+        return;
+    while (dirent *e = readdir(d)) {
+        const char *n = e->d_name;
+        size_t len = strlen(n);
+        if (len < 5)
+            continue;
+        const char *ext = n + len - 4;
+        if (strcasecmp(ext, ".ppm") != 0 && strcasecmp(ext, ".bmp") != 0)
+            continue;
+        WallChoice w;
+        w.name = n;
+        w.pattern = 0;
+        w.file = std::string(dir) + "/" + n;
+        walls.push_back(std::move(w));
+    }
+    closedir(d);
+}
+
+void WM::rebuild_walls()
+{
+    walls.clear();
+    const char *pats[] = {"(None)", "Bricks", "Dots", "Weave", "Waves", "Checker"};
+    for (int i = 0; i < 6; i++) {
+        WallChoice w;
+        w.name = pats[i];
+        w.pattern = i;
+        walls.push_back(w);
+    }
+    add_wall_dir(walls, "/opt/chime/wallpapers");
+    const char *home = getenv("HOME");
+    if (home && *home) {
+        std::string p = std::string(home) + "/.chime/wallpapers";
+        add_wall_dir(walls, p.c_str());
+    }
+}
+
+void WM::make_wall_tile()
+{
+    if (wall_tile) {
+        XFreePixmap(dpy, wall_tile);
+        wall_tile = 0;
+    }
+    wall_tw = wall_th = 0;
+    if (wall_i < 0 || wall_i >= (int)walls.size())
+        return;
+    const WallChoice &W = walls[wall_i];
+    if (!W.file.empty()) {
+        FILE *f = fopen(W.file.c_str(), "rb");
+        if (!f)
+            return;
+        int w = 0, h = 0, maxv = 0;
+        char mag[3] = {};
+        if (fread(mag, 1, 2, f) != 2 || mag[0] != 'P' || mag[1] != '6') {
+            fclose(f);
+            return;
+        }
+        int c;
+        auto skip = [&]() {
+            do {
+                c = fgetc(f);
+                if (c == '#')
+                    while (c != '\n' && c != EOF)
+                        c = fgetc(f);
+            } while (c == ' ' || c == '\n' || c == '\t' || c == '\r');
+            ungetc(c, f);
+        };
+        skip();
+        if (fscanf(f, "%d", &w) != 1) {
+            fclose(f);
+            return;
+        }
+        skip();
+        if (fscanf(f, "%d", &h) != 1) {
+            fclose(f);
+            return;
+        }
+        skip();
+        if (fscanf(f, "%d", &maxv) != 1 || w < 1 || h < 1 || w > 2048 || h > 2048) {
+            fclose(f);
+            return;
+        }
+        fgetc(f);
+        wall_tile = XCreatePixmap(dpy, root, (unsigned)w, (unsigned)h, (unsigned)depth);
+        wall_tw = w;
+        wall_th = h;
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int r = fgetc(f), g = fgetc(f), b = fgetc(f);
+                if (r < 0)
+                    r = 0;
+                XSetForeground(dpy, gc, alloc_rgb({(uint8_t)r, (uint8_t)g, (uint8_t)b}));
+                XDrawPoint(dpy, wall_tile, gc, x, y);
+            }
+        }
+        fclose(f);
+        return;
+    }
+    if (W.pattern <= 0)
+        return;
+    wall_tw = wall_th = 32;
+    wall_tile = XCreatePixmap(dpy, root, 32, 32, (unsigned)depth);
+    fill(wall_tile, 0, 0, 32, 32, desktop.pix);
+    if (W.pattern == 1) {
+        XSetForeground(dpy, gc, lo.pix);
+        for (int y = 0; y < 32; y += 8) {
+            XDrawLine(dpy, wall_tile, gc, 0, y, 31, y);
+            int off = (y / 8) & 1 ? 16 : 0;
+            XDrawLine(dpy, wall_tile, gc, off, y, off, y + 7);
+        }
+        XSetForeground(dpy, gc, hi.pix);
+        for (int y = 1; y < 32; y += 8)
+            XDrawLine(dpy, wall_tile, gc, 0, y, 31, y);
+    } else if (W.pattern == 2) {
+        XSetForeground(dpy, gc, dk.pix);
+        for (int y = 2; y < 32; y += 4)
+            for (int x = 2; x < 32; x += 4)
+                XDrawPoint(dpy, wall_tile, gc, x, y);
+    } else if (W.pattern == 3) {
+        XSetForeground(dpy, gc, lo.pix);
+        for (int i = -32; i < 32; i += 4)
+            XDrawLine(dpy, wall_tile, gc, i, 0, i + 32, 32);
+        XSetForeground(dpy, gc, hi.pix);
+        for (int i = -30; i < 32; i += 4)
+            XDrawLine(dpy, wall_tile, gc, i, 0, i + 32, 32);
+    } else if (W.pattern == 4) {
+        XSetForeground(dpy, gc, title.pix);
+        for (int y = 0; y < 32; y++) {
+            int x = 16 + (int)((y % 16 < 8 ? y % 8 : 8 - (y % 8)) * 1.5);
+            XDrawPoint(dpy, wall_tile, gc, x, y);
+            XDrawPoint(dpy, wall_tile, gc, x + 1, y);
+        }
+    } else if (W.pattern == 5) {
+        for (int y = 0; y < 32; y += 8)
+            for (int x = 0; x < 32; x += 8)
+                if (((x / 8) + (y / 8)) & 1)
+                    fill(wall_tile, x, y, 8, 8, lo.pix);
+    }
+}
+
+void WM::apply_scheme(int i)
+{
+    if (i < 0 || i >= w95::kSchemeN)
+        i = 0;
+    scheme_i = i;
+    const w95::Scheme &s = w95::kSchemes[i];
+    desktop.pix = alloc_rgb(s.desktop);
+    face.pix = alloc_rgb(s.face);
+    hi.pix = alloc_rgb(s.hi);
+    lo.pix = alloc_rgb(s.lo);
+    dk.pix = alloc_rgb(s.dk);
+    title.pix = alloc_rgb(s.title);
+    title_in.pix = alloc_rgb(s.title_in);
+    fg.pix = alloc_rgb(s.text);
+    field.pix = alloc_rgb(s.field);
+    banner.pix = alloc_rgb(s.banner);
+    make_wall_tile();
+    refresh_chrome();
+}
+
+void WM::apply_wall(int i)
+{
+    if (walls.empty())
+        rebuild_walls();
+    if (i < 0 || i >= (int)walls.size())
+        i = 0;
+    wall_i = i;
+    make_wall_tile();
+    refresh_chrome();
+}
+
+void WM::refresh_chrome()
+{
+    if (!dpy)
+        return;
+    XSetWindowBackground(dpy, root, desktop.pix);
+    if (rundlg)
+        XSetWindowBackground(dpy, rundlg, face.pix);
+    if (shutdlg)
+        XSetWindowBackground(dpy, shutdlg, face.pix);
+    if (setdlg)
+        XSetWindowBackground(dpy, setdlg, face.pix);
+    if (traywin)
+        XSetWindowBackground(dpy, traywin, face.pix);
+    for (auto &m : mons) {
+        if (m.desktop)
+            XSetWindowBackground(dpy, m.desktop, desktop.pix);
+        if (m.taskbar)
+            XSetWindowBackground(dpy, m.taskbar, face.pix);
+        if (m.startmenu)
+            XSetWindowBackground(dpy, m.startmenu, face.pix);
+        if (m.submenu)
+            XSetWindowBackground(dpy, m.submenu, face.pix);
+        if (m.desktop)
+            draw_desktop(m);
+        if (m.taskbar)
+            draw_taskbar(m);
+    }
+    for (auto &c : clients)
+        draw_frame(c.get());
+    if (run_open)
+        draw_rundlg();
+    if (shut_open)
+        draw_shutdlg();
+    if (set_open)
+        draw_setdlg();
+    if (traywin)
+        draw_tray();
+}
+
+void WM::save_display()
+{
+    const char *home = getenv("HOME");
+    if (!home || !*home)
+        return;
+    std::string dir = std::string(home) + "/.chime";
+    mkdir(dir.c_str(), 0755);
+    std::string path = dir + "/display";
+    FILE *f = fopen(path.c_str(), "w");
+    if (!f)
+        return;
+    const char *sn = (scheme_i >= 0 && scheme_i < w95::kSchemeN) ? w95::kSchemes[scheme_i].name : "Chicago";
+    const char *wn = (wall_i >= 0 && wall_i < (int)walls.size()) ? walls[wall_i].name.c_str() : "(None)";
+    std::fprintf(f, "scheme=%s\nwall=%s\n", sn, wn);
+    fclose(f);
+}
+
+void WM::load_display()
+{
+    rebuild_walls();
+    const char *home = getenv("HOME");
+    if (home && *home) {
+        std::string path = std::string(home) + "/.chime/display";
+        FILE *f = fopen(path.c_str(), "r");
+        if (f) {
+            char line[256];
+            while (fgets(line, sizeof(line), f)) {
+                char *nl = strchr(line, '\n');
+                if (nl)
+                    *nl = 0;
+                if (!strncmp(line, "scheme=", 7)) {
+                    for (int i = 0; i < w95::kSchemeN; i++)
+                        if (!strcmp(line + 7, w95::kSchemes[i].name))
+                            scheme_i = i;
+                } else if (!strncmp(line, "wall=", 5)) {
+                    for (int i = 0; i < (int)walls.size(); i++)
+                        if (walls[i].name == (line + 5))
+                            wall_i = i;
+                }
+            }
+            fclose(f);
+        }
+    }
+    apply_scheme(scheme_i);
+    apply_wall(wall_i);
+}
+
+void WM::close_settings(bool revert)
+{
+    if (!set_open)
+        return;
+    set_open = false;
+    XUngrabKeyboard(dpy, CurrentTime);
+    XUnmapWindow(dpy, setdlg);
+    if (revert) {
+        apply_scheme(set_save_scheme);
+        apply_wall(set_save_wall);
+    }
+}
+
+void WM::open_settings(int mi)
+{
+    close_menus();
+    if (mons.empty())
+        return;
+    if (mi < 0 || mi >= (int)mons.size())
+        mi = 0;
+    dialog_mon = mi;
+    rebuild_walls();
+    set_save_scheme = scheme_i;
+    set_save_wall = wall_i;
+    Monitor &m = mons[mi];
+    int w = w95::kSetW, h = w95::kSetH;
+    int x = m.x + (m.w - w) / 2;
+    int y = m.y + (m.h - w95::kTaskbarH - h) / 3;
+    if (y < m.y + 8)
+        y = m.y + 8;
+    XMoveResizeWindow(dpy, setdlg, x, y, (unsigned)w, (unsigned)h);
+    set_open = true;
+    XMapRaised(dpy, setdlg);
+    XSetInputFocus(dpy, setdlg, RevertToPointerRoot, CurrentTime);
+    XGrabKeyboard(dpy, setdlg, True, GrabModeAsync, GrabModeAsync, CurrentTime);
+    draw_setdlg();
 }
 
 static int dir_from_hit(Hit h)
@@ -798,21 +1464,22 @@ void WM::on_button_press(XEvent *e)
     }
 
     if (b->window == rundlg) {
-        int w = 380, h = 148, bw = 74, bh = 24;
-        if (b->x >= w - 8 - w95::kBtn && b->y < w95::kTitleH + 6) {
-            run_open = false;
-            XUnmapWindow(dpy, rundlg);
+        const int w = w95::kRunW, h = w95::kRunH;
+        const int bw = w95::kDlgBtnW, bh = w95::kDlgBtnH;
+        const int by = h - 12 - bh;
+        const int cancel_x = w - 12 - bw;
+        const int ok_x = cancel_x - 8 - bw;
+        if (b->x >= w - 6 - w95::kBtn && b->y >= 4 && b->y < 4 + w95::kTitleH) {
+            close_run();
             return;
         }
-        if (b->y >= h - 34 && b->y < h - 34 + bh) {
-            if (b->x >= w - 2 * bw - 20 && b->x < w - bw - 20) {
+        if (b->y >= by && b->y < by + bh) {
+            if (b->x >= ok_x && b->x < ok_x + bw) {
                 if (!run_text.empty())
                     launch(run_text.c_str());
-                run_open = false;
-                XUnmapWindow(dpy, rundlg);
-            } else if (b->x >= w - bw - 12 && b->x < w - 12) {
-                run_open = false;
-                XUnmapWindow(dpy, rundlg);
+                close_run();
+            } else if (b->x >= cancel_x && b->x < cancel_x + bw) {
+                close_run();
             }
         }
         return;
@@ -826,6 +1493,56 @@ void WM::on_button_press(XEvent *e)
             } else if (b->x >= w / 2 + 8 && b->x < w / 2 + 8 + bw) {
                 shut_open = false;
                 XUnmapWindow(dpy, shutdlg);
+            }
+        }
+        return;
+    }
+
+    if (b->window == setdlg) {
+        const int w = w95::kSetW, h = w95::kSetH;
+        const int bw = w95::kDlgBtnW, bh = w95::kDlgBtnH;
+        const int by = h - 12 - bh;
+        const int apply_x = w - 12 - bw;
+        const int cancel_x = apply_x - 8 - bw;
+        const int ok_x = cancel_x - 8 - bw;
+        auto listhit = [&](int lx, int ly, int lw, int lh, int n) {
+            if (b->x < lx || b->y < ly || b->x >= lx + lw || b->y >= ly + lh)
+                return -1;
+            int i = (b->y - ly - 2) / w95::kListRow;
+            int vis = (lh - 4) / w95::kListRow;
+            if (i < 0 || i >= n || i >= vis)
+                return -1;
+            return i;
+        };
+        if (b->x >= w - 6 - w95::kBtn && b->y >= 4 && b->y < 4 + w95::kTitleH) {
+            close_settings(true);
+            return;
+        }
+        int wi = listhit(232, 44, 200, 104, (int)walls.size());
+        if (wi >= 0) {
+            apply_wall(wi);
+            draw_setdlg();
+            return;
+        }
+        int si = listhit(16, 168, 416, 132, w95::kSchemeN);
+        if (si >= 0) {
+            apply_scheme(si);
+            draw_setdlg();
+            return;
+        }
+        if (b->y >= by && b->y < by + bh) {
+            if (b->x >= ok_x && b->x < ok_x + bw) {
+                save_display();
+                set_save_scheme = scheme_i;
+                set_save_wall = wall_i;
+                close_settings(false);
+            } else if (b->x >= cancel_x && b->x < cancel_x + bw) {
+                close_settings(true);
+            } else if (b->x >= apply_x && b->x < apply_x + bw) {
+                save_display();
+                set_save_scheme = scheme_i;
+                set_save_wall = wall_i;
+                draw_setdlg();
             }
         }
         return;
@@ -874,6 +1591,8 @@ void WM::on_button_press(XEvent *e)
         close_menus();
         if (idx == 1)
             launch("cabinet \"$HOME\"");
+        else if (idx == 2)
+            open_settings(mi);
         else if (idx == 4)
             launch("aterm -e sh -c 'echo Chime desktop; read x' || true");
         else if (idx == 5)
@@ -889,7 +1608,7 @@ void WM::on_button_press(XEvent *e)
             return;
         }
         close_menus();
-        int trayw = w95::kClockW;
+        int trayw = tray_width(*mon);
         int trayx = mon->w - trayw - 4;
         if (b->x >= trayx)
             return;
@@ -941,9 +1660,9 @@ void WM::on_button_press(XEvent *e)
                 else if (hit == 1)
                     launch("cabinet \"$HOME\"");
                 else if (hit == 2)
-                    launch("aterm -e sh -c 'echo Network Neighborhood; read x' || true");
+                    launch("aterm || xterm || x-terminal-emulator || true");
                 else
-                    launch("aterm -e sh -c 'echo Recycle Bin is empty; read x' || true");
+                    launch("editor || aterm -e vi || xterm -e vi || true");
                 selected_icon = -1;
             } else {
                 selected_icon = hit;
@@ -990,8 +1709,13 @@ void WM::on_button_press(XEvent *e)
             }
             last_title_win = fr->frame;
             last_title_time = b->time;
-            if (fr->maxed)
-                return;
+            if (!fr->maxed && !fr->tiled) {
+                fr->rx = fr->x;
+                fr->ry = fr->y;
+                fr->rw = fr->w;
+                fr->rh = fr->h;
+            }
+            float_for_drag(fr, b->x_root, b->y_root);
             drag = DragMode::Move;
             drag_c = fr;
             drag_ox = b->x_root;
@@ -1006,6 +1730,10 @@ void WM::on_button_press(XEvent *e)
         }
         int dir = dir_from_hit(h);
         if (dir && !fr->maxed) {
+            if (fr->tiled) {
+                fr->tiled = false;
+                fr->snap = Snap::Off;
+            }
             drag = DragMode::Resize;
             drag_c = fr;
             drag_dir = dir;
@@ -1021,11 +1749,21 @@ void WM::on_button_press(XEvent *e)
     }
 }
 
-void WM::on_button_release(XEvent *)
+void WM::on_button_release(XEvent *e)
 {
     if (drag != DragMode::Off) {
-        if (drag_c)
+        if (drag == DragMode::Move && drag_c) {
+            int px = e->xbutton.x_root;
+            int py = e->xbutton.y_root;
+            Snap s = snap_at(px, py);
+            if (s != Snap::Off)
+                apply_snap(drag_c, s, px, py);
+            else
+                drag_c->last_mon = monitor_for(drag_c);
+        } else if (drag_c) {
             drag_c->last_mon = monitor_for(drag_c);
+        }
+        hide_snap_preview();
         drag = DragMode::Off;
         drag_c = nullptr;
         XUngrabPointer(dpy, CurrentTime);
@@ -1044,6 +1782,7 @@ void WM::on_motion(XEvent *e)
             drag_c->x = drag_fx + dx;
             drag_c->y = drag_fy + dy;
             apply_geom(drag_c);
+            show_snap_preview(snap_at(m->x_root, m->y_root), m->x_root, m->y_root);
         } else {
             int x = drag_fx, y = drag_fy, w = drag_fw, h = drag_fh;
             if (drag_dir & 8) {
@@ -1116,18 +1855,61 @@ void WM::on_motion(XEvent *e)
 void WM::on_key(XEvent *e)
 {
     KeySym ks = XLookupKeysym(&e->xkey, 0);
-    if (run_open && e->xkey.window == rundlg) {
+    bool press = (e->type == KeyPress);
+
+    if (!press) {
+        if (ks == XK_Super_L || ks == XK_Super_R || ks == XK_Meta_L || ks == XK_Meta_R) {
+            if (super_held && !super_chord && !run_open && !shut_open && !set_open && !mons.empty())
+                open_start(mons[pointer_mon()]);
+            super_held = false;
+            super_chord = false;
+        }
+        return;
+    }
+
+    if (ks == XK_Super_L || ks == XK_Super_R || ks == XK_Meta_L || ks == XK_Meta_R) {
+        super_held = true;
+        super_chord = false;
+        return;
+    }
+
+    if ((ks == XK_r || ks == XK_R) && (super_held || (super_mask && (e->xkey.state & super_mask)))) {
+        super_chord = true;
+        open_run(pointer_mon());
+        return;
+    }
+
+    if (set_open) {
+        if (super_held || (super_mask && (e->xkey.state & super_mask))) {
+            super_chord = true;
+            return;
+        }
+        KeySym ks2;
+        XLookupString(&e->xkey, nullptr, 0, &ks2, nullptr);
+        if (ks2 == XK_Return) {
+            save_display();
+            set_save_scheme = scheme_i;
+            set_save_wall = wall_i;
+            close_settings(false);
+        } else if (ks2 == XK_Escape)
+            close_settings(true);
+        return;
+    }
+
+    if (run_open) {
+        if (super_held || (super_mask && (e->xkey.state & super_mask))) {
+            super_chord = true;
+            return;
+        }
         char buf[16];
         KeySym ks2;
         int n = XLookupString(&e->xkey, buf, sizeof(buf), &ks2, nullptr);
         if (ks2 == XK_Return) {
             if (!run_text.empty())
                 launch(run_text.c_str());
-            run_open = false;
-            XUnmapWindow(dpy, rundlg);
+            close_run();
         } else if (ks2 == XK_Escape) {
-            run_open = false;
-            XUnmapWindow(dpy, rundlg);
+            close_run();
         } else if (ks2 == XK_BackSpace) {
             if (!run_text.empty())
                 run_text.pop_back();
@@ -1170,25 +1952,32 @@ void WM::on_key(XEvent *e)
             focus(list[idx]);
         }
     }
-    if ((ks == XK_Escape && (e->xkey.state & ControlMask)) || ks == XK_Super_L || ks == XK_Super_R) {
-        Window rr, cr;
-        int rx, ry, wx, wy;
-        unsigned mask;
-        XQueryPointer(dpy, root, &rr, &cr, &rx, &ry, &wx, &wy, &mask);
-        open_start(mons[monitor_at(rx, ry)]);
-    }
+    if (ks == XK_Escape && (e->xkey.state & ControlMask) && !mons.empty())
+        open_start(mons[pointer_mon()]);
 }
 
 void WM::on_expose(XEvent *e)
 {
     if (e->xexpose.count != 0)
         return;
+    if (e->xexpose.window == snapwin) {
+        draw_snap_preview();
+        return;
+    }
     if (e->xexpose.window == rundlg) {
         draw_rundlg();
         return;
     }
     if (e->xexpose.window == shutdlg) {
         draw_shutdlg();
+        return;
+    }
+    if (e->xexpose.window == setdlg) {
+        draw_setdlg();
+        return;
+    }
+    if (e->xexpose.window == traywin) {
+        draw_tray();
         return;
     }
     if (Monitor *m = mon_by_window(e->xexpose.window)) {
@@ -1215,13 +2004,19 @@ void WM::handle_event(XEvent *e)
     }
     switch (e->type) {
     case MapRequest:
-        if (Client *c = find_client(e->xmaprequest.window))
+        if (is_tray_icon(e->xmaprequest.window))
+            XMapWindow(dpy, e->xmaprequest.window);
+        else if (Client *c = find_client(e->xmaprequest.window))
             restore(c);
         else
             manage(e->xmaprequest.window);
         break;
     case ConfigureRequest: {
         XConfigureRequestEvent *cr = &e->xconfigurerequest;
+        if (is_tray_icon(cr->window)) {
+            tray_layout();
+            break;
+        }
         Client *c = find_client(cr->window);
         XWindowChanges wc;
         wc.x = cr->x;
@@ -1261,7 +2056,9 @@ void WM::handle_event(XEvent *e)
         }
         break;
     case DestroyNotify:
-        if (Client *c = find_client(e->xdestroywindow.window))
+        if (is_tray_icon(e->xdestroywindow.window))
+            tray_undock(e->xdestroywindow.window);
+        else if (Client *c = find_client(e->xdestroywindow.window))
             unmanage(c, true);
         break;
     case EnterNotify:
@@ -1283,13 +2080,16 @@ void WM::handle_event(XEvent *e)
         on_motion(e);
         break;
     case KeyPress:
+    case KeyRelease:
         on_key(e);
         break;
     case Expose:
         on_expose(e);
         break;
     case PropertyNotify:
-        if (Client *c = find_client(e->xproperty.window)) {
+        if (is_tray_icon(e->xproperty.window) && e->xproperty.atom == xembed_info)
+            tray_layout();
+        else if (Client *c = find_client(e->xproperty.window)) {
             if (e->xproperty.atom == XA_WM_NAME || e->xproperty.atom == net_wm_name) {
                 c->name = get_name(c->win);
                 draw_frame(c);
@@ -1299,7 +2099,10 @@ void WM::handle_event(XEvent *e)
         }
         break;
     case ClientMessage:
-        if (e->xclient.message_type == net_active) {
+        if (e->xclient.message_type == net_system_tray_opcode) {
+            if (e->xclient.data.l[1] == 0)
+                tray_dock((Window)e->xclient.data.l[2]);
+        } else if (e->xclient.message_type == net_active) {
             if (Client *c = find_client(e->xclient.window)) {
                 if (c->iconic)
                     restore(c);
@@ -1316,6 +2119,36 @@ void WM::handle_event(XEvent *e)
     default:
         break;
     }
+}
+
+unsigned WM::mod_mask_for(KeySym ks)
+{
+    KeyCode kc = XKeysymToKeycode(dpy, ks);
+    if (!kc)
+        return 0;
+    XModifierKeymap *mm = XGetModifierMapping(dpy);
+    if (!mm)
+        return 0;
+    unsigned masks[8] = {ShiftMask, LockMask, ControlMask, Mod1Mask, Mod2Mask, Mod3Mask, Mod4Mask, Mod5Mask};
+    unsigned found = 0;
+    for (int m = 0; m < 8; m++) {
+        for (int i = 0; i < mm->max_keypermod; i++) {
+            if (mm->modifiermap[m * mm->max_keypermod + i] == kc)
+                found |= masks[m];
+        }
+    }
+    XFreeModifiermap(mm);
+    return found;
+}
+
+void WM::grab_key(KeySym ks, unsigned mod)
+{
+    KeyCode kc = XKeysymToKeycode(dpy, ks);
+    if (!kc)
+        return;
+    unsigned ign[] = {0, LockMask, Mod2Mask, LockMask | Mod2Mask};
+    for (unsigned extra : ign)
+        XGrabKey(dpy, kc, mod | extra, root, True, GrabModeAsync, GrabModeAsync);
 }
 
 bool WM::init()
@@ -1338,7 +2171,8 @@ bool WM::init()
 
     g_other_wm = false;
     XSetErrorHandler(xerr_start);
-    XSelectInput(dpy, root, SubstructureRedirectMask | SubstructureNotifyMask | ButtonPressMask | KeyPressMask | PropertyChangeMask);
+    XSelectInput(dpy, root, SubstructureRedirectMask | SubstructureNotifyMask | ButtonPressMask | KeyPressMask |
+                                KeyReleaseMask | PropertyChangeMask);
     XSync(dpy, False);
     if (g_other_wm) {
         std::fprintf(stderr, "chime: another window manager is running\n");
@@ -1393,21 +2227,25 @@ bool WM::init()
         XRRSelectInput(dpy, root, RRScreenChangeNotifyMask | RROutputChangeNotifyMask | RRCrtcChangeNotifyMask);
 
     ewmh_init();
-    rundlg = mkwin(0, 0, 380, 148, face.pix, ExposureMask | ButtonPressMask | KeyPressMask, true);
+    rundlg = mkwin(0, 0, w95::kRunW, w95::kRunH, face.pix,
+                   ExposureMask | ButtonPressMask | KeyPressMask | KeyReleaseMask, true);
     shutdlg = mkwin(0, 0, 320, 120, face.pix, ExposureMask | ButtonPressMask | KeyPressMask, true);
+    setdlg = mkwin(0, 0, w95::kSetW, w95::kSetH, face.pix,
+                   ExposureMask | ButtonPressMask | KeyPressMask | KeyReleaseMask, true);
+    snapwin = mkwin(0, 0, 40, 40, title.pix, ExposureMask, true);
     sync_monitors();
+    load_display();
 
-    auto grab = [&](KeySym ks, unsigned mod) {
-        KeyCode kc = XKeysymToKeycode(dpy, ks);
-        if (kc)
-            XGrabKey(dpy, kc, mod, root, True, GrabModeAsync, GrabModeAsync);
-    };
-    grab(XK_Tab, Mod1Mask);
-    grab(XK_Tab, Mod1Mask | ShiftMask);
-    grab(XK_F4, Mod1Mask);
-    grab(XK_Escape, ControlMask);
-    grab(XK_Super_L, 0);
-    grab(XK_Super_R, 0);
+    super_mask = mod_mask_for(XK_Super_L) | mod_mask_for(XK_Super_R);
+    if (!super_mask)
+        super_mask = Mod4Mask;
+    grab_key(XK_Tab, Mod1Mask);
+    grab_key(XK_Tab, Mod1Mask | ShiftMask);
+    grab_key(XK_F4, Mod1Mask);
+    grab_key(XK_Escape, ControlMask);
+    grab_key(XK_Super_L, 0);
+    grab_key(XK_Super_R, 0);
+    grab_key(XK_r, super_mask);
 
     Window dummy, *kids = nullptr;
     unsigned n = 0;
@@ -1456,7 +2294,11 @@ void WM::run()
 
 void WM::finish()
 {
+    close_run();
+    close_settings(false);
     close_menus();
+    if (dpy && traywin)
+        XSetSelectionOwner(dpy, net_system_tray, None, CurrentTime);
     if (dpy)
         XCloseDisplay(dpy);
     dpy = nullptr;

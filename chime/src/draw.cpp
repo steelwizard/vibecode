@@ -130,21 +130,24 @@ void WM::draw_icon(Drawable d, int x, int y, int kind, bool selected)
         XSetForeground(dpy, gc, lo.pix);
         XDrawRectangle(dpy, d, gc, x + 4, y + 8, 24, 18);
     } else if (kind == 2) {
-        fill(d, x + 2, y + 6, 14, 10, lo.pix);
-        fill(d, x + 4, y + 8, 10, 6, title.pix);
-        fill(d, x + 16, y + 12, 14, 10, lo.pix);
-        fill(d, x + 18, y + 14, 10, 6, title.pix);
-        XSetForeground(dpy, gc, white.pix);
-        XDrawLine(dpy, d, gc, x + 10, y + 16, x + 18, y + 16);
+        fill(d, x + 2, y + 4, 28, 22, lo.pix);
+        fill(d, x + 4, y + 6, 24, 16, dk.pix);
+        XSetForeground(dpy, gc, green.pix);
+        XDrawLine(dpy, d, gc, x + 7, y + 10, x + 18, y + 10);
+        XDrawLine(dpy, d, gc, x + 7, y + 13, x + 22, y + 13);
+        XDrawLine(dpy, d, gc, x + 7, y + 16, x + 14, y + 16);
+        fill(d, x + 12, y + 22, 8, 4, face.pix);
+        fill(d, x + 6, y + 26, 20, 3, lo.pix);
     } else {
-        fill(d, x + 8, y + 6, 16, 20, lo.pix);
-        fill(d, x + 10, y + 8, 12, 16, face.pix);
-        fill(d, x + 6, y + 4, 20, 4, lo.pix);
-        fill(d, x + 12, y + 2, 8, 4, green.pix);
+        fill(d, x + 6, y + 2, 20, 26, white.pix);
+        XSetForeground(dpy, gc, lo.pix);
+        XDrawRectangle(dpy, d, gc, x + 6, y + 2, 20, 26);
+        fill(d, x + 8, y + 4, 16, 4, title.pix);
         XSetForeground(dpy, gc, dk.pix);
-        XDrawLine(dpy, d, gc, x + 12, y + 10, x + 12, y + 20);
-        XDrawLine(dpy, d, gc, x + 16, y + 10, x + 16, y + 20);
-        XDrawLine(dpy, d, gc, x + 20, y + 10, x + 20, y + 20);
+        XDrawLine(dpy, d, gc, x + 9, y + 12, x + 23, y + 12);
+        XDrawLine(dpy, d, gc, x + 9, y + 16, x + 21, y + 16);
+        XDrawLine(dpy, d, gc, x + 9, y + 20, x + 23, y + 20);
+        XDrawLine(dpy, d, gc, x + 9, y + 24, x + 18, y + 24);
     }
 }
 
@@ -176,11 +179,11 @@ void WM::draw_frame(Client *c)
     sunken(c->frame, cx - 1, cy - 1, cw + 2, ch + 2);
 }
 
-static const char *kDeskNames[] = {"My Computer", "My Documents", "Network", "Recycle Bin"};
+static const char *kDeskNames[] = {"My Computer", "My Documents", "Terminal", "Editor"};
 
 void WM::draw_desktop(Monitor &m)
 {
-    fill(m.desktop, 0, 0, m.w, m.h - w95::kTaskbarH, desktop.pix);
+    tile_wall(m.desktop, 0, 0, m.w, m.h - w95::kTaskbarH);
     if (!m.primary)
         return;
     int pad = 12;
@@ -206,6 +209,133 @@ void WM::draw_desktop(Monitor &m)
     }
 }
 
+void WM::draw_clock(Drawable d, int x, int y, int w, int h)
+{
+    time_t now = time(nullptr);
+    struct tm tm{};
+    localtime_r(&now, &tm);
+    int h12 = tm.tm_hour % 12;
+    if (h12 == 0)
+        h12 = 12;
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%d:%02d %s", h12, tm.tm_min, tm.tm_hour >= 12 ? "PM" : "AM");
+    int cw = text_w(buf);
+    draw_str(d, x + (w - cw) / 2, y, h, buf, fg.pix, false);
+}
+
+void WM::tile_wall(Drawable d, int x, int y, int w, int h)
+{
+    fill(d, x, y, w, h, desktop.pix);
+    if (!wall_tile || wall_tw < 1 || wall_th < 1)
+        return;
+    for (int py = y; py < y + h; py += wall_th) {
+        for (int px = x; px < x + w; px += wall_tw) {
+            int cw = std::min(wall_tw, x + w - px);
+            int ch = std::min(wall_th, y + h - py);
+            if (cw > 0 && ch > 0)
+                XCopyArea(dpy, wall_tile, d, gc, 0, 0, cw, ch, px, py);
+        }
+    }
+}
+
+void WM::draw_dlg_btn(Drawable d, int x, int y, int w, int h, const char *lab)
+{
+    fill(d, x, y, w, h, face.pix);
+    bevel(d, x, y, w, h, true);
+    int lw = text_w(lab);
+    draw_str(d, x + (w - lw) / 2, y, h, lab, fg.pix, false);
+}
+
+void WM::draw_listbox(Drawable d, int x, int y, int w, int h, int sel, int n, const char *(*label)(int))
+{
+    fill(d, x, y, w, h, field.pix);
+    sunken(d, x, y, w, h);
+    int vis = (h - 4) / w95::kListRow;
+    for (int i = 0; i < n && i < vis; i++) {
+        int iy = y + 2 + i * w95::kListRow;
+        const char *lab = label(i);
+        if (i == sel) {
+            fill(d, x + 2, iy, w - 4, w95::kListRow, title.pix);
+            draw_str_clip(d, x + 6, iy, w - 12, w95::kListRow, lab, white.pix, false);
+        } else
+            draw_str_clip(d, x + 6, iy, w - 12, w95::kListRow, lab, fg.pix, false);
+    }
+}
+
+void WM::draw_setdlg()
+{
+    const int w = w95::kSetW, h = w95::kSetH;
+    fill(setdlg, 0, 0, w, h, face.pix);
+    bevel(setdlg, 0, 0, w, h, true);
+    fill(setdlg, 3, 3, w - 6, w95::kTitleH, title.pix);
+    draw_str(setdlg, 8, 3, w95::kTitleH, "Display Properties", white.pix, true);
+    draw_caption_btn(setdlg, w - 6 - w95::kBtn, 5, 2, false);
+
+    draw_str(setdlg, 16, 26, 16, "Preview", fg.pix, false);
+    sunken(setdlg, 16, 42, 204, 106);
+    fill(setdlg, 20, 46, 196, 78, dk.pix);
+    tile_wall(setdlg, 24, 50, 188, 70);
+    fill(setdlg, 96, 120, 44, 8, lo.pix);
+    fill(setdlg, 80, 128, 76, 12, face.pix);
+    bevel(setdlg, 80, 128, 76, 12, true);
+
+    draw_str(setdlg, 232, 26, 16, "Wallpaper", fg.pix, false);
+    fill(setdlg, 232, 44, 200, 104, field.pix);
+    sunken(setdlg, 232, 44, 200, 104);
+    {
+        int vis = (104 - 4) / w95::kListRow;
+        for (int i = 0; i < (int)walls.size() && i < vis; i++) {
+            int iy = 46 + i * w95::kListRow;
+            if (i == wall_i) {
+                fill(setdlg, 234, iy, 196, w95::kListRow, title.pix);
+                draw_str_clip(setdlg, 238, iy, 188, w95::kListRow, walls[i].name.c_str(), white.pix, false);
+            } else
+                draw_str_clip(setdlg, 238, iy, 188, w95::kListRow, walls[i].name.c_str(), fg.pix, false);
+        }
+    }
+
+    draw_str(setdlg, 16, 152, 16, "Color scheme", fg.pix, false);
+    fill(setdlg, 16, 168, 416, 132, field.pix);
+    sunken(setdlg, 16, 168, 416, 132);
+    {
+        int vis = (132 - 4) / w95::kListRow;
+        for (int i = 0; i < w95::kSchemeN && i < vis; i++) {
+            int iy = 170 + i * w95::kListRow;
+            if (i == scheme_i) {
+                fill(setdlg, 18, iy, 412, w95::kListRow, title.pix);
+                draw_str_clip(setdlg, 22, iy, 404, w95::kListRow, w95::kSchemes[i].name, white.pix, false);
+            } else
+                draw_str_clip(setdlg, 22, iy, 404, w95::kListRow, w95::kSchemes[i].name, fg.pix, false);
+        }
+    }
+
+    XSetForeground(dpy, gc, lo.pix);
+    XDrawLine(dpy, setdlg, gc, 8, h - 44, w - 9, h - 44);
+    XSetForeground(dpy, gc, hi.pix);
+    XDrawLine(dpy, setdlg, gc, 8, h - 43, w - 9, h - 43);
+
+    const int bw = w95::kDlgBtnW, bh = w95::kDlgBtnH;
+    int by = h - 12 - bh;
+    int apply_x = w - 12 - bw;
+    int cancel_x = apply_x - 8 - bw;
+    int ok_x = cancel_x - 8 - bw;
+    draw_dlg_btn(setdlg, ok_x, by, bw, bh, "OK");
+    draw_dlg_btn(setdlg, cancel_x, by, bw, bh, "Cancel");
+    draw_dlg_btn(setdlg, apply_x, by, bw, bh, "Apply");
+}
+
+void WM::draw_tray()
+{
+    if (!traywin)
+        return;
+    XWindowAttributes wa{};
+    if (!XGetWindowAttributes(dpy, traywin, &wa) || wa.map_state == IsUnmapped)
+        return;
+    fill(traywin, 0, 0, wa.width, wa.height, face.pix);
+    sunken(traywin, 0, 0, wa.width, wa.height);
+    draw_clock(traywin, wa.width - w95::kClockW, 0, w95::kClockW, wa.height);
+}
+
 void WM::draw_taskbar(Monitor &m)
 {
     fill(m.taskbar, 0, 0, m.w, w95::kTaskbarH, face.pix);
@@ -220,19 +350,13 @@ void WM::draw_taskbar(Monitor &m)
     draw_flag(m.taskbar, sbx + 4, sby + 4);
     draw_str(m.taskbar, sbx + 22, sby, sbh, "Start", fg.pix, true);
 
-    int trayw = w95::kClockW;
+    int trayw = tray_width(m);
     int trayx = m.w - trayw - 4;
-    sunken(m.taskbar, trayx, 4, trayw, w95::kTaskbarH - 8);
-    time_t now = time(nullptr);
-    struct tm tm{};
-    localtime_r(&now, &tm);
-    int h12 = tm.tm_hour % 12;
-    if (h12 == 0)
-        h12 = 12;
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "%d:%02d %s", h12, tm.tm_min, tm.tm_hour >= 12 ? "PM" : "AM");
-    int cw = text_w(buf);
-    draw_str(m.taskbar, trayx + (trayw - cw) / 2, 4, w95::kTaskbarH - 8, buf, fg.pix, false);
+    if (!(m.primary && traywin)) {
+        sunken(m.taskbar, trayx, 4, trayw, w95::kTaskbarH - 8);
+        draw_clock(m.taskbar, trayx, 4, trayw, w95::kTaskbarH - 8);
+    } else
+        draw_tray();
 
     auto list = clients_on(mon_index(&m));
     int x0 = sbx + sbw + 6;
@@ -257,7 +381,7 @@ void WM::draw_taskbar(Monitor &m)
 MenuItem kMenu[] = {
     {"Programs", false, true, true},
     {"Documents", false, false, true},
-    {"Settings", false, true, false},
+    {"Settings", false, false, true},
     {"Find", false, true, false},
     {"Help", false, false, true},
     {"Run...", false, false, true},
@@ -324,7 +448,7 @@ void WM::draw_startmenu(Monitor &m)
 
 void WM::draw_submenu(Monitor &m)
 {
-    const char *items[] = {"MS-DOS Prompt", "Editor", "Cabinet"};
+    const char *items[] = {"Terminal", "Editor", "Cabinet"};
     int n = 3;
     int mw = 150, mh = 8 + n * w95::kMenuItemH;
     fill(m.submenu, 0, 0, mw, mh, face.pix);
@@ -340,26 +464,44 @@ void WM::draw_submenu(Monitor &m)
 
 void WM::draw_rundlg()
 {
-    int w = 380, h = 148;
+    const int w = w95::kRunW, h = w95::kRunH;
     fill(rundlg, 0, 0, w, h, face.pix);
     bevel(rundlg, 0, 0, w, h, true);
-    fill(rundlg, 4, 4, w - 8, w95::kTitleH, title.pix);
-    draw_str(rundlg, 8, 4, w95::kTitleH, "Run", white.pix, true);
-    int cx = w - 8 - w95::kBtn;
-    draw_caption_btn(rundlg, cx, 6, 2, false);
-    draw_str(rundlg, 12, 28, 36, "Type the name of a program, folder, or", fg.pix, false);
-    draw_str(rundlg, 12, 44, 16, "document, and Windows will open it.", fg.pix, false);
-    draw_str(rundlg, 12, 68, 18, "Open:", fg.pix, false);
-    sunken(rundlg, 56, 68, w - 68, 22);
-    fill(rundlg, 58, 70, w - 72, 18, field.pix);
-    draw_str_clip(rundlg, 62, 70, w - 80, 18, run_text.c_str(), fg.pix, false);
-    int bw = 74, bh = 24;
-    fill(rundlg, w - 2 * bw - 20, h - 34, bw, bh, face.pix);
-    bevel(rundlg, w - 2 * bw - 20, h - 34, bw, bh, true);
-    draw_str(rundlg, w - 2 * bw - 20 + 24, h - 34, bh, "OK", fg.pix, false);
-    fill(rundlg, w - bw - 12, h - 34, bw, bh, face.pix);
-    bevel(rundlg, w - bw - 12, h - 34, bw, bh, true);
-    draw_str(rundlg, w - bw - 12 + 14, h - 34, bh, "Cancel", fg.pix, false);
+    fill(rundlg, 3, 3, w - 6, w95::kTitleH, title.pix);
+    draw_str(rundlg, 8, 3, w95::kTitleH, "Run", white.pix, true);
+    draw_caption_btn(rundlg, w - 6 - w95::kBtn, 5, 2, false);
+
+    draw_icon(rundlg, 12, 30, 0, false);
+    draw_str(rundlg, 52, 28, 16, "Type the name of a program, folder,", fg.pix, false);
+    draw_str(rundlg, 52, 44, 16, "or document, and Chime will open it.", fg.pix, false);
+
+    const char *openlab = "Open:";
+    int labw = text_w(openlab);
+    int fy = 88, fh = 22;
+    draw_str(rundlg, 12, fy, fh, openlab, fg.pix, false);
+    int fx = 12 + labw + 10;
+    int fw = w - fx - 14;
+    sunken(rundlg, fx, fy, fw, fh);
+    fill(rundlg, fx + 2, fy + 2, fw - 4, fh - 4, field.pix);
+    int tx = fx + 6;
+    int tw = fw - 12;
+    draw_str_clip(rundlg, tx, fy + 2, tw - 6, fh - 4, run_text.c_str(), fg.pix, false);
+    int caret = tx + text_w(run_text.c_str());
+    if (caret > tx + tw - 4)
+        caret = tx + tw - 4;
+    fill(rundlg, caret, fy + 4, 1, fh - 8, fg.pix);
+
+    XSetForeground(dpy, gc, lo.pix);
+    XDrawLine(dpy, rundlg, gc, 8, h - 44, w - 9, h - 44);
+    XSetForeground(dpy, gc, hi.pix);
+    XDrawLine(dpy, rundlg, gc, 8, h - 43, w - 9, h - 43);
+
+    const int bw = w95::kDlgBtnW, bh = w95::kDlgBtnH;
+    int by = h - 12 - bh;
+    int cancel_x = w - 12 - bw;
+    int ok_x = cancel_x - 8 - bw;
+    draw_dlg_btn(rundlg, ok_x, by, bw, bh, "OK");
+    draw_dlg_btn(rundlg, cancel_x, by, bw, bh, "Cancel");
 }
 
 void WM::draw_shutdlg()
@@ -368,7 +510,7 @@ void WM::draw_shutdlg()
     fill(shutdlg, 0, 0, w, h, face.pix);
     bevel(shutdlg, 0, 0, w, h, true);
     fill(shutdlg, 4, 4, w - 8, w95::kTitleH, title.pix);
-    draw_str(shutdlg, 8, 4, w95::kTitleH, "Shut Down Windows", white.pix, true);
+    draw_str(shutdlg, 8, 4, w95::kTitleH, "Shut Down", white.pix, true);
     draw_str(shutdlg, 16, 32, 24, "Are you sure you want to shut down?", fg.pix, false);
     int bw = 74, bh = 24;
     fill(shutdlg, w / 2 - bw - 8, h - 36, bw, bh, face.pix);

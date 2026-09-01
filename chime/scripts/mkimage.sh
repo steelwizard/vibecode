@@ -14,8 +14,8 @@ OUT_IMG=$ROOT/chime.img
 # vesafb in QEMU: nomodeset keeps simpledrm from stealing VGA so /dev/fb0 exists.
 KCMDLINE="loglevel=3 cde nomodeset vga=791 video=vesafb:ywrap,mtrr:3"
 
-if [ ! -x "$ROOT/chime" ] || [ ! -x "$ROOT/cabinet" ]; then
-    echo "build chime and cabinet first (make)" >&2
+if [ ! -x "$ROOT/chime" ] || [ ! -x "$ROOT/cabinet" ] || [ ! -x "$ROOT/volicon" ]; then
+    echo "build chime, cabinet, and volicon first (make)" >&2
     exit 1
 fi
 if ! command -v unsquashfs >/dev/null; then
@@ -49,10 +49,63 @@ for tcz in "$WORK/iso/cde/optional"/*.tcz; do
     unsquashfs -f -n -d "$OV" "$tcz" >/dev/null
 done
 
-echo "bundling chime, cabinet, and libraries..."
+echo "adding neofetch and alsa..."
+TCZREPO=${TCZREPO:-https://tinycorelinux.mirrorservice.org/15.x/x86_64/tcz}
+TC_KERNEL=${TC_KERNEL:-6.6.8-tinycore64}
+tcz_name() {
+    local n=${1%.tcz}
+    n=$(printf '%s' "$n" | sed "s/KERNEL/${TC_KERNEL}/g")
+    printf '%s.tcz' "$n"
+}
+tcz_fetch() {
+    local name
+    name=$(tcz_name "$1")
+    mkdir -p "$ROOT/dl/tcz" "$WORK/tczseen"
+    if [ -f "$WORK/tczseen/$name" ]; then
+        return 0
+    fi
+    touch "$WORK/tczseen/$name"
+    if [ ! -f "$ROOT/dl/tcz/$name" ]; then
+        echo "  downloading $name"
+        curl -L --fail --retry 3 -o "$ROOT/dl/tcz/$name" "$TCZREPO/$name"
+    fi
+    if [ ! -f "$ROOT/dl/tcz/$name.dep" ]; then
+        curl -fsSL --retry 2 -o "$ROOT/dl/tcz/$name.dep" "$TCZREPO/$name.dep" || rm -f "$ROOT/dl/tcz/$name.dep"
+    fi
+    if [ -f "$ROOT/dl/tcz/$name.dep" ]; then
+        while read -r dep || [ -n "$dep" ]; do
+            dep=$(echo "$dep" | tr -d '\r')
+            [ -n "$dep" ] || continue
+            case "$dep" in \#*) continue ;; esac
+            tcz_fetch "$dep"
+        done < "$ROOT/dl/tcz/$name.dep"
+    fi
+}
+tcz_install() {
+    local name
+    name=$(tcz_name "$1")
+    mkdir -p "$WORK/tczinst"
+    [ -f "$WORK/tczinst/$name" ] && return 0
+    touch "$WORK/tczinst/$name"
+    tcz_fetch "$name"
+    if [ -f "$ROOT/dl/tcz/$name.dep" ]; then
+        while read -r dep || [ -n "$dep" ]; do
+            dep=$(echo "$dep" | tr -d '\r')
+            [ -n "$dep" ] || continue
+            case "$dep" in \#*) continue ;; esac
+            tcz_install "$dep"
+        done < "$ROOT/dl/tcz/$name.dep"
+    fi
+    unsquashfs -f -n -d "$OV" "$ROOT/dl/tcz/$name" >/dev/null
+}
+tcz_install neofetch.tcz
+tcz_install alsa.tcz
+tcz_install alsamixergui.tcz
+
+echo "bundling chime, cabinet, volicon, and libraries..."
 DEST=$WORK/bundle
 mkdir -p "$DEST"
-for bin in chime cabinet; do
+for bin in chime cabinet volicon; do
     cp "$ROOT/$bin" "$DEST/$bin"
     chmod +x "$DEST/$bin"
     ldd "$ROOT/$bin" | awk '/=>/ {print $3} $1 ~ /^\// {print $1}' | while read -r lib; do
@@ -93,6 +146,18 @@ export LD_LIBRARY_PATH="$D${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 exec "$D/cabinet" "$@"
 EOF
 chmod +x "$OV/usr/local/bin/cabinet"
+cat > "$OV/usr/local/bin/volicon" << 'EOF'
+#!/bin/sh
+D=/opt/chime
+LD=$(ls "$D"/ld-linux-x86-64.so.* 2>/dev/null | head -1)
+if [ -n "$LD" ]; then
+    exec "$LD" --library-path "$D" "$D/volicon" "$@"
+fi
+export LD_LIBRARY_PATH="$D${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$D/volicon" "$@"
+EOF
+chmod +x "$OV/usr/local/bin/volicon"
+mkdir -p "$OV/opt/chime/wallpapers" "$OV/home/tc/.chime/wallpapers"
 
 printf 'Xfbdev\n' > "$OV/etc/sysconfig/Xserver"
 printf 'chime\n' > "$OV/etc/sysconfig/desktop"
@@ -114,6 +179,7 @@ export XPID=$!
 waitforX || { echo failed in waitforX; cat /tmp/Xfbdev.log 2>/dev/null; exit 1; }
 "$DESKTOP" 2>/tmp/wm_errors &
 export WM_PID=$!
+volicon >/tmp/volicon.log 2>&1 &
 [ -x "$HOME/.setbackground" ] && "$HOME/.setbackground"
 [ -x "$HOME/.mouse_config" ] && "$HOME/.mouse_config" &
 [ -d /usr/local/etc/X.d ] && find /usr/local/etc/X.d -type f -o -type l | sort | while read F; do . "$F"; done
@@ -130,7 +196,9 @@ echo Xfbdev > /etc/sysconfig/Xserver
 echo chime > /etc/sysconfig/desktop
 ldconfig >/dev/null 2>&1 || true
 modprobe vesafb >/dev/null 2>&1 || true
-chmod 666 /dev/fb0 /dev/input/mice 2>/dev/null || true
+modprobe snd-hda-intel >/dev/null 2>&1 || true
+modprobe snd-intel8x0 >/dev/null 2>&1 || true
+chmod 666 /dev/fb0 /dev/input/mice /dev/snd/* 2>/dev/null || true
 /opt/bootlocal.sh &
 EOF
 chmod +x "$OV/opt/bootsync.sh"
