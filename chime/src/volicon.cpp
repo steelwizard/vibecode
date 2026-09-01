@@ -1,3 +1,8 @@
+// volicon — 20x20 speaker glyph that docks in Chime's system tray.
+// Left-click mutes; wheel steps volume 5%; right-click opens alsamixer.
+// Volume is applied with amixer (Master, then PCM). We wait up to 8s for
+// the WM to own _NET_SYSTEM_TRAY_S<screen> before docking.
+
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
@@ -59,6 +64,7 @@ void draw()
     XPoint sp[3] = {{(short)(x + 4), (short)(y + 3)}, {(short)(x + 9), (short)y}, {(short)(x + 9), (short)(y + 12)}};
     XFillPolygon(dpy, icon, gc, sp, 3, Convex, CoordModeOrigin);
     if (!muted) {
+        // 0–2 sound-wave arcs depending on volume band.
         XSetForeground(dpy, gc, hi);
         int n = vol < 35 ? 0 : (vol < 70 ? 1 : 2);
         for (int i = 0; i < n; i++) {
@@ -80,6 +86,7 @@ Window tray_owner()
     return XGetSelectionOwner(dpy, sel);
 }
 
+// SYSTEM_TRAY_REQUEST_DOCK (opcode 0): ask the tray to reparent `icon`.
 void dock(Window owner)
 {
     Atom opcode = XInternAtom(dpy, "_NET_SYSTEM_TRAY_OPCODE", False);

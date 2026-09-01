@@ -1,4 +1,7 @@
 #!/bin/sh
+# Boot chime.iso in QEMU. -vga std gives vesafb (/dev/fb0) for Xfbdev.
+# DUAL=1 uses virtio-vga with two outputs (host WM multi-head test).
+# usb-tablet avoids pointer grab; nic none keeps the guest offline.
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 ISO=$ROOT/chime.iso

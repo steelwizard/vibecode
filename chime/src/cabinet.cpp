@@ -1,3 +1,8 @@
+// Cabinet — Chime's Explorer-style file manager.
+// A single X window with a fake menu bar, toolbar, address well, details list,
+// and status line. Directory IO is POSIX; opening a file shells out to editor
+// or vi. Layout numbers must stay in sync with on_tool() hit boxes.
+
 #include "theme.h"
 
 #include <X11/Xlib.h>
@@ -8,6 +13,7 @@
 #include <algorithm>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <cerrno>
@@ -22,10 +28,10 @@ namespace {
 
 constexpr int kWinW = 640;
 constexpr int kWinH = 420;
-constexpr int kMenuH = 20;
+constexpr int kMenuH = 20;  // Decorative "File Edit View Help" strip (not wired)
 constexpr int kToolH = 26;
 constexpr int kAddrH = 22;
-constexpr int kHeadH = 18;
+constexpr int kHeadH = 18;  // Name / Size / Type column headers
 constexpr int kStatH = 20;
 constexpr int kRowH = 16;
 
@@ -37,11 +43,12 @@ struct Entry {
     std::string name;
     std::string path;
     bool is_dir = false;
-    bool is_parent = false;
+    bool is_parent = false; // The synthetic ".." row
     off_t size = 0;
     time_t mtime = 0;
 };
 
+// Status-line modal: Y/N confirm, or type a name and Return.
 enum class Prompt { Idle, Del, Rename, Mkdir };
 
 Display *dpy;
@@ -53,6 +60,11 @@ Col face, hi, lo, dk, title, fg, white, field, yellow;
 int ww = kWinW, wh = kWinH;
 std::vector<Entry> ents;
 int sel = 0, scroll = 0;
+int mark_anchor = 0;
+std::vector<char> marked;
+bool dragging = false;
+int drag_x0 = 0, drag_y0 = 0, drag_x1 = 0, drag_y1 = 0;
+std::vector<char> drag_saved;
 std::string cwd;
 Prompt prompt = Prompt::Idle;
 std::string pbuf, status;
@@ -63,6 +75,7 @@ Atom wm_delete, wm_protocols;
 unsigned long alloc_rgb(w95::Rgb c)
 {
     XColor xc{};
+    // XColor channels are 16-bit; 257 * 8-bit maps 0..255 onto 0..65535 evenly.
     xc.red = (unsigned short)(c.r * 257);
     xc.green = (unsigned short)(c.g * 257);
     xc.blue = (unsigned short)(c.b * 257);
@@ -123,6 +136,8 @@ void btn(int x, int y, int w, int h, const char *lab)
     draw_str(x + (w - tw) / 2, y, h, lab, fg.pix);
 }
 
+// Detach from Cabinet so a long-running editor doesn't zombie this process.
+// SIGCHLD is SIG_IGN in main, so we don't wait.
 void spawn(const char *cmd)
 {
     if (fork() == 0) {
@@ -132,6 +147,7 @@ void spawn(const char *cmd)
     }
 }
 
+// Single-quote for /bin/sh so paths with spaces or $ don't expand.
 std::string shell_quote(const std::string &s)
 {
     std::string o = "'";
@@ -151,6 +167,8 @@ void set_title()
     XStoreName(dpy, win, t.c_str());
 }
 
+// Rebuild ents from path. Hidden names (leading '.') are skipped. Sort is
+// parent first, then directories, then files, case-insensitive.
 void load_dir(const std::string &path)
 {
     DIR *d = opendir(path.c_str());
@@ -198,6 +216,9 @@ void load_dir(const std::string &path)
     });
     sel = 0;
     scroll = 0;
+    marked.assign(ents.size(), 0);
+    if (!ents.empty())
+        marked[0] = 1;
     status = std::to_string(ents.size()) + " object(s)";
     set_title();
 }
@@ -218,6 +239,77 @@ void ensure_sel()
     int vis = rows_vis();
     if (sel >= scroll + vis)
         scroll = sel - vis + 1;
+}
+
+int marked_count()
+{
+    int n = 0;
+    for (char c : marked)
+        n += c ? 1 : 0;
+    return n;
+}
+
+void mark_only(int i)
+{
+    marked.assign(ents.size(), 0);
+    if (i >= 0 && i < (int)marked.size())
+        marked[i] = 1;
+    sel = i < 0 ? 0 : i;
+    mark_anchor = sel;
+}
+
+void mark_range(int a, int b)
+{
+    marked.assign(ents.size(), 0);
+    if (ents.empty())
+        return;
+    if (a > b)
+        std::swap(a, b);
+    a = std::clamp(a, 0, (int)ents.size() - 1);
+    b = std::clamp(b, 0, (int)ents.size() - 1);
+    for (int i = a; i <= b; i++)
+        marked[i] = 1;
+    sel = b;
+}
+
+void apply_marquee()
+{
+    int ly = list_top();
+    int vis = rows_vis();
+    int x = std::min(drag_x0, drag_x1), y = std::min(drag_y0, drag_y1);
+    int w = std::abs(drag_x1 - drag_x0), h = std::abs(drag_y1 - drag_y0);
+    marked = drag_saved;
+    marked.resize(ents.size(), 0);
+    int last = sel;
+    for (int i = 0; i < vis; i++) {
+        int idx = scroll + i;
+        if (idx < 0 || idx >= (int)ents.size())
+            break;
+        int ry = ly + 1 + i * kRowH;
+        int rx = 4, rw = ww - 8, rh = kRowH;
+        if (x < rx + rw && rx < x + w && y < ry + rh && ry < y + h) {
+            marked[idx] = 1;
+            last = idx;
+        }
+    }
+    sel = last;
+}
+
+void draw_dotted_rect(int x0, int y0, int x1, int y1)
+{
+    int x = std::min(x0, x1), y = std::min(y0, y1);
+    int w = std::abs(x1 - x0), h = std::abs(y1 - y0);
+    if (w < 1 || h < 1)
+        return;
+    char dash[] = {1, 1};
+    XSetDashes(dpy, gc, 0, dash, 2);
+    XSetLineAttributes(dpy, gc, 0, LineOnOffDash, CapButt, JoinMiter);
+    XSetForeground(dpy, gc, dk.pix);
+    XDrawRectangle(dpy, win, gc, x, y, (unsigned)w, (unsigned)h);
+    XSetForeground(dpy, gc, white.pix);
+    XSetDashes(dpy, gc, 1, dash, 2);
+    XDrawRectangle(dpy, win, gc, x, y, (unsigned)w, (unsigned)h);
+    XSetLineAttributes(dpy, gc, 0, LineSolid, CapButt, JoinMiter);
 }
 
 std::string fmt_size(const Entry &e)
@@ -299,7 +391,7 @@ void redraw()
             break;
         int y = ly + 1 + i * kRowH;
         const Entry &e = ents[idx];
-        bool on = (idx == sel);
+        bool on = (idx < (int)marked.size() && marked[idx]);
         if (on)
             fill(lx + 2, y, lw - 4, kRowH, title.pix);
         unsigned long col = on ? white.pix : fg.pix;
@@ -311,6 +403,12 @@ void redraw()
         auto sz = fmt_size(e);
         clip_str(ww - 260, y, 90, kRowH, sz.c_str(), col);
         clip_str(ww - 160, y, 140, kRowH, fmt_type(e), col);
+    }
+    if (dragging) {
+        XRectangle r{(short)lx, (short)ly, (unsigned short)std::max(0, lw), (unsigned short)std::max(0, lh)};
+        XSetClipRectangles(dpy, gc, 0, 0, &r, 1, Unsorted);
+        draw_dotted_rect(drag_x0, drag_y0, drag_x1, drag_y1);
+        XSetClipMask(dpy, gc, None);
     }
 
     int sy = wh - kStatH;
@@ -336,37 +434,65 @@ void go_up()
 
 void open_sel()
 {
-    if (ents.empty() || sel < 0 || sel >= (int)ents.size())
+    if (ents.empty())
         return;
-    const Entry &e = ents[sel];
-    if (e.is_dir) {
-        load_dir(e.path);
+    int nmark = marked_count();
+    if (nmark <= 1) {
+        if (sel < 0 || sel >= (int)ents.size())
+            return;
+        const Entry &e = ents[sel];
+        if (e.is_dir) {
+            load_dir(e.path);
+            return;
+        }
+        std::string q = shell_quote(e.path);
+        std::string cmd = "editor " + q + " 2>/dev/null || aterm -e vi " + q + " || xterm -e vi " + q;
+        if (access(e.path.c_str(), X_OK) == 0)
+            cmd = q + " || " + cmd;
+        spawn(cmd.c_str());
+        status = "Opened " + e.name;
         return;
     }
-    std::string q = shell_quote(e.path);
-    std::string cmd = "editor " + q + " 2>/dev/null || aterm -e vi " + q + " || xterm -e vi " + q;
-    if (access(e.path.c_str(), X_OK) == 0)
-        cmd = q + " || " + cmd;
-    spawn(cmd.c_str());
-    status = "Opened " + e.name;
+    int opened = 0;
+    for (int i = 0; i < (int)ents.size(); i++) {
+        if (!marked[i] || ents[i].is_dir)
+            continue;
+        std::string q = shell_quote(ents[i].path);
+        std::string cmd = "editor " + q + " 2>/dev/null || aterm -e vi " + q + " || xterm -e vi " + q;
+        if (access(ents[i].path.c_str(), X_OK) == 0)
+            cmd = q + " || " + cmd;
+        spawn(cmd.c_str());
+        opened++;
+    }
+    status = opened ? ("Opened " + std::to_string(opened) + " file(s)") : "Nothing to open";
 }
 
 void do_delete()
 {
     if (ents.empty())
         return;
-    const Entry &e = ents[sel];
-    if (e.is_parent) {
-        status = "Cannot delete ..";
+    int n = 0, failed = 0;
+    for (int i = (int)ents.size() - 1; i >= 0; i--) {
+        if (i >= (int)marked.size() || !marked[i])
+            continue;
+        const Entry &e = ents[i];
+        if (e.is_parent)
+            continue;
+        int r = e.is_dir ? rmdir(e.path.c_str()) : unlink(e.path.c_str());
+        if (r != 0)
+            failed++;
+        else
+            n++;
+    }
+    if (n == 0 && failed == 0) {
+        status = "Nothing to delete";
         return;
     }
-    int r = e.is_dir ? rmdir(e.path.c_str()) : unlink(e.path.c_str());
-    if (r != 0)
-        status = std::string("Delete failed: ") + strerror(errno);
-    else {
-        status = "Deleted " + e.name;
-        load_dir(cwd);
-    }
+    if (failed)
+        status = std::to_string(n) + " deleted, " + std::to_string(failed) + " failed";
+    else
+        status = "Deleted " + std::to_string(n) + " object(s)";
+    load_dir(cwd);
 }
 
 void do_mkdir(const std::string &name)
@@ -416,14 +542,23 @@ void start_rename()
 
 void start_del()
 {
-    if (ents.empty() || ents[sel].is_parent) {
+    int n = marked_count();
+    if (n == 0 && !ents.empty() && sel >= 0 && sel < (int)ents.size())
+        mark_only(sel);
+    n = marked_count();
+    if (n == 1 && sel >= 0 && sel < (int)ents.size() && ents[sel].is_parent) {
+        status = "Cannot delete ..";
+        return;
+    }
+    if (n < 1) {
         status = "Nothing to delete";
         return;
     }
     prompt = Prompt::Del;
-    pbuf = ents[sel].name;
+    pbuf = n == 1 && sel >= 0 && sel < (int)ents.size() ? ents[sel].name : (std::to_string(n) + " objects");
 }
 
+// Toolbar buttons are painted at fixed x; keep these widths matching btn() above.
 void on_tool(int x, int y)
 {
     if (y < kMenuH || y >= kMenuH + kToolH)
@@ -442,18 +577,35 @@ void on_tool(int x, int y)
         start_del();
 }
 
-void on_list_click(int y, Time t, bool dbl_hint)
+void on_list_click(int x, int y, Time t, unsigned state, bool press)
 {
     int row = (y - list_top() - 1) / kRowH;
     int idx = scroll + row;
-    if (idx < 0 || idx >= (int)ents.size())
+    bool ctrl = (state & ControlMask) != 0;
+    bool shift = (state & ShiftMask) != 0;
+    if (press) {
+        drag_x0 = drag_x1 = x;
+        drag_y0 = drag_y1 = y;
+        dragging = false;
+        if (idx >= 0 && idx < (int)ents.size()) {
+            if (ctrl) {
+                if (idx < (int)marked.size())
+                    marked[idx] = marked[idx] ? 0 : 1;
+                sel = idx;
+            } else if (shift)
+                mark_range(mark_anchor, idx);
+            else
+                mark_only(idx);
+            bool dbl = (idx == last_row && t - last_click < w95::kDblClickMs && !ctrl && !shift);
+            last_row = idx;
+            last_click = t;
+            if (dbl)
+                open_sel();
+        } else if (!ctrl)
+            mark_only(-1);
+        drag_saved = marked;
         return;
-    sel = idx;
-    bool dbl = dbl_hint || (idx == last_row && t - last_click < w95::kDblClickMs);
-    last_row = idx;
-    last_click = t;
-    if (dbl)
-        open_sel();
+    }
 }
 
 void on_key(XKeyEvent *e)
@@ -494,6 +646,16 @@ void on_key(XKeyEvent *e)
         return;
     }
 
+    bool ctrl = (e->state & ControlMask) != 0;
+    bool shift = (e->state & ShiftMask) != 0;
+    if (ctrl && (ks == XK_a || ks == XK_A)) {
+        marked.assign(ents.size(), 1);
+        if (!ents.empty() && ents[0].is_parent)
+            marked[0] = 0;
+        status = std::to_string(marked_count()) + " object(s) selected";
+        return;
+    }
+    int prev = sel;
     if (ks == XK_Up)
         sel--;
     else if (ks == XK_Down)
@@ -518,7 +680,17 @@ void on_key(XKeyEvent *e)
         load_dir(cwd.empty() ? "/" : cwd);
     else if (ks == XK_F7)
         start_mkdir();
+    else if (ks == XK_space && ctrl && sel >= 0 && sel < (int)marked.size())
+        marked[sel] = marked[sel] ? 0 : 1;
     ensure_sel();
+    if (ks == XK_Up || ks == XK_Down || ks == XK_Page_Up || ks == XK_Page_Down || ks == XK_Home || ks == XK_End) {
+        if (shift)
+            mark_range(mark_anchor, sel);
+        else if (!ctrl)
+            mark_only(sel);
+        else
+            mark_anchor = prev;
+    }
 }
 
 } // namespace
@@ -544,7 +716,8 @@ int main(int argc, char **argv)
 
     XSetWindowAttributes swa{};
     swa.background_pixel = face.pix;
-    swa.event_mask = ExposureMask | KeyPressMask | ButtonPressMask | StructureNotifyMask;
+    swa.event_mask = ExposureMask | KeyPressMask | ButtonPressMask | ButtonReleaseMask | ButtonMotionMask |
+                     StructureNotifyMask;
     win = XCreateWindow(dpy, RootWindow(dpy, screen), 80, 60, kWinW, kWinH, 0, CopyFromParent, InputOutput,
                         CopyFromParent, CWBackPixel | CWEventMask, &swa);
     gc = XCreateGC(dpy, win, 0, nullptr);
@@ -586,11 +759,29 @@ int main(int argc, char **argv)
                 if (y < kMenuH + kToolH)
                     on_tool(e.xbutton.x, y);
                 else if (y >= list_top() && y < list_top() + list_h())
-                    on_list_click(y, e.xbutton.time, e.xbutton.button == 1 && false);
+                    on_list_click(e.xbutton.x, y, e.xbutton.time, e.xbutton.state, true);
                 redraw();
             } else if (e.xbutton.button == 3 && e.xbutton.y >= list_top()) {
-                on_list_click(e.xbutton.y, e.xbutton.time, false);
+                on_list_click(e.xbutton.x, e.xbutton.y, e.xbutton.time, e.xbutton.state, true);
                 start_del();
+                redraw();
+            }
+        } else if (e.type == MotionNotify && (e.xmotion.state & Button1Mask)) {
+            int dx = e.xmotion.x - drag_x0, dy = e.xmotion.y - drag_y0;
+            if (!dragging && dx * dx + dy * dy > 16)
+                dragging = true;
+            if (dragging) {
+                drag_x1 = e.xmotion.x;
+                drag_y1 = e.xmotion.y;
+                apply_marquee();
+                redraw();
+            }
+        } else if (e.type == ButtonRelease && e.xbutton.button == 1) {
+            if (dragging) {
+                drag_x1 = e.xbutton.x;
+                drag_y1 = e.xbutton.y;
+                apply_marquee();
+                dragging = false;
                 redraw();
             }
         } else if (e.type == KeyPress) {

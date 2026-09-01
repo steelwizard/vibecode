@@ -1,3 +1,8 @@
+// Chime window manager: ICCCM/EWMH reparenting WM with a Win95 shell
+// (desktop, taskbar, Start menu, system tray) on every RandR/Xinerama head.
+// This file owns session setup, clients, snapping, tray, settings, and the
+// X event loop. Painting lives in draw.cpp.
+
 #include "wm.h"
 
 #include <X11/Xproto.h>
@@ -14,11 +19,13 @@
 #include <string>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 
-static WM *g_wm;
-static bool g_other_wm;
+static WM *g_wm;       // Used only so signal/error paths can find the instance
+static bool g_other_wm; // Set if SubstructureRedirect is already taken
 
+// Temporary handler while we try to become WM: BadAccess means another WM won.
 static int xerr_start(Display *, XErrorEvent *e)
 {
     if (e->error_code == BadAccess)
@@ -26,6 +33,8 @@ static int xerr_start(Display *, XErrorEvent *e)
     return 0;
 }
 
+// Steady-state handler. Racey Destroy/Unmap on client windows is normal;
+// swallowing BadWindow/BadDrawable/BadMatch keeps the session alive.
 static int xerr(Display *, XErrorEvent *e)
 {
     if (e->error_code == BadWindow || e->error_code == BadDrawable || e->error_code == BadMatch)
@@ -33,9 +42,238 @@ static int xerr(Display *, XErrorEvent *e)
     return 0;
 }
 
+static long now_ms()
+{
+    timeval tv{};
+    gettimeofday(&tv, nullptr);
+    return tv.tv_sec * 1000L + tv.tv_usec / 1000;
+}
+
+static std::string shell_quote(const std::string &s)
+{
+    std::string o = "'";
+    for (char c : s) {
+        if (c == '\'')
+            o += "'\\''";
+        else
+            o += c;
+    }
+    o += "'";
+    return o;
+}
+
+static const char *kEditorCmd = "editor || aterm -e vi || xterm -e vi || true";
+static const char *kTermCmd = "aterm || xterm || x-terminal-emulator || true";
+
+static uint16_t read_u16(FILE *f)
+{
+    int a = fgetc(f), b = fgetc(f);
+    if (a < 0 || b < 0)
+        return 0;
+    return (uint16_t)(a | (b << 8));
+}
+
+static uint32_t read_u32(FILE *f)
+{
+    uint16_t lo = read_u16(f), hi = read_u16(f);
+    return lo | ((uint32_t)hi << 16);
+}
+
+static bool ppm_skip(FILE *f)
+{
+    int c;
+    do {
+        c = fgetc(f);
+        if (c == '#')
+            while (c != '\n' && c != EOF)
+                c = fgetc(f);
+    } while (c == ' ' || c == '\n' || c == '\t' || c == '\r');
+    if (c == EOF)
+        return false;
+    ungetc(c, f);
+    return true;
+}
+
+static bool load_ppm(FILE *f, Raster &out)
+{
+    char mag[3] = {};
+    if (fread(mag, 1, 2, f) != 2 || mag[0] != 'P' || mag[1] != '6')
+        return false;
+    int w = 0, h = 0, maxv = 0;
+    if (!ppm_skip(f) || fscanf(f, "%d", &w) != 1)
+        return false;
+    if (!ppm_skip(f) || fscanf(f, "%d", &h) != 1)
+        return false;
+    if (!ppm_skip(f) || fscanf(f, "%d", &maxv) != 1 || w < 1 || h < 1 || w > 4096 || h > 4096)
+        return false;
+    fgetc(f);
+    out.w = w;
+    out.h = h;
+    out.rgb.resize((size_t)w * h * 3);
+    return fread(out.rgb.data(), 1, out.rgb.size(), f) == out.rgb.size();
+}
+
+static bool load_bmp(FILE *f, Raster &out)
+{
+    if (fgetc(f) != 'B' || fgetc(f) != 'M')
+        return false;
+    read_u32(f);
+    read_u16(f);
+    read_u16(f);
+    uint32_t off = read_u32(f);
+    uint32_t hdr = read_u32(f);
+    if (hdr < 40)
+        return false;
+    int32_t width = (int32_t)read_u32(f);
+    int32_t height = (int32_t)read_u32(f);
+    read_u16(f);
+    uint16_t bpp = read_u16(f);
+    uint32_t comp = read_u32(f);
+    if (comp != 0 || (bpp != 24 && bpp != 32) || width < 1 || width > 4096)
+        return false;
+    int h = height < 0 ? -height : height;
+    if (h < 1 || h > 4096)
+        return false;
+    bool topdown = height < 0;
+    if (fseek(f, (long)off, SEEK_SET) != 0)
+        return false;
+    out.w = width;
+    out.h = h;
+    out.rgb.assign((size_t)width * h * 3, 0);
+    int bppb = bpp / 8;
+    int rowb = (width * bppb + 3) & ~3;
+    std::vector<uint8_t> row((size_t)rowb);
+    for (int y = 0; y < h; y++) {
+        if (fread(row.data(), 1, (size_t)rowb, f) != (size_t)rowb)
+            return false;
+        int dy = topdown ? y : (h - 1 - y);
+        for (int x = 0; x < width; x++) {
+            int s = x * bppb;
+            size_t d = ((size_t)dy * width + x) * 3;
+            out.rgb[d] = row[s + 2];
+            out.rgb[d + 1] = row[s + 1];
+            out.rgb[d + 2] = row[s];
+        }
+    }
+    return true;
+}
+
+static bool is_image_name(const char *n)
+{
+    size_t len = strlen(n);
+    if (len < 4)
+        return false;
+    const char *e4 = n + len - 4;
+    if (!strcasecmp(e4, ".ppm") || !strcasecmp(e4, ".bmp") || !strcasecmp(e4, ".png") || !strcasecmp(e4, ".jpg") ||
+        !strcasecmp(e4, ".gif") || !strcasecmp(e4, ".pnm"))
+        return true;
+    return len >= 5 && !strcasecmp(n + len - 5, ".jpeg");
+}
+
+static bool convert_to_ppm(const char *src, const char *dst)
+{
+    std::string q = shell_quote(src);
+    std::string d = shell_quote(dst);
+    char cmd[2048];
+    std::snprintf(cmd, sizeof(cmd),
+                  "convert %s -depth 8 ppm:%s 2>/dev/null || "
+                  "magick %s -depth 8 ppm:%s 2>/dev/null || "
+                  "ffmpeg -nostdin -y -i %s -pix_fmt rgb24 %s >/dev/null 2>&1",
+                  q.c_str(), d.c_str(), q.c_str(), d.c_str(), q.c_str(), d.c_str());
+    return system(cmd) == 0;
+}
+
+static bool load_image_path(const char *path, Raster &out)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return false;
+    char mag[2] = {};
+    if (fread(mag, 1, 2, f) != 2) {
+        fclose(f);
+        return false;
+    }
+    rewind(f);
+    bool ok = false;
+    if (mag[0] == 'P' && mag[1] == '6')
+        ok = load_ppm(f, out);
+    else if (mag[0] == 'B' && mag[1] == 'M')
+        ok = load_bmp(f, out);
+    fclose(f);
+    if (ok && out.w > 0)
+        return true;
+    char tmp[64];
+    std::snprintf(tmp, sizeof(tmp), "/tmp/chime-wall-%d.ppm", (int)getpid());
+    if (!convert_to_ppm(path, tmp))
+        return false;
+    FILE *g = fopen(tmp, "rb");
+    if (!g) {
+        unlink(tmp);
+        return false;
+    }
+    ok = load_ppm(g, out);
+    fclose(g);
+    unlink(tmp);
+    return ok && out.w > 0;
+}
+
+static bool save_ppm(const char *path, const Raster &r)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        return false;
+    std::fprintf(f, "P6\n%d %d\n255\n", r.w, r.h);
+    bool ok = fwrite(r.rgb.data(), 1, r.rgb.size(), f) == r.rgb.size();
+    fclose(f);
+    return ok;
+}
+
+static Raster scale_nn(const Raster &s, int nw, int nh)
+{
+    Raster d;
+    d.w = nw;
+    d.h = nh;
+    d.rgb.resize((size_t)nw * (size_t)nh * 3);
+    if (s.w < 1 || s.h < 1)
+        return d;
+    for (int y = 0; y < nh; y++) {
+        int sy = y * s.h / nh;
+        for (int x = 0; x < nw; x++) {
+            int sx = x * s.w / nw;
+            memcpy(&d.rgb[((size_t)y * nw + x) * 3], &s.rgb[((size_t)sy * s.w + sx) * 3], 3);
+        }
+    }
+    return d;
+}
+
+static std::string base_name(const std::string &p)
+{
+    auto sl = p.find_last_of('/');
+    return sl == std::string::npos ? p : p.substr(sl + 1);
+}
+
+static ColorScheme scheme_from_builtin(const w95::Scheme &b)
+{
+    ColorScheme s;
+    s.name = b.name;
+    s.desktop = b.desktop;
+    s.face = b.face;
+    s.hi = b.hi;
+    s.lo = b.lo;
+    s.dk = b.dk;
+    s.title = b.title;
+    s.title_in = b.title_in;
+    s.text = b.text;
+    s.field = b.field;
+    s.banner = b.banner;
+    s.builtin = true;
+    return s;
+}
+
 unsigned long WM::alloc_rgb(w95::Rgb c)
 {
     XColor xc{};
+    // 8-bit channel -> 16-bit XColor: 255*257 = 65535.
     xc.red = (unsigned short)(c.r * 257);
     xc.green = (unsigned short)(c.g * 257);
     xc.blue = (unsigned short)(c.b * 257);
@@ -44,6 +282,8 @@ unsigned long WM::alloc_rgb(w95::Rgb c)
     return xc.pixel;
 }
 
+// Create an InputOutput window on the root. override_redirect is set for
+// shell chrome (taskbar, menus, dialogs) so we never try to manage ourselves.
 Window WM::mkwin(int x, int y, int w, int h, unsigned long bg, long mask, bool override)
 {
     XSetWindowAttributes swa{};
@@ -59,6 +299,7 @@ Window WM::mkwin(int x, int y, int w, int h, unsigned long bg, long mask, bool o
 
 void WM::intern_atoms()
 {
+    // ICCCM names first, then EWMH, then freedesktop system tray / XEmbed.
     utf8 = XInternAtom(dpy, "UTF8_STRING", False);
     wm_protocols = XInternAtom(dpy, "WM_PROTOCOLS", False);
     wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
@@ -82,6 +323,7 @@ void WM::intern_atoms()
     net_wm_state_maxh = XInternAtom(dpy, "_NET_WM_STATE_MAXIMIZED_HORZ", False);
     net_active_window = net_active;
     motif_hints = XInternAtom(dpy, "_MOTIF_WM_HINTS", False);
+    // Selection name is per-screen: _NET_SYSTEM_TRAY_S0 on the first screen.
     char tray_sel[32];
     std::snprintf(tray_sel, sizeof(tray_sel), "_NET_SYSTEM_TRAY_S%d", screen);
     net_system_tray = XInternAtom(dpy, tray_sel, False);
@@ -93,6 +335,8 @@ void WM::intern_atoms()
     manager = XInternAtom(dpy, "MANAGER", False);
 }
 
+// Announce ourselves as the supporting WM and publish the subset of EWMH
+// we actually implement (one virtual desktop, workarea, active window, …).
 void WM::ewmh_init()
 {
     checkwin = XCreateSimpleWindow(dpy, root, 0, 0, 1, 1, 0, 0, 0);
@@ -112,6 +356,8 @@ void WM::ewmh_init()
 
 void WM::ewmh_update()
 {
+    // Work area is the primary monitor minus the taskbar. Clients that honor
+    // _NET_WORKAREA (few on this image) will avoid covering the bar.
     long geom[2] = {sw, sh};
     XChangeProperty(dpy, root, net_desktop_geometry, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)geom, 2);
     long wa[4] = {0, 0, sw, sh - w95::kTaskbarH};
@@ -137,6 +383,8 @@ void WM::ewmh_update()
     XChangeProperty(dpy, root, net_active, XA_WINDOW, 32, PropModeReplace, (unsigned char *)&aw, 1);
 }
 
+// Run cmd via /bin/sh in a new session. SIGCHLD is ignored in init() so
+// we never wait; "|| true" in callers keeps the child from looking failed.
 void WM::launch(const char *cmd)
 {
     if (fork() == 0) {
@@ -148,6 +396,7 @@ void WM::launch(const char *cmd)
 
 std::string WM::get_name(Window w)
 {
+    // Prefer UTF-8 EWMH title; fall back to ICCCM WM_NAME; else "Untitled".
     Atom type;
     int fmt;
     unsigned long n, extra;
@@ -171,6 +420,7 @@ std::string WM::get_name(Window w)
 
 bool WM::has_proto(Window w, Atom a)
 {
+    // True if the client listed `a` in WM_PROTOCOLS (e.g. WM_DELETE_WINDOW).
     Atom *protos = nullptr;
     int n = 0;
     if (!XGetWMProtocols(dpy, w, &protos, &n) || !protos)
@@ -185,6 +435,7 @@ bool WM::has_proto(Window w, Atom a)
 
 void WM::send_client_message(Window w, Atom type, long a, long b, long c)
 {
+    // 32-bit ClientMessage with up to three longs (WM_PROTOCOLS, EWMH, …).
     XEvent ev{};
     ev.type = ClientMessage;
     ev.xclient.window = w;
@@ -196,6 +447,9 @@ void WM::send_client_message(Window w, Atom type, long a, long b, long c)
     XSendEvent(dpy, w, False, NoEventMask, &ev);
 }
 
+// RandR active monitors first, then Xinerama, then a single root-sized head.
+// Xfbdev on the live ISO has no RandR outputs, so we almost always hit the
+// last fallback there.
 std::vector<Monitor> WM::query_monitors()
 {
     std::vector<Monitor> out;
@@ -252,9 +506,12 @@ std::vector<Monitor> WM::query_monitors()
 
 void WM::create_shell(Monitor &m)
 {
-    long dmask = ExposureMask | ButtonPressMask | ButtonReleaseMask | ButtonMotionMask;
+    // Desktop fills the work area; taskbar sits on the bottom edge. Menus are
+    // created off-screen-ish and mapped when opened. override_redirect on all.
+    long dmask = ExposureMask | ButtonPressMask | ButtonReleaseMask | ButtonMotionMask | KeyPressMask;
     long tmask = ExposureMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask | LeaveWindowMask;
-    long mmask = ExposureMask | ButtonPressMask | PointerMotionMask | LeaveWindowMask | EnterWindowMask;
+    long mmask = ExposureMask | ButtonPressMask | PointerMotionMask | LeaveWindowMask | EnterWindowMask | KeyPressMask |
+                 KeyReleaseMask;
     m.desktop = mkwin(m.x, m.y, m.w, m.h - w95::kTaskbarH, desktop.pix, dmask, true);
     m.taskbar = mkwin(m.x, m.y + m.h - w95::kTaskbarH, m.w, w95::kTaskbarH, face.pix, tmask, true);
     int mw = w95::kBannerW + w95::kMenuBodyW;
@@ -270,6 +527,7 @@ void WM::create_shell(Monitor &m)
 
 void WM::destroy_shell(Monitor &m)
 {
+    // Submenu first so we don't leave an orphan mapped after the Start menu dies.
     if (m.submenu)
         XDestroyWindow(dpy, m.submenu);
     if (m.startmenu)
@@ -283,6 +541,8 @@ void WM::destroy_shell(Monitor &m)
 
 void WM::sync_monitors()
 {
+    // Called at startup and on RRScreenChangeNotify. If geometry is unchanged
+    // we only restack; otherwise rebuild shell windows and clamp clients.
     sw = DisplayWidth(dpy, screen);
     sh = DisplayHeight(dpy, screen);
     auto geoms = query_monitors();
@@ -337,6 +597,8 @@ void WM::sync_monitors()
 
 void WM::restack_shell()
 {
+    // Desktop always at the bottom, taskbar always on top of clients, then
+    // menus and modal dialogs. Raise order matters for click-through.
     for (auto &m : mons)
         if (m.desktop)
             XLowerWindow(dpy, m.desktop);
@@ -355,10 +617,15 @@ void WM::restack_shell()
         XRaiseWindow(dpy, shutdlg);
     if (set_open)
         XRaiseWindow(dpy, setdlg);
+    if (color_open)
+        XRaiseWindow(dpy, colordlg);
+    if (file_open)
+        XRaiseWindow(dpy, filedlg);
 }
 
 int WM::monitor_at(int x, int y)
 {
+    // Point-in-rect, then nearest center if the pointer is in a gap/overlap.
     for (size_t i = 0; i < mons.size(); i++) {
         Monitor &m = mons[i];
         if (x >= m.x && y >= m.y && x < m.x + m.w && y < m.y + m.h)
@@ -380,6 +647,7 @@ int WM::monitor_at(int x, int y)
 
 int WM::monitor_for(Client *c)
 {
+    // Iconic windows keep last_mon so their task button stays on the old head.
     if (!c)
         return 0;
     if (c->iconic)
@@ -389,6 +657,7 @@ int WM::monitor_for(Client *c)
 
 Monitor *WM::mon_by_window(Window w)
 {
+    // Desktop, taskbar, Start menu, or Programs flyout belonging to a head.
     for (auto &m : mons) {
         if (m.desktop == w || m.taskbar == w || m.startmenu == w || m.submenu == w)
             return &m;
@@ -423,8 +692,150 @@ int WM::pointer_mon()
     return monitor_at(rx, ry);
 }
 
+static void desk_cell(int i, int &x, int &y, int &w, int &h)
+{
+    x = 12;
+    y = 12 + i * w95::kCellH;
+    w = w95::kCellW;
+    h = w95::kCellH;
+}
+
+static bool rects_hit(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh)
+{
+    return ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah;
+}
+
+void WM::desk_select_only(int i)
+{
+    if (i < 0 || i > 3) {
+        selected_icon = -1;
+        desk_mask = 0;
+        return;
+    }
+    selected_icon = i;
+    desk_mask = 1u << i;
+}
+
+void WM::select_desk_icons(int x0, int y0, int x1, int y1, unsigned base)
+{
+    int rx = std::min(x0, x1), ry = std::min(y0, y1);
+    int rw = std::abs(x1 - x0), rh = std::abs(y1 - y0);
+    unsigned m = base;
+    int last = selected_icon;
+    for (int i = 0; i < 4; i++) {
+        int ix, iy, iw, ih;
+        desk_cell(i, ix, iy, iw, ih);
+        if (rects_hit(rx, ry, rw, rh, ix, iy, iw, ih)) {
+            m |= 1u << i;
+            last = i;
+        }
+    }
+    desk_mask = m;
+    if (m)
+        selected_icon = last;
+}
+
+void WM::activate_desk_sel()
+{
+    if (!desk_mask && selected_icon >= 0)
+        activate_desk_icon(selected_icon);
+    else {
+        for (int i = 0; i < 4; i++)
+            if (desk_mask & (1u << i))
+                activate_desk_icon(i);
+    }
+}
+
+void WM::refresh_modes()
+{
+    modes.clear();
+    auto add = [&](int w, int h) {
+        if (w < 320 || h < 200 || w > 7680 || h > 4320)
+            return;
+        for (auto &m : modes)
+            if (m.w == w && m.h == h)
+                return;
+        modes.push_back({w, h});
+    };
+    int nsz = 0;
+    XRRScreenSize *ss = XRRSizes(dpy, screen, &nsz);
+    if (ss) {
+        for (int i = 0; i < nsz; i++)
+            add(ss[i].width, ss[i].height);
+    }
+    if (have_randr) {
+        XRRScreenResources *sr = XRRGetScreenResourcesCurrent(dpy, root);
+        if (sr) {
+            for (int i = 0; i < sr->nmode; i++)
+                add((int)sr->modes[i].width, (int)sr->modes[i].height);
+            XRRFreeScreenResources(sr);
+        }
+    }
+    static const int kCommon[][2] = {{640, 480},   {800, 600},   {1024, 768},  {1280, 720},  {1280, 800},
+                                     {1280, 1024}, {1366, 768},  {1440, 900},  {1600, 900},  {1600, 1200},
+                                     {1920, 1080}, {1920, 1200}};
+    for (auto &c : kCommon)
+        add(c[0], c[1]);
+    add(sw, sh);
+    std::sort(modes.begin(), modes.end(), [](const VideoMode &a, const VideoMode &b) {
+        return a.w != b.w ? a.w < b.w : a.h < b.h;
+    });
+    mode_i = 0;
+    for (int i = 0; i < (int)modes.size(); i++)
+        if (modes[i].w == sw && modes[i].h == sh)
+            mode_i = i;
+    mode_scroll = 0;
+    mode_note.clear();
+}
+
+bool WM::apply_mode(int i)
+{
+    if (i < 0 || i >= (int)modes.size())
+        return false;
+    int w = modes[i].w, h = modes[i].h;
+    mode_i = i;
+    const char *home = getenv("HOME");
+    if (home && *home) {
+        mkdir((std::string(home) + "/.chime").c_str(), 0755);
+        std::string path = std::string(home) + "/.chime/xmode";
+        FILE *f = fopen(path.c_str(), "w");
+        if (f) {
+            std::fprintf(f, "%dx%d\n", w, h);
+            fclose(f);
+        }
+    }
+    int nsz = 0;
+    XRRScreenSize *ss = XRRSizes(dpy, screen, &nsz);
+    if (ss) {
+        for (int s = 0; s < nsz; s++) {
+            if (ss[s].width != w || ss[s].height != h)
+                continue;
+            XRRScreenConfiguration *sc = XRRGetScreenInfo(dpy, root);
+            if (!sc)
+                break;
+            Rotation rot = RR_Rotate_0;
+            XRRConfigCurrentConfiguration(sc, &rot);
+            Status st = XRRSetScreenConfig(dpy, sc, root, (int)s, rot, CurrentTime);
+            XRRFreeScreenConfigInfo(sc);
+            if (st == Success) {
+                mode_note.clear();
+                return true;
+            }
+        }
+    }
+    char cmd[160];
+    std::snprintf(cmd, sizeof cmd, "xrandr -s %dx%d >/dev/null 2>&1", w, h);
+    if (system(cmd) == 0) {
+        mode_note.clear();
+        return true;
+    }
+    mode_note = "Saved. Log out to apply on this display.";
+    return false;
+}
+
 int WM::tray_width(const Monitor &m)
 {
+    // Only the primary bar grows for docked icons; other bars stay clock-sized.
     int w = w95::kClockW;
     if (m.primary && !tray_icons.empty())
         w += 4 + (int)tray_icons.size() * w95::kTraySlot;
@@ -441,6 +852,7 @@ bool WM::is_tray_icon(Window w)
 
 void WM::tray_send_xembed(Window w, long msg, long detail, long d1, long d2)
 {
+    // XEmbed client message: l[1] is the opcode (0 = EMBEDDED_NOTIFY).
     XEvent ev{};
     ev.xclient.type = ClientMessage;
     ev.xclient.window = w;
@@ -456,6 +868,7 @@ void WM::tray_send_xembed(Window w, long msg, long detail, long d1, long d2)
 
 void WM::tray_stash()
 {
+    // Park icons on the root while we destroy/recreate traywin on monitor sync.
     for (Window w : tray_icons) {
         XSelectInput(dpy, w, StructureNotifyMask);
         XReparentWindow(dpy, w, root, 0, 0);
@@ -466,6 +879,8 @@ void WM::tray_stash()
 
 void WM::tray_claim()
 {
+    // Own _NET_SYSTEM_TRAY_S<n> and broadcast MANAGER so tray clients (volicon)
+    // can find us. Launch volicon once after we hold the selection.
     if (!traywin)
         return;
     long orient = 0;
@@ -493,6 +908,7 @@ void WM::tray_claim()
 
 void WM::tray_create()
 {
+    // Child of the primary taskbar, right-aligned. Reparents any stashed icons.
     Monitor *p = primary_mon();
     if (!p || !p->taskbar)
         return;
@@ -518,6 +934,7 @@ void WM::tray_create()
 
 void WM::tray_layout()
 {
+    // Resize the well, then pack icons left-to-right and the clock on the right.
     Monitor *p = primary_mon();
     if (!p || !traywin || !p->taskbar)
         return;
@@ -538,6 +955,8 @@ void WM::tray_layout()
 
 void WM::tray_dock(Window w)
 {
+    // SYSTEM_TRAY_REQUEST_DOCK. If the window was already managed as a client
+    // (rare), drop the frame first so it becomes a 20x20 child of traywin.
     if (!w || w == traywin || is_internal(w) || is_tray_icon(w))
         return;
     if (Client *c = find_client(w))
@@ -567,13 +986,16 @@ void WM::tray_undock(Window w)
 
 bool WM::is_internal(Window w)
 {
-    if (w == rundlg || w == shutdlg || w == setdlg || w == checkwin || w == snapwin || w == traywin || w == root)
+    // Anything we created (chrome, dialogs, tray) must not go through manage().
+    if (w == rundlg || w == shutdlg || w == setdlg || w == checkwin || w == snapwin || w == traywin || w == root ||
+        w == colordlg || w == filedlg)
         return true;
     return mon_by_window(w) != nullptr || is_tray_icon(w);
 }
 
 Client *WM::find_client(Window w)
 {
+    // Match the application's window, not the frame we wrapped it in.
     for (auto &c : clients)
         if (c->win == w)
             return c.get();
@@ -590,6 +1012,7 @@ Client *WM::find_frame(Window w)
 
 std::vector<Client *> WM::clients_on(int mi)
 {
+    // Taskbar buttons and Alt+Tab cycle only windows whose center is on this head.
     std::vector<Client *> out;
     for (auto &c : clients)
         if (monitor_for(c.get()) == mi)
@@ -599,12 +1022,15 @@ std::vector<Client *> WM::clients_on(int mi)
 
 void WM::set_wm_state(Client *c, long state)
 {
+    // ICCCM WM_STATE: NormalState or IconicState. Second long is unused icon window.
     long data[2] = {state, None};
     XChangeProperty(dpy, c->win, wm_state, wm_state, 32, PropModeReplace, (unsigned char *)data, 2);
 }
 
 void WM::send_configure(Client *c)
 {
+    // Synthetic ConfigureNotify with the client (inner) geometry, as ICCCM
+    // requires after we reparent/resize.
     XConfigureEvent ce{};
     ce.type = ConfigureNotify;
     ce.event = c->win;
@@ -621,6 +1047,7 @@ void WM::send_configure(Client *c)
 
 void WM::apply_geom(Client *c)
 {
+    // Outer frame on root, inner client inset by bevel + caption.
     if (c->w < 80)
         c->w = 80;
     if (c->h < 50)
@@ -639,6 +1066,9 @@ void WM::apply_geom(Client *c)
 
 void WM::manage(Window w)
 {
+    // Reparent a MapRequest into a decorated frame. Position is a cascade on
+    // the monitor that currently has the pointer. override_redirect windows
+    // (menus, dmenu, our own chrome) are left alone.
     if (is_internal(w) || find_client(w) || find_frame(w) || is_tray_icon(w) || w == traywin)
         return;
     XWindowAttributes wa{};
@@ -676,6 +1106,7 @@ void WM::manage(Window w)
     XSetWindowBorderWidth(dpy, w, 0);
     XReparentWindow(dpy, w, c->frame, w95::kFrameB, w95::kFrameB + w95::kTitleH);
     XSelectInput(dpy, w, PropertyChangeMask | StructureNotifyMask);
+    // Sync grab: we see the click first, raise/focus, then ReplayPointer.
     XGrabButton(dpy, AnyButton, AnyModifier, w, False, ButtonPressMask, GrabModeSync, GrabModeAsync, None, None);
     XResizeWindow(dpy, w, (unsigned)(c->w - 2 * w95::kFrameB), (unsigned)(c->h - 2 * w95::kFrameB - w95::kTitleH));
     XMapWindow(dpy, w);
@@ -693,6 +1124,7 @@ void WM::manage(Window w)
 
 void WM::unmanage(Client *c, bool destroyed)
 {
+    // destroyed==true: the client already vanished; don't reparent or ungrab.
     if (!c)
         return;
     if (focused == c)
@@ -712,6 +1144,8 @@ void WM::unmanage(Client *c, bool destroyed)
     clients.erase(std::remove_if(clients.begin(), clients.end(), [&](auto &p) { return p.get() == c; }), clients.end());
     if (!focused && !clients.empty())
         focus(clients.back().get());
+    else if (!focused)
+        ungrab_if_idle();
     for (auto &m : mons)
         draw_taskbar(m);
     ewmh_update();
@@ -719,33 +1153,28 @@ void WM::unmanage(Client *c, bool destroyed)
 
 void WM::focus(Client *c)
 {
+    // Click-to-focus: the last click target owns both the keyboard and the
+    // active caption. Shell chrome (Start, desktop, dialogs) is routed in
+    // ungrab_if_idle() after we update `focused`.
     Client *old = focused;
     focused = c;
     if (old && old != c)
         draw_frame(old);
     if (c && !c->iconic) {
-        XSetInputFocus(dpy, c->win, RevertToPointerRoot, CurrentTime);
-        if (has_proto(c->win, wm_take_focus))
-            send_client_message(c->win, wm_protocols, (long)wm_take_focus, CurrentTime);
         draw_frame(c);
         c->last_mon = monitor_for(c);
-    } else if (!c) {
-        XSetInputFocus(dpy, root, RevertToPointerRoot, CurrentTime);
     }
     for (auto &m : mons)
         draw_taskbar(m);
     ewmh_update();
-    if (run_open) {
-        XSetInputFocus(dpy, rundlg, RevertToPointerRoot, CurrentTime);
-        XGrabKeyboard(dpy, rundlg, True, GrabModeAsync, GrabModeAsync, CurrentTime);
-    } else if (set_open) {
-        XSetInputFocus(dpy, setdlg, RevertToPointerRoot, CurrentTime);
-        XGrabKeyboard(dpy, setdlg, True, GrabModeAsync, GrabModeAsync, CurrentTime);
-    }
+    ungrab_if_idle();
+    if (c && !c->iconic && has_proto(c->win, wm_take_focus))
+        send_client_message(c->win, wm_protocols, (long)wm_take_focus, CurrentTime);
 }
 
 void WM::raise_client(Client *c)
 {
+    // Raise the frame, then restack_shell so the taskbar stays above it.
     if (!c)
         return;
     XRaiseWindow(dpy, c->frame);
@@ -754,6 +1183,7 @@ void WM::raise_client(Client *c)
 
 void WM::close_client(Client *c)
 {
+    // Prefer WM_DELETE_WINDOW so apps can save; XKillClient is the last resort.
     if (!c)
         return;
     if (has_proto(c->win, wm_delete))
@@ -764,6 +1194,7 @@ void WM::close_client(Client *c)
 
 void WM::minimize(Client *c)
 {
+    // ignore_unmap: the UnmapNotify from XUnmapWindow must not unmanage us.
     if (!c || c->iconic)
         return;
     c->last_mon = monitor_for(c);
@@ -779,6 +1210,7 @@ void WM::minimize(Client *c)
 
 void WM::restore(Client *c)
 {
+    // Map the frame again and give it focus. Counterpart to minimize().
     if (!c)
         return;
     c->iconic = false;
@@ -790,6 +1222,7 @@ void WM::restore(Client *c)
 
 void WM::remember_float(Client *c)
 {
+    // Only snapshot if we are not already snapped; otherwise rx/ry would be the tile.
     if (!c || c->maxed || c->tiled)
         return;
     c->rx = c->x;
@@ -800,6 +1233,8 @@ void WM::remember_float(Client *c)
 
 void WM::float_for_drag(Client *c, int px, int py)
 {
+    // Pull a maximized/tiled window back to its remembered size, keeping the
+    // pointer over the same relative X so the caption doesn't jump.
     if (!c || (!c->maxed && !c->tiled))
         return;
     int rw = c->rw > 80 ? c->rw : 320;
@@ -825,6 +1260,8 @@ void WM::float_for_drag(Client *c, int px, int py)
 
 Snap WM::snap_at(int px, int py)
 {
+    // Corners beat edges. The taskbar strip counts as "bottom" so you can
+    // snap BL/BR without hunting the last 24px of the work area.
     if (mons.empty())
         return Snap::Off;
     Monitor &m = mons[monitor_at(px, py)];
@@ -853,6 +1290,7 @@ Snap WM::snap_at(int px, int py)
 
 void WM::snap_rect(Snap s, int px, int py, int &x, int &y, int &w, int &h)
 {
+    // Work area of the monitor under the pointer, then split into half/quarter.
     Monitor &m = mons[monitor_at(px, py)];
     x = m.x;
     y = m.y;
@@ -896,6 +1334,7 @@ void WM::snap_rect(Snap s, int px, int py, int &x, int &y, int &w, int &h)
 
 void WM::apply_snap(Client *c, Snap s, int px, int py)
 {
+    // Top => maxed; other edges => tiled. Both remember the previous float size.
     if (!c || s == Snap::Off || mons.empty())
         return;
     remember_float(c);
@@ -916,6 +1355,7 @@ void WM::apply_snap(Client *c, Snap s, int px, int py)
 
 void WM::show_snap_preview(Snap s, int px, int py)
 {
+    // Overlay a fake captioned window; keep the dragged frame and taskbars above it.
     if (!snapwin || s == Snap::Off) {
         hide_snap_preview();
         return;
@@ -945,6 +1385,7 @@ void WM::hide_snap_preview()
 
 void WM::draw_snap_preview()
 {
+    // Mini framed window: navy fill, raised bevel, fake caption bar.
     if (!snapwin)
         return;
     XWindowAttributes wa{};
@@ -962,6 +1403,7 @@ void WM::draw_snap_preview()
 
 void WM::maximize_toggle(Client *c)
 {
+    // Restore uses the stored float rect; maximize snaps to Top on the pointer's head.
     if (!c)
         return;
     if (c->maxed) {
@@ -987,6 +1429,7 @@ void WM::maximize_toggle(Client *c)
 
 Hit WM::hit_frame(Client *c, int x, int y)
 {
+    // Coordinates are relative to the frame. Corners get a 12px extra grab.
     const int B = w95::kFrameB;
     const int T = w95::kTitleH;
     if (y < B) {
@@ -1030,6 +1473,7 @@ Hit WM::hit_frame(Client *c, int x, int y)
 
 Cursor WM::cursor_for(Hit h)
 {
+    // Title uses fleur (move); edges use the matching XC_* font cursor.
     switch (h) {
     case Hit::EdgeN:
         return cur_n;
@@ -1056,7 +1500,12 @@ Cursor WM::cursor_for(Hit h)
 
 void WM::close_menus()
 {
+    // Unmap Start + Programs on every head. Hover state is reset so the next
+    // open does not paint a stale highlight.
+    bool had = false;
     for (auto &m : mons) {
+        if (m.start_open || m.sub_open)
+            had = true;
         if (m.start_open)
             XUnmapWindow(dpy, m.startmenu);
         if (m.sub_open)
@@ -1065,10 +1514,14 @@ void WM::close_menus()
         m.hover = m.subhover = -1;
         draw_taskbar(m);
     }
+    if (had)
+        ungrab_if_idle();
 }
 
 void WM::open_start(Monitor &m)
 {
+    // Clicking Start while it is open closes it (toggle). close_menus() first
+    // so we never leave two heads' Start menus mapped.
     bool was = m.start_open;
     close_menus();
     if (was)
@@ -1079,8 +1532,12 @@ void WM::open_start(Monitor &m)
     int my = m.y + m.h - w95::kTaskbarH - mh;
     XMoveResizeWindow(dpy, m.startmenu, mx, my, (unsigned)mw, (unsigned)mh);
     m.start_open = true;
-    m.hover = -1;
+    m.hover = menu_step(-1, 1);
+    m.subhover = -1;
     XMapRaised(dpy, m.startmenu);
+    // Deactivate the client caption; keyboard + highlight follow this menu.
+    focus(nullptr);
+    sync_start_pointer(m);
     draw_startmenu(m);
     draw_taskbar(m);
 }
@@ -1090,12 +1547,13 @@ void WM::close_run()
     if (!run_open)
         return;
     run_open = false;
-    XUngrabKeyboard(dpy, CurrentTime);
     XUnmapWindow(dpy, rundlg);
+    ungrab_if_idle();
 }
 
 void WM::open_run(int mi)
 {
+    // Centered on monitor mi. Keyboard grab so keys don't go to the focused client.
     close_menus();
     if (mons.empty())
         return;
@@ -1107,12 +1565,13 @@ void WM::open_run(int mi)
     int x = m.x + (m.w - w) / 2;
     int y = m.y + (m.h - w95::kTaskbarH - h) / 3;
     XMoveResizeWindow(dpy, rundlg, x, y, (unsigned)w, (unsigned)h);
-    if (!run_open)
+    if (!run_open) {
         run_text.clear();
+        run_cursor = 0;
+    }
     run_open = true;
     XMapRaised(dpy, rundlg);
-    XSetInputFocus(dpy, rundlg, RevertToPointerRoot, CurrentTime);
-    XGrabKeyboard(dpy, rundlg, True, GrabModeAsync, GrabModeAsync, CurrentTime);
+    focus(nullptr);
     draw_rundlg();
 }
 
@@ -1127,6 +1586,7 @@ void WM::open_shut(int mi)
     XMoveResizeWindow(dpy, shutdlg, x, y, (unsigned)w, (unsigned)h);
     shut_open = true;
     XMapRaised(dpy, shutdlg);
+    focus(nullptr);
     draw_shutdlg();
 }
 
@@ -1137,11 +1597,7 @@ static void add_wall_dir(std::vector<WallChoice> &walls, const char *dir)
         return;
     while (dirent *e = readdir(d)) {
         const char *n = e->d_name;
-        size_t len = strlen(n);
-        if (len < 5)
-            continue;
-        const char *ext = n + len - 4;
-        if (strcasecmp(ext, ".ppm") != 0 && strcasecmp(ext, ".bmp") != 0)
+        if (!is_image_name(n))
             continue;
         WallChoice w;
         w.name = n;
@@ -1154,6 +1610,8 @@ static void add_wall_dir(std::vector<WallChoice> &walls, const char *dir)
 
 void WM::rebuild_walls()
 {
+    // Built-in patterns first so indices stay stable, then files from the image
+    // and the user's ~/.chime/wallpapers.
     walls.clear();
     const char *pats[] = {"(None)", "Bricks", "Dots", "Weave", "Waves", "Checker"};
     for (int i = 0; i < 6; i++) {
@@ -1172,6 +1630,8 @@ void WM::rebuild_walls()
 
 void WM::make_wall_tile()
 {
+    // Build a pixmap to XCopyArea in tile_wall(). File wallpapers are P6 PPM
+    // (binary RGB). Patterns 1–5 are 32x32 doodles in the current scheme colors.
     if (wall_tile) {
         XFreePixmap(dpy, wall_tile);
         wall_tile = 0;
@@ -1181,54 +1641,22 @@ void WM::make_wall_tile()
         return;
     const WallChoice &W = walls[wall_i];
     if (!W.file.empty()) {
-        FILE *f = fopen(W.file.c_str(), "rb");
-        if (!f)
+        Raster img;
+        if (!load_image_path(W.file.c_str(), img))
             return;
-        int w = 0, h = 0, maxv = 0;
-        char mag[3] = {};
-        if (fread(mag, 1, 2, f) != 2 || mag[0] != 'P' || mag[1] != '6') {
-            fclose(f);
-            return;
+        Monitor *p = primary_mon();
+        int dw = p ? p->w : sw;
+        int dh = p ? p->h - w95::kTaskbarH : sh - w95::kTaskbarH;
+        if (dh < 8)
+            dh = 8;
+        // Photos fill the monitor; small tiles (patterns, textures) repeat.
+        if (img.w >= 128 || img.h >= 128) {
+            img = scale_nn(img, dw, dh);
         }
-        int c;
-        auto skip = [&]() {
-            do {
-                c = fgetc(f);
-                if (c == '#')
-                    while (c != '\n' && c != EOF)
-                        c = fgetc(f);
-            } while (c == ' ' || c == '\n' || c == '\t' || c == '\r');
-            ungetc(c, f);
-        };
-        skip();
-        if (fscanf(f, "%d", &w) != 1) {
-            fclose(f);
-            return;
-        }
-        skip();
-        if (fscanf(f, "%d", &h) != 1) {
-            fclose(f);
-            return;
-        }
-        skip();
-        if (fscanf(f, "%d", &maxv) != 1 || w < 1 || h < 1 || w > 2048 || h > 2048) {
-            fclose(f);
-            return;
-        }
-        fgetc(f);
-        wall_tile = XCreatePixmap(dpy, root, (unsigned)w, (unsigned)h, (unsigned)depth);
-        wall_tw = w;
-        wall_th = h;
-        for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                int r = fgetc(f), g = fgetc(f), b = fgetc(f);
-                if (r < 0)
-                    r = 0;
-                XSetForeground(dpy, gc, alloc_rgb({(uint8_t)r, (uint8_t)g, (uint8_t)b}));
-                XDrawPoint(dpy, wall_tile, gc, x, y);
-            }
-        }
-        fclose(f);
+        wall_tw = img.w;
+        wall_th = img.h;
+        wall_tile = XCreatePixmap(dpy, root, (unsigned)img.w, (unsigned)img.h, (unsigned)depth);
+        blit_rgb(wall_tile, img.rgb.data(), img.w, img.h);
         return;
     }
     if (W.pattern <= 0)
@@ -1237,6 +1665,7 @@ void WM::make_wall_tile()
     wall_tile = XCreatePixmap(dpy, root, 32, 32, (unsigned)depth);
     fill(wall_tile, 0, 0, 32, 32, desktop.pix);
     if (W.pattern == 1) {
+        // Bricks: mortar lines, staggered every other row.
         XSetForeground(dpy, gc, lo.pix);
         for (int y = 0; y < 32; y += 8) {
             XDrawLine(dpy, wall_tile, gc, 0, y, 31, y);
@@ -1247,11 +1676,13 @@ void WM::make_wall_tile()
         for (int y = 1; y < 32; y += 8)
             XDrawLine(dpy, wall_tile, gc, 0, y, 31, y);
     } else if (W.pattern == 2) {
+        // Dots.
         XSetForeground(dpy, gc, dk.pix);
         for (int y = 2; y < 32; y += 4)
             for (int x = 2; x < 32; x += 4)
                 XDrawPoint(dpy, wall_tile, gc, x, y);
     } else if (W.pattern == 3) {
+        // Weave: paired diagonal lines in lo/hi.
         XSetForeground(dpy, gc, lo.pix);
         for (int i = -32; i < 32; i += 4)
             XDrawLine(dpy, wall_tile, gc, i, 0, i + 32, 32);
@@ -1259,6 +1690,7 @@ void WM::make_wall_tile()
         for (int i = -30; i < 32; i += 4)
             XDrawLine(dpy, wall_tile, gc, i, 0, i + 32, 32);
     } else if (W.pattern == 4) {
+        // Waves: a triangle-wave column of points.
         XSetForeground(dpy, gc, title.pix);
         for (int y = 0; y < 32; y++) {
             int x = 16 + (int)((y % 16 < 8 ? y % 8 : 8 - (y % 8)) * 1.5);
@@ -1266,6 +1698,7 @@ void WM::make_wall_tile()
             XDrawPoint(dpy, wall_tile, gc, x + 1, y);
         }
     } else if (W.pattern == 5) {
+        // Checker: 8x8 cells in lo over the desktop color.
         for (int y = 0; y < 32; y += 8)
             for (int x = 0; x < 32; x += 8)
                 if (((x / 8) + (y / 8)) & 1)
@@ -1275,10 +1708,12 @@ void WM::make_wall_tile()
 
 void WM::apply_scheme(int i)
 {
-    if (i < 0 || i >= w95::kSchemeN)
+    if (schemes.empty())
+        init_schemes();
+    if (i < 0 || i >= (int)schemes.size())
         i = 0;
     scheme_i = i;
-    const w95::Scheme &s = w95::kSchemes[i];
+    const ColorScheme &s = schemes[i];
     desktop.pix = alloc_rgb(s.desktop);
     face.pix = alloc_rgb(s.face);
     hi.pix = alloc_rgb(s.hi);
@@ -1306,6 +1741,8 @@ void WM::apply_wall(int i)
 
 void WM::refresh_chrome()
 {
+    // After a scheme/wallpaper change, poke every shell window's background
+    // pixel and repaint. Frames are redrawn so captions pick up the new title color.
     if (!dpy)
         return;
     XSetWindowBackground(dpy, root, desktop.pix);
@@ -1315,6 +1752,10 @@ void WM::refresh_chrome()
         XSetWindowBackground(dpy, shutdlg, face.pix);
     if (setdlg)
         XSetWindowBackground(dpy, setdlg, face.pix);
+    if (colordlg)
+        XSetWindowBackground(dpy, colordlg, face.pix);
+    if (filedlg)
+        XSetWindowBackground(dpy, filedlg, face.pix);
     if (traywin)
         XSetWindowBackground(dpy, traywin, face.pix);
     for (auto &m : mons) {
@@ -1339,12 +1780,17 @@ void WM::refresh_chrome()
         draw_shutdlg();
     if (set_open)
         draw_setdlg();
+    if (color_open)
+        draw_colordlg();
+    if (file_open)
+        draw_filedlg();
     if (traywin)
         draw_tray();
 }
 
 void WM::save_display()
 {
+    // ~/.chime/display is two lines: scheme=<name> and wall=<name>.
     const char *home = getenv("HOME");
     if (!home || !*home)
         return;
@@ -1354,15 +1800,21 @@ void WM::save_display()
     FILE *f = fopen(path.c_str(), "w");
     if (!f)
         return;
-    const char *sn = (scheme_i >= 0 && scheme_i < w95::kSchemeN) ? w95::kSchemes[scheme_i].name : "Chicago";
+    const char *sn = (scheme_i >= 0 && scheme_i < (int)schemes.size()) ? schemes[scheme_i].name.c_str() : "Chicago";
     const char *wn = (wall_i >= 0 && wall_i < (int)walls.size()) ? walls[wall_i].name.c_str() : "(None)";
-    std::fprintf(f, "scheme=%s\nwall=%s\n", sn, wn);
+    int mw = (mode_i >= 0 && mode_i < (int)modes.size()) ? modes[mode_i].w : sw;
+    int mh = (mode_i >= 0 && mode_i < (int)modes.size()) ? modes[mode_i].h : sh;
+    std::fprintf(f, "scheme=%s\nwall=%s\nmode=%dx%d\n", sn, wn, mw, mh);
     fclose(f);
+    save_schemes();
 }
 
 void WM::load_display()
 {
+    // Missing file is fine: Chicago + "(None)" stay at index 0.
+    init_schemes();
     rebuild_walls();
+    refresh_modes();
     const char *home = getenv("HOME");
     if (home && *home) {
         std::string path = std::string(home) + "/.chime/display";
@@ -1374,13 +1826,20 @@ void WM::load_display()
                 if (nl)
                     *nl = 0;
                 if (!strncmp(line, "scheme=", 7)) {
-                    for (int i = 0; i < w95::kSchemeN; i++)
-                        if (!strcmp(line + 7, w95::kSchemes[i].name))
+                    for (int i = 0; i < (int)schemes.size(); i++)
+                        if (schemes[i].name == (line + 7))
                             scheme_i = i;
                 } else if (!strncmp(line, "wall=", 5)) {
                     for (int i = 0; i < (int)walls.size(); i++)
                         if (walls[i].name == (line + 5))
                             wall_i = i;
+                } else if (!strncmp(line, "mode=", 5)) {
+                    int mw = 0, mh = 0;
+                    if (sscanf(line + 5, "%dx%d", &mw, &mh) == 2) {
+                        for (int i = 0; i < (int)modes.size(); i++)
+                            if (modes[i].w == mw && modes[i].h == mh)
+                                mode_i = i;
+                    }
                 }
             }
             fclose(f);
@@ -1392,19 +1851,26 @@ void WM::load_display()
 
 void WM::close_settings(bool revert)
 {
+    // Cancel passes revert=true and restores the snapshot taken in open_settings.
+    close_colordlg(false);
+    close_filedlg();
     if (!set_open)
         return;
     set_open = false;
-    XUngrabKeyboard(dpy, CurrentTime);
     XUnmapWindow(dpy, setdlg);
     if (revert) {
+        schemes = set_save_schemes;
         apply_scheme(set_save_scheme);
         apply_wall(set_save_wall);
+        mode_i = set_save_mode;
+        mode_note.clear();
     }
+    ungrab_if_idle();
 }
 
 void WM::open_settings(int mi)
 {
+    // Snapshot scheme/wall so Cancel can revert live preview changes.
     close_menus();
     if (mons.empty())
         return;
@@ -1414,6 +1880,12 @@ void WM::open_settings(int mi)
     rebuild_walls();
     set_save_scheme = scheme_i;
     set_save_wall = wall_i;
+    set_save_schemes = schemes;
+    refresh_modes();
+    set_save_mode = mode_i;
+    wall_scroll = scheme_scroll = mode_scroll = 0;
+    set_list = 1;
+    mode_note.clear();
     Monitor &m = mons[mi];
     int w = w95::kSetW, h = w95::kSetH;
     int x = m.x + (m.w - w) / 2;
@@ -1423,13 +1895,850 @@ void WM::open_settings(int mi)
     XMoveResizeWindow(dpy, setdlg, x, y, (unsigned)w, (unsigned)h);
     set_open = true;
     XMapRaised(dpy, setdlg);
-    XSetInputFocus(dpy, setdlg, RevertToPointerRoot, CurrentTime);
-    XGrabKeyboard(dpy, setdlg, True, GrabModeAsync, GrabModeAsync, CurrentTime);
+    focus(nullptr);
+    draw_setdlg();
+}
+
+void WM::grab_dialog(Window w)
+{
+    if (!w)
+        return;
+    XSetInputFocus(dpy, w, RevertToPointerRoot, CurrentTime);
+    XGrabKeyboard(dpy, w, True, GrabModeAsync, GrabModeAsync, CurrentTime);
+}
+
+void WM::ungrab_if_idle()
+{
+    // Keyboard follows the last click: dialog, Start menu, focused client, or
+    // the desktop (so arrow keys hit icons after you click the wallpaper).
+    if (run_open)
+        grab_dialog(rundlg);
+    else if (file_open)
+        grab_dialog(filedlg);
+    else if (color_open)
+        grab_dialog(colordlg);
+    else if (set_open)
+        grab_dialog(setdlg);
+    else if (shut_open)
+        grab_dialog(shutdlg);
+    else if (Monitor *sm = open_start_mon()) {
+        if (sm->sub_open && sm->subhover >= 0)
+            grab_dialog(sm->submenu);
+        else
+            grab_dialog(sm->startmenu);
+    } else if (focused && !focused->iconic) {
+        XUngrabKeyboard(dpy, CurrentTime);
+        XSetInputFocus(dpy, focused->win, RevertToPointerRoot, CurrentTime);
+    } else if (Monitor *p = primary_mon(); p && p->desktop)
+        grab_dialog(p->desktop);
+    else {
+        XUngrabKeyboard(dpy, CurrentTime);
+        XSetInputFocus(dpy, root, RevertToPointerRoot, CurrentTime);
+    }
+}
+
+void WM::ensure_list_scroll(int &scroll, int sel, int vis, int n)
+{
+    if (vis < 1)
+        vis = 1;
+    int maxs = std::max(0, n - vis);
+    if (sel >= 0) {
+        if (sel < scroll)
+            scroll = sel;
+        if (sel >= scroll + vis)
+            scroll = sel - vis + 1;
+    }
+    if (scroll < 0)
+        scroll = 0;
+    if (scroll > maxs)
+        scroll = maxs;
+}
+
+unsigned long WM::pixel_from_rgb(std::uint8_t r, std::uint8_t g, std::uint8_t b)
+{
+    if (vis && (vis->c_class == TrueColor || vis->c_class == DirectColor)) {
+        auto pack = [](unsigned v, unsigned long mask) -> unsigned long {
+            if (!mask)
+                return 0;
+            int shift = 0;
+            unsigned long m = mask;
+            while ((m & 1) == 0) {
+                m >>= 1;
+                shift++;
+            }
+            int bits = 0;
+            while (m & 1) {
+                m >>= 1;
+                bits++;
+            }
+            unsigned long maxv = (1UL << bits) - 1;
+            return ((v * maxv) / 255) << shift;
+        };
+        return pack(r, vis->red_mask) | pack(g, vis->green_mask) | pack(b, vis->blue_mask);
+    }
+    return alloc_rgb({r, g, b});
+}
+
+void WM::blit_rgb(Pixmap dst, const std::uint8_t *rgb, int w, int h)
+{
+    if (!rgb || w < 1 || h < 1)
+        return;
+    XImage *im = XCreateImage(dpy, vis, (unsigned)depth, ZPixmap, 0, nullptr, (unsigned)w, (unsigned)h, 32, 0);
+    if (!im)
+        return;
+    im->data = (char *)calloc((size_t)im->bytes_per_line * (size_t)h, 1);
+    if (!im->data) {
+        im->data = nullptr;
+        XDestroyImage(im);
+        return;
+    }
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            const std::uint8_t *p = rgb + ((size_t)y * w + x) * 3;
+            XPutPixel(im, x, y, pixel_from_rgb(p[0], p[1], p[2]));
+        }
+    }
+    XPutImage(dpy, dst, gc, im, 0, 0, 0, 0, (unsigned)w, (unsigned)h);
+    XDestroyImage(im);
+}
+
+w95::Rgb &WM::scheme_role(ColorScheme &s, int role)
+{
+    switch (role) {
+    case 0:
+        return s.desktop;
+    case 1:
+        return s.face;
+    case 2:
+        return s.hi;
+    case 3:
+        return s.lo;
+    case 4:
+        return s.dk;
+    case 5:
+        return s.title;
+    case 6:
+        return s.title_in;
+    case 7:
+        return s.text;
+    case 8:
+        return s.field;
+    default:
+        return s.banner;
+    }
+}
+
+void WM::init_schemes()
+{
+    schemes.clear();
+    for (int i = 0; i < w95::kSchemeN; i++)
+        schemes.push_back(scheme_from_builtin(w95::kSchemes[i]));
+    load_schemes();
+}
+
+std::string WM::unique_scheme_name(const std::string &base)
+{
+    auto used = [&](const std::string &n) {
+        for (auto &s : schemes)
+            if (s.name == n)
+                return true;
+        return false;
+    };
+    if (!used(base))
+        return base;
+    for (int i = 2; i < 100; i++) {
+        std::string n = base + " " + std::to_string(i);
+        if (!used(n))
+            return n;
+    }
+    return base + " copy";
+}
+
+void WM::save_schemes()
+{
+    const char *home = getenv("HOME");
+    if (!home || !*home)
+        return;
+    std::string dir = std::string(home) + "/.chime";
+    mkdir(dir.c_str(), 0755);
+    std::string path = dir + "/schemes";
+    FILE *f = fopen(path.c_str(), "w");
+    if (!f)
+        return;
+    for (auto &s : schemes) {
+        if (s.builtin)
+            continue;
+        auto rgb = [](FILE *fp, const char *k, w95::Rgb c) {
+            std::fprintf(fp, "%s=%d,%d,%d\n", k, c.r, c.g, c.b);
+        };
+        std::fprintf(f, "name=%s\n", s.name.c_str());
+        rgb(f, "desktop", s.desktop);
+        rgb(f, "face", s.face);
+        rgb(f, "hi", s.hi);
+        rgb(f, "lo", s.lo);
+        rgb(f, "dk", s.dk);
+        rgb(f, "title", s.title);
+        rgb(f, "title_in", s.title_in);
+        rgb(f, "text", s.text);
+        rgb(f, "field", s.field);
+        rgb(f, "banner", s.banner);
+        std::fprintf(f, "\n");
+    }
+    fclose(f);
+}
+
+void WM::load_schemes()
+{
+    const char *home = getenv("HOME");
+    if (!home || !*home)
+        return;
+    std::string path = std::string(home) + "/.chime/schemes";
+    FILE *f = fopen(path.c_str(), "r");
+    if (!f)
+        return;
+    ColorScheme cur;
+    bool have = false;
+    auto finish = [&]() {
+        if (!have || cur.name.empty())
+            return;
+        for (auto &s : schemes)
+            if (s.name == cur.name)
+                return;
+        cur.builtin = false;
+        schemes.push_back(cur);
+    };
+    auto parse_rgb = [](const char *p, w95::Rgb &c) {
+        int r = 0, g = 0, b = 0;
+        if (sscanf(p, "%d,%d,%d", &r, &g, &b) == 3) {
+            c.r = (uint8_t)std::clamp(r, 0, 255);
+            c.g = (uint8_t)std::clamp(g, 0, 255);
+            c.b = (uint8_t)std::clamp(b, 0, 255);
+        }
+    };
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n');
+        if (nl)
+            *nl = 0;
+        if (!line[0]) {
+            finish();
+            cur = ColorScheme{};
+            have = false;
+            continue;
+        }
+        if (!strncmp(line, "name=", 5)) {
+            finish();
+            cur = ColorScheme{};
+            cur.name = line + 5;
+            have = true;
+        } else if (!strncmp(line, "desktop=", 8))
+            parse_rgb(line + 8, cur.desktop);
+        else if (!strncmp(line, "face=", 5))
+            parse_rgb(line + 5, cur.face);
+        else if (!strncmp(line, "hi=", 3))
+            parse_rgb(line + 3, cur.hi);
+        else if (!strncmp(line, "lo=", 3))
+            parse_rgb(line + 3, cur.lo);
+        else if (!strncmp(line, "dk=", 3))
+            parse_rgb(line + 3, cur.dk);
+        else if (!strncmp(line, "title_in=", 9))
+            parse_rgb(line + 9, cur.title_in);
+        else if (!strncmp(line, "title=", 6))
+            parse_rgb(line + 6, cur.title);
+        else if (!strncmp(line, "text=", 5))
+            parse_rgb(line + 5, cur.text);
+        else if (!strncmp(line, "field=", 6))
+            parse_rgb(line + 6, cur.field);
+        else if (!strncmp(line, "banner=", 7))
+            parse_rgb(line + 7, cur.banner);
+    }
+    finish();
+    fclose(f);
+}
+
+Monitor *WM::open_start_mon()
+{
+    for (auto &m : mons)
+        if (m.start_open)
+            return &m;
+    return nullptr;
+}
+
+void WM::position_submenu(Monitor &m)
+{
+    int mw = w95::kBannerW + w95::kMenuBodyW;
+    int mh = menu_height();
+    int sx = m.x + 2 + mw - 4;
+    int sy = m.y + m.h - w95::kTaskbarH - mh + 4;
+    if (sx + 150 > m.x + m.w)
+        sx = m.x + 2 - 150 + 4;
+    XMoveWindow(dpy, m.submenu, sx, sy);
+    m.sub_open = true;
+    XMapRaised(dpy, m.submenu);
+    draw_submenu(m);
+}
+
+static int start_item_at(int x, int y)
+{
+    if (x < w95::kBannerW)
+        return -1;
+    int yy = 4;
+    for (int i = 0; i < kMenuN; i++) {
+        int ih = kMenu[i].sep ? 8 : w95::kMenuItemH;
+        if (y >= yy && y < yy + ih)
+            return kMenu[i].sep ? -1 : i;
+        yy += ih;
+    }
+    return -1;
+}
+
+static int sub_item_at(int y)
+{
+    int i = (y - 4) / w95::kMenuItemH;
+    if (i < 0 || i > 2)
+        return -1;
+    return i;
+}
+
+void WM::set_start_hover(Monitor &m, int idx, bool open_sub)
+{
+    if (idx != m.hover) {
+        m.hover = idx;
+        draw_startmenu(m);
+    }
+    bool want_sub = open_sub && idx == 0 && kMenu[0].enabled;
+    if (want_sub && !m.sub_open)
+        position_submenu(m);
+    else if (!want_sub && m.sub_open) {
+        XUnmapWindow(dpy, m.submenu);
+        m.sub_open = false;
+        m.subhover = -1;
+    }
+}
+
+void WM::sync_start_pointer(Monitor &m)
+{
+    // Highlight the row under the cursor so mouse and keyboard share one selection.
+    Window rr, cr;
+    int rx, ry, wx, wy;
+    unsigned mask;
+    if (m.sub_open && XQueryPointer(dpy, m.submenu, &rr, &cr, &rx, &ry, &wx, &wy, &mask)) {
+        XWindowAttributes wa{};
+        if (XGetWindowAttributes(dpy, m.submenu, &wa) && wx >= 0 && wy >= 0 && wx < wa.width && wy < wa.height) {
+            int i = sub_item_at(wy);
+            if (i != m.subhover) {
+                m.subhover = i;
+                draw_submenu(m);
+            }
+            ungrab_if_idle();
+            return;
+        }
+    }
+    if (!XQueryPointer(dpy, m.startmenu, &rr, &cr, &rx, &ry, &wx, &wy, &mask))
+        return;
+    XWindowAttributes wa{};
+    if (!XGetWindowAttributes(dpy, m.startmenu, &wa) || wx < 0 || wy < 0 || wx >= wa.width || wy >= wa.height)
+        return;
+    int idx = start_item_at(wx, wy);
+    if (idx < 0)
+        return;
+    m.subhover = -1;
+    set_start_hover(m, idx, idx == 0);
+    ungrab_if_idle();
+}
+
+int WM::menu_step(int from, int dir)
+{
+    int i = from < 0 ? (dir > 0 ? -1 : 0) : from;
+    for (int n = 0; n < kMenuN; n++) {
+        i = (i + dir + kMenuN) % kMenuN;
+        if (!kMenu[i].sep && kMenu[i].enabled)
+            return i;
+    }
+    return from < 0 ? 0 : from;
+}
+
+void WM::activate_sub_item(int i)
+{
+    close_menus();
+    if (i == 0)
+        launch(kTermCmd);
+    else if (i == 1)
+        launch(kEditorCmd);
+    else if (i == 2)
+        launch("cabinet /");
+}
+
+void WM::activate_start_item(Monitor &m, int idx)
+{
+    if (idx < 0 || idx >= kMenuN || kMenu[idx].sep || !kMenu[idx].enabled)
+        return;
+    if (idx == 0) {
+        position_submenu(m);
+        m.subhover = 0;
+        draw_submenu(m);
+        ungrab_if_idle();
+        return;
+    }
+    int mi = mon_index(&m);
+    close_menus();
+    if (idx == 1)
+        launch("cabinet \"$HOME\"");
+    else if (idx == 2)
+        open_settings(mi);
+    else if (idx == 4)
+        launch("aterm -e sh -c 'echo Chime desktop; read x' || true");
+    else if (idx == 5)
+        open_run(mi);
+    else if (idx == 7)
+        open_shut(mi);
+}
+
+void WM::activate_desk_icon(int i)
+{
+    if (i == 0)
+        launch("cabinet /");
+    else if (i == 1)
+        launch("cabinet \"$HOME\"");
+    else if (i == 2)
+        launch(kTermCmd);
+    else if (i == 3)
+        launch(kEditorCmd);
+}
+
+void WM::menu_key(KeySym ks)
+{
+    Monitor *mon = open_start_mon();
+    if (!mon)
+        return;
+    bool in_sub = mon->sub_open && mon->subhover >= 0;
+    if (in_sub) {
+        if (ks == XK_Escape || ks == XK_Left) {
+            XUnmapWindow(dpy, mon->submenu);
+            mon->sub_open = false;
+            mon->subhover = -1;
+            draw_startmenu(*mon);
+            ungrab_if_idle();
+            return;
+        }
+        if (ks == XK_Down) {
+            if (mon->subhover < 0)
+                mon->subhover = 0;
+            else
+                mon->subhover = std::min(2, mon->subhover + 1);
+            draw_submenu(*mon);
+        } else if (ks == XK_Up) {
+            if (mon->subhover < 0)
+                mon->subhover = 0;
+            else
+                mon->subhover = std::max(0, mon->subhover - 1);
+            draw_submenu(*mon);
+        } else if (ks == XK_Return || ks == XK_KP_Enter)
+            activate_sub_item(mon->subhover);
+        return;
+    }
+    if (ks == XK_Escape) {
+        close_menus();
+        return;
+    }
+    if (ks == XK_Down)
+        set_start_hover(*mon, menu_step(mon->hover, 1), false);
+    else if (ks == XK_Up)
+        set_start_hover(*mon, menu_step(mon->hover, -1), false);
+    else if (ks == XK_Home)
+        set_start_hover(*mon, menu_step(-1, 1), false);
+    else if (ks == XK_End)
+        set_start_hover(*mon, menu_step(0, -1), false);
+    else if (ks == XK_Right && mon->hover == 0) {
+        position_submenu(*mon);
+        mon->subhover = 0;
+        draw_startmenu(*mon);
+        draw_submenu(*mon);
+        ungrab_if_idle();
+        return;
+    } else if (ks == XK_Return || ks == XK_KP_Enter) {
+        activate_start_item(*mon, mon->hover);
+        return;
+    }
+}
+
+void WM::desktop_key(KeySym ks, unsigned st)
+{
+    if (focused)
+        return;
+    bool ctrl = (st & ControlMask) != 0;
+    bool shift = (st & ShiftMask) != 0;
+    if (ks == XK_a && ctrl) {
+        desk_mask = 0xf;
+        if (selected_icon < 0)
+            selected_icon = 0;
+    } else if (ks == XK_Down || ks == XK_Right) {
+        if (selected_icon < 0)
+            selected_icon = 0;
+        else
+            selected_icon = std::min(3, selected_icon + 1);
+        if (shift && desk_mask)
+            desk_mask |= 1u << selected_icon;
+        else if (!ctrl)
+            desk_mask = 1u << selected_icon;
+    } else if (ks == XK_Up || ks == XK_Left) {
+        if (selected_icon < 0)
+            selected_icon = 0;
+        else
+            selected_icon = std::max(0, selected_icon - 1);
+        if (shift && desk_mask)
+            desk_mask |= 1u << selected_icon;
+        else if (!ctrl)
+            desk_mask = 1u << selected_icon;
+    } else if (ks == XK_Home) {
+        selected_icon = 0;
+        if (!ctrl)
+            desk_mask = 1u;
+    } else if (ks == XK_End) {
+        selected_icon = 3;
+        if (!ctrl)
+            desk_mask = 1u << 3;
+    } else if (ks == XK_space && ctrl) {
+        if (selected_icon >= 0)
+            desk_mask ^= 1u << selected_icon;
+    } else if (ks == XK_Return || ks == XK_KP_Enter || (ks == XK_space && !ctrl)) {
+        activate_desk_sel();
+        return;
+    } else if (ks == XK_Escape) {
+        desk_select_only(-1);
+    } else
+        return;
+    if (Monitor *p = primary_mon())
+        draw_desktop(*p);
+}
+
+void WM::open_colordlg()
+{
+    if (mons.empty() || scheme_i < 0 || scheme_i >= (int)schemes.size())
+        return;
+    if (schemes[scheme_i].builtin) {
+        ColorScheme s = schemes[scheme_i];
+        s.builtin = false;
+        s.name = unique_scheme_name(s.name);
+        schemes.push_back(s);
+        scheme_i = (int)schemes.size() - 1;
+    }
+    color_name_buf = schemes[scheme_i].name;
+    color_name_edit = false;
+    color_role = 0;
+    color_chan = 0;
+    Monitor &m = mons[dialog_mon < (int)mons.size() ? dialog_mon : 0];
+    int w = w95::kColorW, h = w95::kColorH;
+    int x = m.x + (m.w - w) / 2;
+    int y = m.y + (m.h - w95::kTaskbarH - h) / 3;
+    XMoveResizeWindow(dpy, colordlg, x, y, (unsigned)w, (unsigned)h);
+    color_open = true;
+    XMapRaised(dpy, colordlg);
+    ungrab_if_idle();
+    apply_scheme(scheme_i);
+    draw_colordlg();
+    if (set_open)
+        draw_setdlg();
+}
+
+void WM::close_colordlg(bool apply)
+{
+    if (!color_open)
+        return;
+    color_open = false;
+    XUnmapWindow(dpy, colordlg);
+    if (apply && scheme_i >= 0 && scheme_i < (int)schemes.size()) {
+        if (!color_name_buf.empty())
+            schemes[scheme_i].name = color_name_buf;
+        apply_scheme(scheme_i);
+    }
+    ungrab_if_idle();
+    if (set_open)
+        draw_setdlg();
+}
+
+void WM::load_file_dir(const std::string &path)
+{
+    DIR *d = opendir(path.c_str());
+    if (!d)
+        return;
+    file_dir = path;
+    while (file_dir.size() > 1 && file_dir.back() == '/')
+        file_dir.pop_back();
+    file_ents.clear();
+    if (file_dir != "/") {
+        FileEnt p;
+        p.name = "..";
+        p.dir = true;
+        file_ents.push_back(p);
+    }
+    while (dirent *e = readdir(d)) {
+        if (e->d_name[0] == '.')
+            continue;
+        FileEnt fe;
+        fe.name = e->d_name;
+        std::string full = file_dir == "/" ? (std::string("/") + fe.name) : (file_dir + "/" + fe.name);
+        struct stat st{};
+        if (stat(full.c_str(), &st) != 0)
+            continue;
+        fe.dir = S_ISDIR(st.st_mode);
+        if (!fe.dir && !is_image_name(e->d_name))
+            continue;
+        file_ents.push_back(std::move(fe));
+    }
+    closedir(d);
+    std::sort(file_ents.begin(), file_ents.end(), [](const FileEnt &a, const FileEnt &b) {
+        if (a.name == "..")
+            return true;
+        if (b.name == "..")
+            return false;
+        if (a.dir != b.dir)
+            return a.dir;
+        return strcasecmp(a.name.c_str(), b.name.c_str()) < 0;
+    });
+    file_sel = 0;
+    file_scroll = 0;
+}
+
+void WM::open_filedlg()
+{
+    if (mons.empty())
+        return;
+    const char *home = getenv("HOME");
+    load_file_dir(home && *home ? home : "/");
+    file_typed.clear();
+    Monitor &m = mons[dialog_mon < (int)mons.size() ? dialog_mon : 0];
+    int w = w95::kFileW, h = w95::kFileH;
+    int x = m.x + (m.w - w) / 2;
+    int y = m.y + (m.h - w95::kTaskbarH - h) / 3;
+    XMoveResizeWindow(dpy, filedlg, x, y, (unsigned)w, (unsigned)h);
+    file_open = true;
+    XMapRaised(dpy, filedlg);
+    ungrab_if_idle();
+    draw_filedlg();
+}
+
+void WM::close_filedlg()
+{
+    if (!file_open)
+        return;
+    file_open = false;
+    XUnmapWindow(dpy, filedlg);
+    ungrab_if_idle();
+}
+
+bool WM::import_wallpaper(const std::string &src)
+{
+    Raster img;
+    if (!load_image_path(src.c_str(), img))
+        return false;
+    const char *home = getenv("HOME");
+    if (!home || !*home)
+        return false;
+    std::string dir = std::string(home) + "/.chime/wallpapers";
+    mkdir((std::string(home) + "/.chime").c_str(), 0755);
+    mkdir(dir.c_str(), 0755);
+    std::string base = base_name(src);
+    auto dot = base.find_last_of('.');
+    if (dot != std::string::npos)
+        base = base.substr(0, dot);
+    if (base.empty())
+        base = "wallpaper";
+    std::string dest = dir + "/" + base + ".ppm";
+    int n = 2;
+    while (access(dest.c_str(), F_OK) == 0) {
+        dest = dir + "/" + base + "-" + std::to_string(n++) + ".ppm";
+    }
+    if (!save_ppm(dest.c_str(), img))
+        return false;
+    std::string keep = base_name(dest);
+    rebuild_walls();
+    wall_i = 0;
+    for (int i = 0; i < (int)walls.size(); i++)
+        if (walls[i].name == keep)
+            wall_i = i;
+    apply_wall(wall_i);
+    return true;
+}
+
+static std::string file_full(const std::string &dir, const std::string &name)
+{
+    if (name == "..") {
+        auto sl = dir.rfind('/');
+        if (sl == 0 || sl == std::string::npos)
+            return "/";
+        return dir.substr(0, sl);
+    }
+    return dir == "/" ? (std::string("/") + name) : (dir + "/" + name);
+}
+
+void WM::file_key(KeySym ks, const char *buf, int n)
+{
+    if (ks == XK_Escape) {
+        close_filedlg();
+        return;
+    }
+    if (ks == XK_Up) {
+        file_sel = std::max(0, file_sel - 1);
+        if (file_sel < (int)file_ents.size() && !file_ents[file_sel].dir)
+            file_typed = file_ents[file_sel].name;
+        draw_filedlg();
+        return;
+    }
+    if (ks == XK_Down) {
+        if (!file_ents.empty())
+            file_sel = std::min((int)file_ents.size() - 1, file_sel + 1);
+        if (file_sel < (int)file_ents.size() && !file_ents[file_sel].dir)
+            file_typed = file_ents[file_sel].name;
+        draw_filedlg();
+        return;
+    }
+    if (ks == XK_BackSpace && (n != 1 || !buf[0] || buf[0] < 32)) {
+        load_file_dir(file_full(file_dir, ".."));
+        draw_filedlg();
+        return;
+    }
+    if (ks == XK_Return || ks == XK_KP_Enter) {
+        if (!file_typed.empty() && file_typed.find('/') != std::string::npos) {
+            if (import_wallpaper(file_typed))
+                close_filedlg();
+            return;
+        }
+        if (file_sel < 0 || file_sel >= (int)file_ents.size())
+            return;
+        FileEnt &e = file_ents[file_sel];
+        std::string full = file_full(file_dir, e.name);
+        if (e.dir) {
+            load_file_dir(full);
+            draw_filedlg();
+        } else if (import_wallpaper(full))
+            close_filedlg();
+        return;
+    }
+    if (ks == XK_BackSpace) {
+        if (!file_typed.empty())
+            file_typed.pop_back();
+        draw_filedlg();
+        return;
+    }
+    if (n == 1 && buf[0] >= 32 && buf[0] < 127) {
+        file_typed.push_back(buf[0]);
+        draw_filedlg();
+    }
+}
+
+void WM::color_key(KeySym ks, const char *buf, int n)
+{
+    if (ks == XK_Escape) {
+        close_colordlg(false);
+        return;
+    }
+    if (ks == XK_Return && !color_name_edit) {
+        close_colordlg(true);
+        return;
+    }
+    if (ks == XK_Tab) {
+        color_name_edit = !color_name_edit;
+        draw_colordlg();
+        return;
+    }
+    if (color_name_edit) {
+        if (ks == XK_Return) {
+            color_name_edit = false;
+            draw_colordlg();
+            return;
+        }
+        if (ks == XK_BackSpace) {
+            if (!color_name_buf.empty())
+                color_name_buf.pop_back();
+            draw_colordlg();
+            return;
+        }
+        if (n == 1 && buf[0] >= 32 && buf[0] < 127) {
+            color_name_buf.push_back(buf[0]);
+            draw_colordlg();
+        }
+        return;
+    }
+    if (ks == XK_Down)
+        color_role = std::min(w95::kColorRoleN - 1, color_role + 1);
+    else if (ks == XK_Up)
+        color_role = std::max(0, color_role - 1);
+    else if (ks == XK_Left || ks == XK_Right) {
+        if (scheme_i < 0 || scheme_i >= (int)schemes.size())
+            return;
+        w95::Rgb &c = scheme_role(schemes[scheme_i], color_role);
+        uint8_t *ch = color_chan == 0 ? &c.r : color_chan == 1 ? &c.g : &c.b;
+        int v = *ch + (ks == XK_Right ? 5 : -5);
+        *ch = (uint8_t)std::clamp(v, 0, 255);
+        apply_scheme(scheme_i);
+    } else if (ks == XK_bracketleft)
+        color_chan = std::max(0, color_chan - 1);
+    else if (ks == XK_bracketright)
+        color_chan = std::min(2, color_chan + 1);
+    else if (ks == XK_r || ks == XK_R)
+        color_chan = 0;
+    else if (ks == XK_g || ks == XK_G)
+        color_chan = 1;
+    else if (ks == XK_b || ks == XK_B)
+        color_chan = 2;
+    else
+        return;
+    draw_colordlg();
+}
+
+void WM::settings_key(KeySym ks, const char *, int)
+{
+    if (ks == XK_Return) {
+        save_display();
+        apply_mode(mode_i);
+        set_save_scheme = scheme_i;
+        set_save_wall = wall_i;
+        set_save_mode = mode_i;
+        set_save_schemes = schemes;
+        close_settings(false);
+        return;
+    }
+    if (ks == XK_Escape) {
+        close_settings(true);
+        return;
+    }
+    if (ks == XK_Tab) {
+        set_list = (set_list + 1) % 3;
+        draw_setdlg();
+        return;
+    }
+    int *sel = &scheme_i;
+    int n = (int)schemes.size();
+    if (set_list == 0) {
+        sel = &wall_i;
+        n = (int)walls.size();
+    } else if (set_list == 2) {
+        sel = &mode_i;
+        n = (int)modes.size();
+    }
+    if (n < 1)
+        return;
+    if (ks == XK_Down)
+        *sel = std::min(n - 1, *sel + 1);
+    else if (ks == XK_Up)
+        *sel = std::max(0, *sel - 1);
+    else if (ks == XK_Home)
+        *sel = 0;
+    else if (ks == XK_End)
+        *sel = n - 1;
+    else
+        return;
+    if (set_list == 1)
+        apply_scheme(scheme_i);
+    else if (set_list == 0)
+        apply_wall(wall_i);
     draw_setdlg();
 }
 
 static int dir_from_hit(Hit h)
 {
+    // Bit 0 N, bit 1 S, bit 2 E, bit 3 W — matches drag_dir in on_motion.
     int d = 0;
     if (h == Hit::EdgeN || h == Hit::EdgeNE || h == Hit::EdgeNW)
         d |= 1;
@@ -1444,6 +2753,8 @@ static int dir_from_hit(Hit h)
 
 void WM::on_button_press(XEvent *e)
 {
+    // Dispatch by window: client (click-to-focus), dialogs, menus, taskbar,
+    // desktop icons, then frame chrome (buttons / move / resize).
     XButtonEvent *b = &e->xbutton;
     if (run_open && b->window != rundlg) {
         if (b->window != shutdlg) {
@@ -1456,6 +2767,8 @@ void WM::on_button_press(XEvent *e)
     Client *cl = find_client(b->window);
 
     if (cl) {
+        // Click was on the application window (we grab AnyButton in Sync mode
+        // so we can raise/focus then ReplayPointer to the client).
         close_menus();
         raise_client(cl);
         focus(cl);
@@ -1493,7 +2806,131 @@ void WM::on_button_press(XEvent *e)
             } else if (b->x >= w / 2 + 8 && b->x < w / 2 + 8 + bw) {
                 shut_open = false;
                 XUnmapWindow(dpy, shutdlg);
+                ungrab_if_idle();
             }
+        }
+        return;
+    }
+
+    if (b->window == colordlg) {
+        const int w = w95::kColorW, h = w95::kColorH;
+        const int bw = w95::kDlgBtnW, bh = w95::kDlgBtnH;
+        const int by = h - 12 - bh;
+        const int cancel_x = w - 12 - bw;
+        const int ok_x = cancel_x - 8 - bw;
+        if (b->x >= w - 6 - w95::kBtn && b->y >= 4 && b->y < 4 + w95::kTitleH) {
+            close_colordlg(false);
+            return;
+        }
+        if (b->x >= 60 && b->y >= 26 && b->x < w - 16 && b->y < 46) {
+            color_name_edit = true;
+            draw_colordlg();
+            return;
+        }
+        if (b->x >= 16 && b->y >= 54 && b->x < 196 && b->y < 234) {
+            int i = (b->y - 56) / w95::kListRow;
+            if (i >= 0 && i < w95::kColorRoleN) {
+                color_role = i;
+                color_name_edit = false;
+                draw_colordlg();
+            }
+            return;
+        }
+        auto hitbar = [&](int y) {
+            return b->y >= y && b->y < y + 16 && b->x >= 232 && b->x < 392;
+        };
+        int chan = -1;
+        if (hitbar(136))
+            chan = 0;
+        else if (hitbar(160))
+            chan = 1;
+        else if (hitbar(184))
+            chan = 2;
+        if (chan >= 0 && scheme_i >= 0 && scheme_i < (int)schemes.size()) {
+            color_chan = chan;
+            int v = (b->x - 232) * 255 / 160;
+            v = std::clamp(v, 0, 255);
+            w95::Rgb &c = scheme_role(schemes[scheme_i], color_role);
+            if (chan == 0)
+                c.r = (uint8_t)v;
+            else if (chan == 1)
+                c.g = (uint8_t)v;
+            else
+                c.b = (uint8_t)v;
+            apply_scheme(scheme_i);
+            draw_colordlg();
+            return;
+        }
+        if (b->y >= by && b->y < by + bh) {
+            if (b->x >= ok_x && b->x < ok_x + bw)
+                close_colordlg(true);
+            else if (b->x >= cancel_x && b->x < cancel_x + bw)
+                close_colordlg(false);
+        }
+        return;
+    }
+
+    if (b->window == filedlg) {
+        const int w = w95::kFileW, h = w95::kFileH;
+        const int bw = w95::kDlgBtnW, bh = w95::kDlgBtnH;
+        const int by = h - 12 - bh;
+        const int cancel_x = w - 12 - bw;
+        const int ok_x = cancel_x - 8 - bw;
+        if (b->x >= w - 6 - w95::kBtn && b->y >= 4 && b->y < 4 + w95::kTitleH) {
+            close_filedlg();
+            return;
+        }
+        if (b->y >= 24 && b->y < 46) {
+            if (b->x >= w - 84 && b->x < w - 52) {
+                load_file_dir(file_full(file_dir, ".."));
+                draw_filedlg();
+            } else if (b->x >= w - 48 && b->x < w - 12) {
+                const char *home = getenv("HOME");
+                load_file_dir(home && *home ? home : "/");
+                draw_filedlg();
+            }
+            return;
+        }
+        if (b->button == 4) {
+            file_scroll = std::max(0, file_scroll - 3);
+            draw_filedlg();
+            return;
+        }
+        if (b->button == 5) {
+            file_scroll += 3;
+            draw_filedlg();
+            return;
+        }
+        int lx = 12, ly = 54, lw = w - 24, lh = 180;
+        if (b->x >= lx && b->y >= ly && b->x < lx + lw && b->y < ly + lh) {
+            int vis = (lh - 4) / w95::kListRow;
+            int i = file_scroll + (b->y - ly - 2) / w95::kListRow;
+            if (i >= 0 && i < (int)file_ents.size() && i < file_scroll + vis) {
+                bool dbl = (file_sel == i && last_icon == i && b->time - last_icon_time < w95::kDblClickMs);
+                file_sel = i;
+                last_icon = i;
+                last_icon_time = b->time;
+                if (!file_ents[i].dir)
+                    file_typed = file_ents[i].name;
+                if (dbl) {
+                    std::string full = file_full(file_dir, file_ents[i].name);
+                    if (file_ents[i].dir)
+                        load_file_dir(full);
+                    else if (import_wallpaper(full)) {
+                        close_filedlg();
+                        return;
+                    }
+                }
+                draw_filedlg();
+            }
+            return;
+        }
+        if (b->y >= by && b->y < by + bh) {
+            if (b->x >= ok_x && b->x < ok_x + bw) {
+                KeySym ks = XK_Return;
+                file_key(ks, "", 0);
+            } else if (b->x >= cancel_x && b->x < cancel_x + bw)
+                close_filedlg();
         }
         return;
     }
@@ -1505,43 +2942,117 @@ void WM::on_button_press(XEvent *e)
         const int apply_x = w - 12 - bw;
         const int cancel_x = apply_x - 8 - bw;
         const int ok_x = cancel_x - 8 - bw;
-        auto listhit = [&](int lx, int ly, int lw, int lh, int n) {
+        auto listhit = [&](int lx, int ly, int lw, int lh, int scroll, int n) {
             if (b->x < lx || b->y < ly || b->x >= lx + lw || b->y >= ly + lh)
                 return -1;
             int i = (b->y - ly - 2) / w95::kListRow;
             int vis = (lh - 4) / w95::kListRow;
-            if (i < 0 || i >= n || i >= vis)
+            if (i < 0 || i >= vis)
                 return -1;
-            return i;
+            int idx = scroll + i;
+            if (idx < 0 || idx >= n)
+                return -1;
+            return idx;
         };
         if (b->x >= w - 6 - w95::kBtn && b->y >= 4 && b->y < 4 + w95::kTitleH) {
             close_settings(true);
             return;
         }
-        int wi = listhit(232, 44, 200, 104, (int)walls.size());
+        if (b->button == 4 || b->button == 5) {
+            int *sc = &scheme_scroll;
+            int n = (int)schemes.size();
+            int vis = (w95::kSchemeListH - 4) / w95::kListRow;
+            if (b->x >= w95::kWallListX && b->y >= w95::kWallListY && b->y < w95::kWallListY + w95::kWallListH) {
+                sc = &wall_scroll;
+                n = (int)walls.size();
+                vis = (w95::kWallListH - 4) / w95::kListRow;
+            } else if (b->x >= w95::kResListX && b->y >= w95::kResListY && b->y < w95::kResListY + w95::kResListH) {
+                sc = &mode_scroll;
+                n = (int)modes.size();
+                vis = (w95::kResListH - 4) / w95::kListRow;
+            }
+            *sc += (b->button == 5) ? 1 : -1;
+            ensure_list_scroll(*sc, -1, vis, n);
+            draw_setdlg();
+            return;
+        }
+        int wi = listhit(w95::kWallListX, w95::kWallListY, w95::kWallListW, w95::kWallListH, wall_scroll,
+                         (int)walls.size());
         if (wi >= 0) {
+            set_list = 0;
             apply_wall(wi);
             draw_setdlg();
             return;
         }
-        int si = listhit(16, 168, 416, 132, w95::kSchemeN);
+        int si = listhit(w95::kSchemeListX, w95::kSchemeListY, w95::kSchemeListW, w95::kSchemeListH, scheme_scroll,
+                         (int)schemes.size());
         if (si >= 0) {
+            set_list = 1;
             apply_scheme(si);
             draw_setdlg();
             return;
         }
+        int mi = listhit(w95::kResListX, w95::kResListY, w95::kResListW, w95::kResListH, mode_scroll,
+                         (int)modes.size());
+        if (mi >= 0) {
+            set_list = 2;
+            mode_i = mi;
+            mode_note.clear();
+            draw_setdlg();
+            return;
+        }
+        if (b->x >= w95::kBrowseX && b->x < w95::kBrowseX + w95::kBrowseW && b->y >= w95::kBrowseY &&
+            b->y < w95::kBrowseY + w95::kDlgBtnH) {
+            open_filedlg();
+            return;
+        }
+        int bx = w95::kSchemeBtnX, byb = w95::kSchemeBtnY;
+        if (b->x >= bx && b->x < bx + 96) {
+            if (b->y >= byb && b->y < byb + w95::kDlgBtnH) {
+                ColorScheme s = (scheme_i >= 0 && scheme_i < (int)schemes.size()) ? schemes[scheme_i]
+                                                                                : scheme_from_builtin(w95::kSchemes[0]);
+                s.builtin = false;
+                s.name = unique_scheme_name("Custom");
+                schemes.push_back(s);
+                scheme_i = (int)schemes.size() - 1;
+                apply_scheme(scheme_i);
+                open_colordlg();
+                return;
+            }
+            if (b->y >= byb + 28 && b->y < byb + 28 + w95::kDlgBtnH) {
+                open_colordlg();
+                return;
+            }
+            if (b->y >= byb + 56 && b->y < byb + 56 + w95::kDlgBtnH) {
+                if (scheme_i >= 0 && scheme_i < (int)schemes.size() && !schemes[scheme_i].builtin &&
+                    (int)schemes.size() > 1) {
+                    schemes.erase(schemes.begin() + scheme_i);
+                    if (scheme_i >= (int)schemes.size())
+                        scheme_i = (int)schemes.size() - 1;
+                    apply_scheme(scheme_i);
+                    draw_setdlg();
+                }
+                return;
+            }
+        }
         if (b->y >= by && b->y < by + bh) {
             if (b->x >= ok_x && b->x < ok_x + bw) {
                 save_display();
+                apply_mode(mode_i);
                 set_save_scheme = scheme_i;
                 set_save_wall = wall_i;
+                set_save_mode = mode_i;
+                set_save_schemes = schemes;
                 close_settings(false);
             } else if (b->x >= cancel_x && b->x < cancel_x + bw) {
                 close_settings(true);
             } else if (b->x >= apply_x && b->x < apply_x + bw) {
                 save_display();
+                apply_mode(mode_i);
                 set_save_scheme = scheme_i;
                 set_save_wall = wall_i;
+                set_save_mode = mode_i;
+                set_save_schemes = schemes;
                 draw_setdlg();
             }
         }
@@ -1549,56 +3060,19 @@ void WM::on_button_press(XEvent *e)
     }
 
     if (mon && b->window == mon->submenu && mon->sub_open) {
-        int i = (b->y - 4) / w95::kMenuItemH;
-        close_menus();
-        if (i == 0)
-            launch("aterm || xterm || x-terminal-emulator || true");
-        else if (i == 1)
-            launch("editor || aterm -e vi || xterm -e vi || true");
-        else if (i == 2)
-            launch("cabinet /");
+        int i = sub_item_at(b->y);
+        mon->subhover = i;
+        activate_sub_item(i);
         return;
     }
 
     if (mon && b->window == mon->startmenu && mon->start_open) {
-        int y = 4;
-        int idx = -1;
-        for (int i = 0; i < kMenuN; i++) {
-            int ih = kMenu[i].sep ? 8 : w95::kMenuItemH;
-            if (b->x >= w95::kBannerW && b->y >= y && b->y < y + ih) {
-                idx = i;
-                break;
-            }
-            y += ih;
-        }
+        int idx = start_item_at(b->x, b->y);
         if (idx < 0 || kMenu[idx].sep || !kMenu[idx].enabled)
             return;
-        if (idx == 0) {
-            int mw = w95::kBannerW + w95::kMenuBodyW;
-            int mh = menu_height();
-            int sx = mon->x + 2 + mw - 4;
-            int sy = mon->y + mon->h - w95::kTaskbarH - mh + 4;
-            if (sx + 150 > mon->x + mon->w)
-                sx = mon->x + 2 - 150 + 4;
-            XMoveWindow(dpy, mon->submenu, sx, sy);
-            mon->sub_open = true;
-            mon->subhover = -1;
-            XMapRaised(dpy, mon->submenu);
-            draw_submenu(*mon);
-            return;
-        }
-        int mi = mon_index(mon);
-        close_menus();
-        if (idx == 1)
-            launch("cabinet \"$HOME\"");
-        else if (idx == 2)
-            open_settings(mi);
-        else if (idx == 4)
-            launch("aterm -e sh -c 'echo Chime desktop; read x' || true");
-        else if (idx == 5)
-            open_run(mi);
-        else if (idx == 7)
-            open_shut(mi);
+        mon->hover = idx;
+        mon->subhover = -1;
+        activate_start_item(*mon, idx);
         return;
     }
 
@@ -1611,7 +3085,7 @@ void WM::on_button_press(XEvent *e)
         int trayw = tray_width(*mon);
         int trayx = mon->w - trayw - 4;
         if (b->x >= trayx)
-            return;
+            return; // Clock / tray well; volicon handles its own clicks.
         auto list = clients_on(mon_index(mon));
         int x0 = 2 + w95::kStartW + 6;
         int x1 = trayx - 6;
@@ -1644,34 +3118,45 @@ void WM::on_button_press(XEvent *e)
         close_menus();
         focus(nullptr);
         if (!mon->primary)
-            return;
-        int pad = 12;
+            return; // Icons exist only on the primary wallpaper.
         int hit = -1;
         for (int i = 0; i < 4; i++) {
-            int ix = pad;
-            int iy = pad + i * w95::kCellH;
-            if (b->x >= ix && b->x < ix + w95::kCellW && b->y >= iy && b->y < iy + w95::kCellH)
+            int ix, iy, iw, ih;
+            desk_cell(i, ix, iy, iw, ih);
+            if (b->x >= ix && b->y >= iy && b->x < ix + iw && b->y < iy + ih)
                 hit = i;
         }
+        bool ctrl = (b->state & ControlMask) != 0;
+        bool shift = (b->state & ShiftMask) != 0;
         if (hit >= 0) {
-            if (selected_icon == hit && last_icon == hit && b->time - last_icon_time < w95::kDblClickMs) {
-                if (hit == 0)
-                    launch("cabinet /");
-                else if (hit == 1)
-                    launch("cabinet \"$HOME\"");
-                else if (hit == 2)
-                    launch("aterm || xterm || x-terminal-emulator || true");
-                else
-                    launch("editor || aterm -e vi || xterm -e vi || true");
-                selected_icon = -1;
-            } else {
+            if ((desk_mask & (1u << hit)) && last_icon == hit && b->time - last_icon_time < w95::kDblClickMs) {
+                activate_desk_sel();
+                last_icon = -1;
+            } else if (ctrl) {
+                desk_mask ^= 1u << hit;
                 selected_icon = hit;
-            }
+            } else if (shift && selected_icon >= 0) {
+                int a = std::min(selected_icon, hit), c = std::max(selected_icon, hit);
+                desk_mask = 0;
+                for (int i = a; i <= c; i++)
+                    desk_mask |= 1u << i;
+                selected_icon = hit;
+            } else
+                desk_select_only(hit);
             last_icon = hit;
             last_icon_time = b->time;
             draw_desktop(*mon);
         } else {
-            selected_icon = -1;
+            if (!ctrl)
+                desk_select_only(-1);
+            sel_base = ctrl ? desk_mask : 0;
+            sel_x0 = sel_x1 = b->x;
+            sel_y0 = sel_y1 = b->y;
+            sel_mon = mon_index(mon);
+            drag = DragMode::Select;
+            drag_c = nullptr;
+            XGrabPointer(dpy, root, False, PointerMotionMask | ButtonReleaseMask, GrabModeAsync, GrabModeAsync, None,
+                         cur_left, CurrentTime);
             draw_desktop(*mon);
         }
         return;
@@ -1695,6 +3180,7 @@ void WM::on_button_press(XEvent *e)
             return;
         }
         if (h == Hit::Sys) {
+            // Double-click the system-menu box closes, like Win95.
             if (last_title_win == fr->frame && b->time - last_title_time < w95::kDblClickMs)
                 close_client(fr);
             last_title_win = fr->frame;
@@ -1702,6 +3188,7 @@ void WM::on_button_press(XEvent *e)
             return;
         }
         if (h == Hit::Title) {
+            // Double-click caption toggles maximize; single click starts a move.
             if (last_title_win == fr->frame && b->time - last_title_time < w95::kDblClickMs) {
                 maximize_toggle(fr);
                 last_title_win = 0;
@@ -1751,7 +3238,16 @@ void WM::on_button_press(XEvent *e)
 
 void WM::on_button_release(XEvent *e)
 {
+    if (drag == DragMode::Select) {
+        drag = DragMode::Off;
+        XUngrabPointer(dpy, CurrentTime);
+        if (Monitor *p = primary_mon())
+            draw_desktop(*p);
+        return;
+    }
     if (drag != DragMode::Off) {
+        // Commit snap if the pointer is still in an edge zone; otherwise just
+        // remember which monitor the window landed on.
         if (drag == DragMode::Move && drag_c) {
             int px = e->xbutton.x_root;
             int py = e->xbutton.y_root;
@@ -1774,7 +3270,19 @@ void WM::on_button_release(XEvent *e)
 
 void WM::on_motion(XEvent *e)
 {
+    // During a drag we update geometry every motion; otherwise we only refresh
+    // resize cursors and Start-menu hover.
     XMotionEvent *m = &e->xmotion;
+    if (drag == DragMode::Select) {
+        Monitor *mon = (sel_mon >= 0 && sel_mon < (int)mons.size()) ? &mons[sel_mon] : primary_mon();
+        if (mon) {
+            sel_x1 = m->x_root - mon->x;
+            sel_y1 = m->y_root - mon->y;
+            select_desk_icons(sel_x0, sel_y0, sel_x1, sel_y1, sel_base);
+            draw_desktop(*mon);
+        }
+        return;
+    }
     if (drag != DragMode::Off && drag_c) {
         int dx = m->x_root - drag_ox;
         int dy = m->y_root - drag_oy;
@@ -1784,6 +3292,7 @@ void WM::on_motion(XEvent *e)
             apply_geom(drag_c);
             show_snap_preview(snap_at(m->x_root, m->y_root), m->x_root, m->y_root);
         } else {
+            // drag_dir bits: 1=N 2=S 4=E 8=W. Moving N/W also shifts origin.
             int x = drag_fx, y = drag_fy, w = drag_fw, h = drag_fh;
             if (drag_dir & 8) {
                 x += dx;
@@ -1813,47 +3322,26 @@ void WM::on_motion(XEvent *e)
     }
     Monitor *mon = mon_by_window(m->window);
     if (mon && m->window == mon->startmenu && mon->start_open) {
-        int y = 4;
-        int idx = -1;
-        for (int i = 0; i < kMenuN; i++) {
-            int ih = kMenu[i].sep ? 8 : w95::kMenuItemH;
-            if (m->x >= w95::kBannerW && m->y >= y && m->y < y + ih)
-                idx = i;
-            y += ih;
-        }
-        if (idx != mon->hover) {
-            mon->hover = idx;
-            draw_startmenu(*mon);
-            if (idx == 0 && kMenu[0].enabled) {
-                int mw = w95::kBannerW + w95::kMenuBodyW;
-                int mh = menu_height();
-                int sx = mon->x + 2 + mw - 4;
-                int sy = mon->y + mon->h - w95::kTaskbarH - mh + 4;
-                if (sx + 150 > mon->x + mon->w)
-                    sx = mon->x + 2 - 150 + 4;
-                XMoveWindow(dpy, mon->submenu, sx, sy);
-                mon->sub_open = true;
-                XMapRaised(dpy, mon->submenu);
-                draw_submenu(*mon);
-            } else if (idx != 0 && mon->sub_open) {
-                XUnmapWindow(dpy, mon->submenu);
-                mon->sub_open = false;
-            }
-        }
+        int idx = start_item_at(m->x, m->y);
+        mon->subhover = -1;
+        if (idx >= 0)
+            set_start_hover(*mon, idx, idx == 0);
+        ungrab_if_idle();
     }
     if (mon && m->window == mon->submenu && mon->sub_open) {
-        int i = (m->y - 4) / w95::kMenuItemH;
-        if (i < 0 || i > 2)
-            i = -1;
+        int i = sub_item_at(m->y);
         if (i != mon->subhover) {
             mon->subhover = i;
             draw_submenu(*mon);
+            ungrab_if_idle();
         }
     }
 }
 
 void WM::on_key(XEvent *e)
 {
+    // Super tap = Start. Super+R = Run. Super held with another key sets
+    // super_chord so the eventual Super release does not open the menu.
     KeySym ks = XLookupKeysym(&e->xkey, 0);
     bool press = (e->type == KeyPress);
 
@@ -1879,20 +3367,41 @@ void WM::on_key(XEvent *e)
         return;
     }
 
+    char buf[16];
+    KeySym ks2;
+    int n = XLookupString(&e->xkey, buf, sizeof(buf), &ks2, nullptr);
+
+    if (file_open) {
+        file_key(ks2, buf, n);
+        return;
+    }
+    if (color_open) {
+        color_key(ks2, buf, n);
+        return;
+    }
     if (set_open) {
         if (super_held || (super_mask && (e->xkey.state & super_mask))) {
             super_chord = true;
             return;
         }
-        KeySym ks2;
-        XLookupString(&e->xkey, nullptr, 0, &ks2, nullptr);
-        if (ks2 == XK_Return) {
-            save_display();
-            set_save_scheme = scheme_i;
-            set_save_wall = wall_i;
-            close_settings(false);
-        } else if (ks2 == XK_Escape)
-            close_settings(true);
+        settings_key(ks2, buf, n);
+        return;
+    }
+
+    if (open_start_mon()) {
+        menu_key(ks2);
+        return;
+    }
+
+    if (shut_open) {
+        if (ks2 == XK_Escape || ks2 == XK_n || ks2 == XK_N) {
+            shut_open = false;
+            XUnmapWindow(dpy, shutdlg);
+            ungrab_if_idle();
+        } else if (ks2 == XK_Return || ks2 == XK_y || ks2 == XK_Y) {
+            running = false;
+            launch("poweroff -f 2>/dev/null || sudo poweroff 2>/dev/null || sudo halt 2>/dev/null || true");
+        }
         return;
     }
 
@@ -1901,21 +3410,41 @@ void WM::on_key(XEvent *e)
             super_chord = true;
             return;
         }
-        char buf[16];
-        KeySym ks2;
-        int n = XLookupString(&e->xkey, buf, sizeof(buf), &ks2, nullptr);
+        caret_on = true;
+        caret_ms = now_ms();
         if (ks2 == XK_Return) {
             if (!run_text.empty())
                 launch(run_text.c_str());
             close_run();
         } else if (ks2 == XK_Escape) {
             close_run();
+        } else if (ks2 == XK_Left) {
+            if (run_cursor > 0)
+                run_cursor--;
+            draw_rundlg();
+        } else if (ks2 == XK_Right) {
+            if (run_cursor < (int)run_text.size())
+                run_cursor++;
+            draw_rundlg();
+        } else if (ks2 == XK_Home) {
+            run_cursor = 0;
+            draw_rundlg();
+        } else if (ks2 == XK_End) {
+            run_cursor = (int)run_text.size();
+            draw_rundlg();
         } else if (ks2 == XK_BackSpace) {
-            if (!run_text.empty())
-                run_text.pop_back();
+            if (run_cursor > 0 && !run_text.empty()) {
+                run_text.erase((size_t)run_cursor - 1, 1);
+                run_cursor--;
+            }
+            draw_rundlg();
+        } else if (ks2 == XK_Delete) {
+            if (run_cursor < (int)run_text.size())
+                run_text.erase((size_t)run_cursor, 1);
             draw_rundlg();
         } else if (n == 1 && buf[0] >= 32 && buf[0] < 127) {
-            run_text.push_back(buf[0]);
+            run_text.insert((size_t)run_cursor, 1, buf[0]);
+            run_cursor++;
             draw_rundlg();
         }
         return;
@@ -1923,6 +3452,7 @@ void WM::on_key(XEvent *e)
     if (ks == XK_F4 && (e->xkey.state & Mod1Mask) && focused)
         close_client(focused);
     if (ks == XK_Tab && (e->xkey.state & Mod1Mask) && !clients.empty()) {
+        // Cycle windows on the focused monitor (or the pointer's, if none).
         int mi = 0;
         if (focused)
             mi = monitor_for(focused);
@@ -1953,11 +3483,14 @@ void WM::on_key(XEvent *e)
         }
     }
     if (ks == XK_Escape && (e->xkey.state & ControlMask) && !mons.empty())
-        open_start(mons[pointer_mon()]);
+        open_start(mons[pointer_mon()]); // Ctrl+Esc is the classic Start chord.
+    else if (!(e->xkey.state & (Mod1Mask | super_mask)) && !focused)
+        desktop_key(ks2, e->xkey.state);
 }
 
 void WM::on_expose(XEvent *e)
 {
+    // Compress: only paint when this is the last expose in the batch.
     if (e->xexpose.count != 0)
         return;
     if (e->xexpose.window == snapwin) {
@@ -1974,6 +3507,14 @@ void WM::on_expose(XEvent *e)
     }
     if (e->xexpose.window == setdlg) {
         draw_setdlg();
+        return;
+    }
+    if (e->xexpose.window == colordlg) {
+        draw_colordlg();
+        return;
+    }
+    if (e->xexpose.window == filedlg) {
+        draw_filedlg();
         return;
     }
     if (e->xexpose.window == traywin) {
@@ -1997,6 +3538,8 @@ void WM::on_expose(XEvent *e)
 
 void WM::handle_event(XEvent *e)
 {
+    // RandR events are not in the core XEvent type enum; they are offset from
+    // the first event code we stored in init().
     if (have_randr && e->type == rr_event + RRScreenChangeNotify) {
         XRRUpdateConfiguration(e);
         sync_monitors();
@@ -2004,6 +3547,8 @@ void WM::handle_event(XEvent *e)
     }
     switch (e->type) {
     case MapRequest:
+        // New top-level, or a minimized client asking to come back. Tray icons
+        // are already children of traywin and just need XMapWindow.
         if (is_tray_icon(e->xmaprequest.window))
             XMapWindow(dpy, e->xmaprequest.window);
         else if (Client *c = find_client(e->xmaprequest.window))
@@ -2012,6 +3557,9 @@ void WM::handle_event(XEvent *e)
             manage(e->xmaprequest.window);
         break;
     case ConfigureRequest: {
+        // Clients must not configure themselves after we reparent; we translate
+        // inner size into outer frame size. Unmanaged windows (override_redirect)
+        // get the request applied as-is.
         XConfigureRequestEvent *cr = &e->xconfigurerequest;
         if (is_tray_icon(cr->window)) {
             tray_layout();
@@ -2047,6 +3595,9 @@ void WM::handle_event(XEvent *e)
                 c->ignore_unmap--;
                 break;
             }
+            // ICCCM withdraw: a synthetic UnmapNotify means the client is
+            // withdrawing. Events with event==root are from the root's
+            // SubstructureNotify and would double-unmanage.
             if (e->xunmap.send_event)
                 unmanage(c, false);
             else if (e->xunmap.event == root)
@@ -2087,6 +3638,8 @@ void WM::handle_event(XEvent *e)
         on_expose(e);
         break;
     case PropertyNotify:
+        // Title changes refresh caption + task button. Tray XEMBED_INFO can
+        // mean the icon wants to show/hide; we just relayout.
         if (is_tray_icon(e->xproperty.window) && e->xproperty.atom == xembed_info)
             tray_layout();
         else if (Client *c = find_client(e->xproperty.window)) {
@@ -2100,7 +3653,7 @@ void WM::handle_event(XEvent *e)
         break;
     case ClientMessage:
         if (e->xclient.message_type == net_system_tray_opcode) {
-            if (e->xclient.data.l[1] == 0)
+            if (e->xclient.data.l[1] == 0) // SYSTEM_TRAY_REQUEST_DOCK
                 tray_dock((Window)e->xclient.data.l[2]);
         } else if (e->xclient.message_type == net_active) {
             if (Client *c = find_client(e->xclient.window)) {
@@ -2123,6 +3676,7 @@ void WM::handle_event(XEvent *e)
 
 unsigned WM::mod_mask_for(KeySym ks)
 {
+    // Walk the modifier map so Super works even when it is not Mod4.
     KeyCode kc = XKeysymToKeycode(dpy, ks);
     if (!kc)
         return 0;
@@ -2143,6 +3697,8 @@ unsigned WM::mod_mask_for(KeySym ks)
 
 void WM::grab_key(KeySym ks, unsigned mod)
 {
+    // Grab with CapsLock and NumLock (Mod2) ignored, otherwise Alt+Tab dies
+    // the moment the user has NumLock on.
     KeyCode kc = XKeysymToKeycode(dpy, ks);
     if (!kc)
         return;
@@ -2171,6 +3727,8 @@ bool WM::init()
 
     g_other_wm = false;
     XSetErrorHandler(xerr_start);
+    // This SelectInput is how we become the window manager. XSync so the
+    // error handler sees BadAccess before we continue.
     XSelectInput(dpy, root, SubstructureRedirectMask | SubstructureNotifyMask | ButtonPressMask | KeyPressMask |
                                 KeyReleaseMask | PropertyChangeMask);
     XSync(dpy, False);
@@ -2197,6 +3755,7 @@ bool WM::init()
     banner.pix = alloc_rgb(w95::rgb_banner);
 
     gc = XCreateGC(dpy, root, 0, nullptr);
+    // Helvetica if the server has it (TinyCore Xfonts often don't), else "fixed".
     const char *fn[] = {"-*-helvetica-medium-r-*-*-12-*-*-*-*-*-*-*", "-*-helvetica-medium-r-*-*-11-*-*-*-*-*-*-*",
                         "fixed", nullptr};
     const char *fb[] = {"-*-helvetica-bold-r-*-*-12-*-*-*-*-*-*-*", "-*-helvetica-bold-r-*-*-11-*-*-*-*-*-*-*",
@@ -2222,23 +3781,31 @@ bool WM::init()
     XSetWindowBackground(dpy, root, desktop.pix);
     XClearWindow(dpy, root);
 
+    // Xfbdev has no RandR; have_randr stays false and query_monitors falls through.
     have_randr = XRRQueryExtension(dpy, &rr_event, &rr_error);
     if (have_randr)
         XRRSelectInput(dpy, root, RRScreenChangeNotifyMask | RROutputChangeNotifyMask | RRCrtcChangeNotifyMask);
 
     ewmh_init();
+    // Dialogs and the snap overlay are created once, then moved onto the
+    // relevant monitor when opened. override_redirect so we don't manage them.
     rundlg = mkwin(0, 0, w95::kRunW, w95::kRunH, face.pix,
                    ExposureMask | ButtonPressMask | KeyPressMask | KeyReleaseMask, true);
     shutdlg = mkwin(0, 0, 320, 120, face.pix, ExposureMask | ButtonPressMask | KeyPressMask, true);
     setdlg = mkwin(0, 0, w95::kSetW, w95::kSetH, face.pix,
                    ExposureMask | ButtonPressMask | KeyPressMask | KeyReleaseMask, true);
     snapwin = mkwin(0, 0, 40, 40, title.pix, ExposureMask, true);
+    colordlg = mkwin(0, 0, w95::kColorW, w95::kColorH, face.pix,
+                     ExposureMask | ButtonPressMask | KeyPressMask | KeyReleaseMask, true);
+    filedlg = mkwin(0, 0, w95::kFileW, w95::kFileH, face.pix,
+                    ExposureMask | ButtonPressMask | KeyPressMask | KeyReleaseMask, true);
     sync_monitors();
     load_display();
 
     super_mask = mod_mask_for(XK_Super_L) | mod_mask_for(XK_Super_R);
     if (!super_mask)
         super_mask = Mod4Mask;
+    // Grabs on root: we see these even when a client has focus.
     grab_key(XK_Tab, Mod1Mask);
     grab_key(XK_Tab, Mod1Mask | ShiftMask);
     grab_key(XK_F4, Mod1Mask);
@@ -2247,6 +3814,7 @@ bool WM::init()
     grab_key(XK_Super_R, 0);
     grab_key(XK_r, super_mask);
 
+    // Adopt windows that were already mapped (restart / existing xterms).
     Window dummy, *kids = nullptr;
     unsigned n = 0;
     if (XQueryTree(dpy, root, &dummy, &dummy, &kids, &n) && kids) {
@@ -2263,13 +3831,19 @@ bool WM::init()
         XFree(kids);
     }
     restack_shell();
+    // Desktop owns the keyboard until a client maps, so arrow keys hit icons.
+    if (!focused)
+        focus(nullptr);
     return true;
 }
 
 void WM::run()
 {
+    // Drain the X queue, then select() with a 250ms timeout so the clock and
+    // dialog carets can blink even when the user is idle.
     int fd = ConnectionNumber(dpy);
     int last_min = -1;
+    caret_ms = now_ms();
     while (running) {
         while (XPending(dpy)) {
             XEvent e;
@@ -2284,6 +3858,17 @@ void WM::run()
             for (auto &m : mons)
                 draw_taskbar(m);
         }
+        long t = now_ms();
+        if (t - caret_ms >= 530) {
+            caret_ms = t;
+            caret_on = !caret_on;
+            if (run_open)
+                draw_rundlg();
+            if (color_open && color_name_edit)
+                draw_colordlg();
+            if (file_open)
+                draw_filedlg();
+        }
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(fd, &fds);
@@ -2294,6 +3879,7 @@ void WM::run()
 
 void WM::finish()
 {
+    // Drop the tray selection so another WM can claim it, then close Display.
     close_run();
     close_settings(false);
     close_menus();

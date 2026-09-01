@@ -1,10 +1,17 @@
 #include "wm.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <algorithm>
 
+// Drawing for Chime chrome: bevels, captions, desktop, taskbar, menus, dialogs.
+// All painting goes through the WM's single GC. Callers that clip (draw_str_clip)
+// must restore the clip mask so later fills are not truncated.
+
+// Solid rectangle. Skips empty dests because XFillRectangle with w/h 0 is
+// an X error on some servers.
 void WM::fill(Drawable d, int x, int y, int w, int h, unsigned long p)
 {
     if (w <= 0 || h <= 0)
@@ -13,6 +20,8 @@ void WM::fill(Drawable d, int x, int y, int w, int h, unsigned long p)
     XFillRectangle(dpy, d, gc, x, y, w, h);
 }
 
+// Classic 2px Win95 bevel. Raised = light on top/left (button at rest);
+// sunken = light on bottom/right (well, pressed Start button).
 void WM::bevel(Drawable d, int x, int y, int w, int h, bool raised)
 {
     if (w <= 0 || h <= 0)
@@ -52,6 +61,8 @@ int WM::text_w(const char *s, bool bold)
     return XTextWidth(f, s, (int)strlen(s));
 }
 
+// Vertically center a string in a box of height box_h. XDrawString's y is the
+// baseline, so we add ascent after the extra top padding.
 void WM::draw_str(Drawable d, int x, int y, int box_h, const char *s, unsigned long pix, bool bold)
 {
     if (!s)
@@ -80,24 +91,19 @@ void WM::draw_str_clip(Drawable d, int x, int y, int w, int h, const char *s, un
     XSetClipMask(dpy, gc, None);
 }
 
-void WM::draw_flag(Drawable d, int x, int y)
-{
-    fill(d, x + 1, y + 1, 6, 5, red.pix);
-    fill(d, x + 8, y + 2, 6, 5, green.pix);
-    fill(d, x + 1, y + 7, 6, 5, blue.pix);
-    fill(d, x + 8, y + 8, 6, 5, yellow.pix);
-}
-
+// Caption chrome: kind 0 = minimize, 1 = maximize/restore, 2 = close (X).
 void WM::draw_caption_btn(Drawable d, int x, int y, int kind, bool maxed)
 {
     fill(d, x, y, w95::kBtn, w95::kBtnH, face.pix);
     bevel(d, x, y, w95::kBtn, w95::kBtnH, true);
     XSetForeground(dpy, gc, fg.pix);
     if (kind == 0) {
+        // Underscore at the bottom of the button.
         XDrawLine(dpy, d, gc, x + 3, y + w95::kBtnH - 5, x + w95::kBtn - 4, y + w95::kBtnH - 5);
         XDrawLine(dpy, d, gc, x + 3, y + w95::kBtnH - 4, x + w95::kBtn - 4, y + w95::kBtnH - 4);
     } else if (kind == 1) {
         if (maxed) {
+            // Two overlapping rects = "restore".
             XDrawRectangle(dpy, d, gc, x + 5, y + 3, 6, 5);
             XDrawRectangle(dpy, d, gc, x + 3, y + 5, 6, 5);
         } else {
@@ -105,6 +111,7 @@ void WM::draw_caption_btn(Drawable d, int x, int y, int kind, bool maxed)
             XDrawLine(dpy, d, gc, x + 3, y + 4, x + w95::kBtn - 5, y + 4);
         }
     } else {
+        // Close: two-pixel-thick X.
         XDrawLine(dpy, d, gc, x + 4, y + 3, x + w95::kBtn - 5, y + w95::kBtnH - 4);
         XDrawLine(dpy, d, gc, x + 5, y + 3, x + w95::kBtn - 4, y + w95::kBtnH - 4);
         XDrawLine(dpy, d, gc, x + w95::kBtn - 5, y + 3, x + 4, y + w95::kBtnH - 4);
@@ -112,12 +119,14 @@ void WM::draw_caption_btn(Drawable d, int x, int y, int kind, bool maxed)
     }
 }
 
+// Desktop / Run-dialog glyphs. kind: 0 computer, 1 folder, 2 terminal, 3 document.
 void WM::draw_icon(Drawable d, int x, int y, int kind, bool selected)
 {
     if (selected)
         fill(d, x - 4, y - 2, w95::kIcon + 8, w95::kIcon + 6, title.pix);
 
     if (kind == 0) {
+        // CRT on a stand, yellow "screen glow" at the corner.
         fill(d, x + 4, y + 2, 24, 18, lo.pix);
         fill(d, x + 6, y + 4, 20, 13, title.pix);
         fill(d, x + 8, y + 6, 6, 4, white.pix);
@@ -151,6 +160,9 @@ void WM::draw_icon(Drawable d, int x, int y, int kind, bool selected)
     }
 }
 
+// Paint the frame around a client: outer bevel, caption, sys-menu box,
+// min/max/close, title text, sunken client well. The application window is
+// a child; we only draw the chrome here.
 void WM::draw_frame(Client *c)
 {
     const int B = w95::kFrameB;
@@ -181,6 +193,8 @@ void WM::draw_frame(Client *c)
 
 static const char *kDeskNames[] = {"My Computer", "My Documents", "Terminal", "Editor"};
 
+// Wallpaper plus, on the primary monitor only, the four desktop shortcuts.
+// Non-primary screens stay empty so we don't duplicate icons across heads.
 void WM::draw_desktop(Monitor &m)
 {
     tile_wall(m.desktop, 0, 0, m.w, m.h - w95::kTaskbarH);
@@ -190,7 +204,7 @@ void WM::draw_desktop(Monitor &m)
     for (int i = 0; i < 4; i++) {
         int ix = pad;
         int iy = pad + i * w95::kCellH;
-        bool sel = (selected_icon == i);
+        bool sel = (desk_mask & (1u << i)) != 0;
         draw_icon(m.desktop, ix + 12, iy, i, sel);
         const char *lab = kDeskNames[i];
         int lw = text_w(lab);
@@ -200,6 +214,7 @@ void WM::draw_desktop(Monitor &m)
             fill(m.desktop, lx - 2, ly, lw + 4, 16, title.pix);
         draw_str(m.desktop, lx, ly, 16, lab, sel ? white.pix : white.pix, false);
         if (!sel) {
+            // 1px black offset under white text so labels read on teal/patterns.
             XSetForeground(dpy, gc, dk.pix);
             XFontStruct *f = font;
             if (f)
@@ -207,6 +222,25 @@ void WM::draw_desktop(Monitor &m)
             draw_str(m.desktop, lx, ly, 16, lab, white.pix, false);
         }
     }
+    if (drag == DragMode::Select && sel_mon == mon_index(&m))
+        draw_dotted_rect(m.desktop, sel_x0, sel_y0, sel_x1, sel_y1);
+}
+
+void WM::draw_dotted_rect(Drawable d, int x0, int y0, int x1, int y1)
+{
+    int x = std::min(x0, x1), y = std::min(y0, y1);
+    int w = std::abs(x1 - x0), h = std::abs(y1 - y0);
+    if (w < 1 || h < 1)
+        return;
+    char dash[] = {1, 1};
+    XSetDashes(dpy, gc, 0, dash, 2);
+    XSetLineAttributes(dpy, gc, 0, LineOnOffDash, CapButt, JoinMiter);
+    XSetForeground(dpy, gc, dk.pix);
+    XDrawRectangle(dpy, d, gc, x, y, (unsigned)w, (unsigned)h);
+    XSetForeground(dpy, gc, white.pix);
+    XSetDashes(dpy, gc, 1, dash, 2);
+    XDrawRectangle(dpy, d, gc, x, y, (unsigned)w, (unsigned)h);
+    XSetLineAttributes(dpy, gc, 0, LineSolid, CapButt, JoinMiter);
 }
 
 void WM::draw_clock(Drawable d, int x, int y, int w, int h)
@@ -262,6 +296,14 @@ void WM::draw_listbox(Drawable d, int x, int y, int w, int h, int sel, int n, co
     }
 }
 
+static const char *kRoleName[] = {
+    "Desktop",       "Window",         "3D Highlight",  "3D Shadow", "3D Dark",
+    "Active Title",  "Inactive Title", "Text",          "Text box",  "Start banner",
+};
+
+// Display Properties: mini desktop preview, wallpaper list + Browse, scheme
+// list + New/Edit/Delete, OK / Cancel / Apply. Hit testing uses kWallList* /
+// kSchemeList* / kBrowse* / kSchemeBtn* in theme.h.
 void WM::draw_setdlg()
 {
     const int w = w95::kSetW, h = w95::kSetH;
@@ -272,42 +314,91 @@ void WM::draw_setdlg()
     draw_caption_btn(setdlg, w - 6 - w95::kBtn, 5, 2, false);
 
     draw_str(setdlg, 16, 26, 16, "Preview", fg.pix, false);
-    sunken(setdlg, 16, 42, 204, 106);
-    fill(setdlg, 20, 46, 196, 78, dk.pix);
-    tile_wall(setdlg, 24, 50, 188, 70);
-    fill(setdlg, 96, 120, 44, 8, lo.pix);
-    fill(setdlg, 80, 128, 76, 12, face.pix);
-    bevel(setdlg, 80, 128, 76, 12, true);
+    sunken(setdlg, 16, 42, 204, 88);
+    fill(setdlg, 20, 46, 196, 62, dk.pix);
+    tile_wall(setdlg, 24, 50, 188, 54);
+    fill(setdlg, 96, 108, 44, 6, lo.pix);
+    fill(setdlg, 80, 114, 76, 10, face.pix);
+    bevel(setdlg, 80, 114, 76, 10, true);
 
-    draw_str(setdlg, 232, 26, 16, "Wallpaper", fg.pix, false);
-    fill(setdlg, 232, 44, 200, 104, field.pix);
-    sunken(setdlg, 232, 44, 200, 104);
+    draw_str(setdlg, w95::kWallListX, 26, 16, "Wallpaper", fg.pix, false);
+    fill(setdlg, w95::kWallListX, w95::kWallListY, w95::kWallListW, w95::kWallListH, field.pix);
+    sunken(setdlg, w95::kWallListX, w95::kWallListY, w95::kWallListW, w95::kWallListH);
     {
-        int vis = (104 - 4) / w95::kListRow;
-        for (int i = 0; i < (int)walls.size() && i < vis; i++) {
-            int iy = 46 + i * w95::kListRow;
-            if (i == wall_i) {
-                fill(setdlg, 234, iy, 196, w95::kListRow, title.pix);
-                draw_str_clip(setdlg, 238, iy, 188, w95::kListRow, walls[i].name.c_str(), white.pix, false);
+        int vis = (w95::kWallListH - 4) / w95::kListRow;
+        ensure_list_scroll(wall_scroll, wall_i, vis, (int)walls.size());
+        for (int i = 0; i < vis; i++) {
+            int idx = wall_scroll + i;
+            if (idx >= (int)walls.size())
+                break;
+            int iy = w95::kWallListY + 2 + i * w95::kListRow;
+            if (idx == wall_i) {
+                fill(setdlg, w95::kWallListX + 2, iy, w95::kWallListW - 4, w95::kListRow, title.pix);
+                draw_str_clip(setdlg, w95::kWallListX + 6, iy, w95::kWallListW - 12, w95::kListRow,
+                              walls[idx].name.c_str(), white.pix, false);
             } else
-                draw_str_clip(setdlg, 238, iy, 188, w95::kListRow, walls[i].name.c_str(), fg.pix, false);
+                draw_str_clip(setdlg, w95::kWallListX + 6, iy, w95::kWallListW - 12, w95::kListRow,
+                              walls[idx].name.c_str(), fg.pix, false);
         }
     }
+    draw_dlg_btn(setdlg, w95::kBrowseX, w95::kBrowseY, w95::kBrowseW, w95::kDlgBtnH, "Browse...");
 
-    draw_str(setdlg, 16, 152, 16, "Color scheme", fg.pix, false);
-    fill(setdlg, 16, 168, 416, 132, field.pix);
-    sunken(setdlg, 16, 168, 416, 132);
+    draw_str(setdlg, 16, 160, 16, "Color scheme", fg.pix, false);
+    fill(setdlg, w95::kSchemeListX, w95::kSchemeListY, w95::kSchemeListW, w95::kSchemeListH, field.pix);
+    sunken(setdlg, w95::kSchemeListX, w95::kSchemeListY, w95::kSchemeListW, w95::kSchemeListH);
     {
-        int vis = (132 - 4) / w95::kListRow;
-        for (int i = 0; i < w95::kSchemeN && i < vis; i++) {
-            int iy = 170 + i * w95::kListRow;
-            if (i == scheme_i) {
-                fill(setdlg, 18, iy, 412, w95::kListRow, title.pix);
-                draw_str_clip(setdlg, 22, iy, 404, w95::kListRow, w95::kSchemes[i].name, white.pix, false);
+        int vis = (w95::kSchemeListH - 4) / w95::kListRow;
+        ensure_list_scroll(scheme_scroll, scheme_i, vis, (int)schemes.size());
+        for (int i = 0; i < vis; i++) {
+            int idx = scheme_scroll + i;
+            if (idx >= (int)schemes.size())
+                break;
+            int iy = w95::kSchemeListY + 2 + i * w95::kListRow;
+            std::string lab = schemes[idx].name;
+            if (!schemes[idx].builtin)
+                lab += " *";
+            if (idx == scheme_i) {
+                fill(setdlg, w95::kSchemeListX + 2, iy, w95::kSchemeListW - 4, w95::kListRow, title.pix);
+                draw_str_clip(setdlg, w95::kSchemeListX + 6, iy, w95::kSchemeListW - 12, w95::kListRow, lab.c_str(),
+                              white.pix, false);
             } else
-                draw_str_clip(setdlg, 22, iy, 404, w95::kListRow, w95::kSchemes[i].name, fg.pix, false);
+                draw_str_clip(setdlg, w95::kSchemeListX + 6, iy, w95::kSchemeListW - 12, w95::kListRow, lab.c_str(),
+                              fg.pix, false);
         }
     }
+    int byb = w95::kSchemeBtnY;
+    draw_dlg_btn(setdlg, w95::kSchemeBtnX, byb, 96, w95::kDlgBtnH, "New");
+    draw_dlg_btn(setdlg, w95::kSchemeBtnX, byb + 28, 96, w95::kDlgBtnH, "Edit...");
+    draw_dlg_btn(setdlg, w95::kSchemeBtnX, byb + 56, 96, w95::kDlgBtnH, "Delete");
+
+    draw_str(setdlg, w95::kResListX, w95::kResListY - 16, 16, "Screen resolution", fg.pix, false);
+    fill(setdlg, w95::kResListX, w95::kResListY, w95::kResListW, w95::kResListH, field.pix);
+    sunken(setdlg, w95::kResListX, w95::kResListY, w95::kResListW, w95::kResListH);
+    {
+        int vis = (w95::kResListH - 4) / w95::kListRow;
+        ensure_list_scroll(mode_scroll, mode_i, vis, (int)modes.size());
+        for (int i = 0; i < vis; i++) {
+            int idx = mode_scroll + i;
+            if (idx >= (int)modes.size())
+                break;
+            int iy = w95::kResListY + 2 + i * w95::kListRow;
+            char lab[32];
+            std::snprintf(lab, sizeof lab, "%d x %d", modes[idx].w, modes[idx].h);
+            if (idx == mode_i) {
+                fill(setdlg, w95::kResListX + 2, iy, w95::kResListW - 4, w95::kListRow, title.pix);
+                draw_str_clip(setdlg, w95::kResListX + 6, iy, w95::kResListW - 12, w95::kListRow, lab, white.pix, false);
+            } else
+                draw_str_clip(setdlg, w95::kResListX + 6, iy, w95::kResListW - 12, w95::kListRow, lab, fg.pix, false);
+        }
+    }
+    if (mode_i >= 0 && mode_i < (int)modes.size()) {
+        char cur[64];
+        std::snprintf(cur, sizeof cur, "Desktop area: %d by %d pixels", modes[mode_i].w, modes[mode_i].h);
+        draw_str(setdlg, w95::kResListX + w95::kResListW + 12, w95::kResListY + 8, 16, cur, fg.pix, false);
+    }
+    if (!mode_note.empty())
+        draw_str_clip(setdlg, w95::kResListX + w95::kResListW + 12, w95::kResListY + 28, 200, 32, mode_note.c_str(),
+                      fg.pix, false);
 
     XSetForeground(dpy, gc, lo.pix);
     XDrawLine(dpy, setdlg, gc, 8, h - 44, w - 9, h - 44);
@@ -324,6 +415,121 @@ void WM::draw_setdlg()
     draw_dlg_btn(setdlg, apply_x, by, bw, bh, "Apply");
 }
 
+void WM::draw_colordlg()
+{
+    const int w = w95::kColorW, h = w95::kColorH;
+    fill(colordlg, 0, 0, w, h, face.pix);
+    bevel(colordlg, 0, 0, w, h, true);
+    fill(colordlg, 3, 3, w - 6, w95::kTitleH, title.pix);
+    draw_str(colordlg, 8, 3, w95::kTitleH, "Edit Color Scheme", white.pix, true);
+    draw_caption_btn(colordlg, w - 6 - w95::kBtn, 5, 2, false);
+
+    draw_str(colordlg, 16, 26, 18, "Name", fg.pix, false);
+    fill(colordlg, 60, 26, w - 76, 20, field.pix);
+    sunken(colordlg, 60, 26, w - 76, 20);
+    draw_str_clip(colordlg, 66, 26, w - 88, 20, color_name_buf.c_str(), fg.pix, false);
+    if (color_name_edit && caret_on) {
+        int cx = 66 + text_w(color_name_buf.c_str());
+        fill(colordlg, cx, 30, 2, 12, fg.pix);
+    }
+
+    fill(colordlg, 16, 54, 180, 180, field.pix);
+    sunken(colordlg, 16, 54, 180, 180);
+    {
+        int vis = (180 - 4) / w95::kListRow;
+        for (int i = 0; i < w95::kColorRoleN && i < vis; i++) {
+            int iy = 56 + i * w95::kListRow;
+            if (i == color_role) {
+                fill(colordlg, 18, iy, 176, w95::kListRow, title.pix);
+                draw_str_clip(colordlg, 24, iy, 164, w95::kListRow, kRoleName[i], white.pix, false);
+            } else
+                draw_str_clip(colordlg, 24, iy, 164, w95::kListRow, kRoleName[i], fg.pix, false);
+        }
+    }
+
+    ColorScheme dummy;
+    ColorScheme &s = (scheme_i >= 0 && scheme_i < (int)schemes.size()) ? schemes[scheme_i] : dummy;
+    w95::Rgb rgb = scheme_role(s, color_role);
+    unsigned long sw = pixel_from_rgb(rgb.r, rgb.g, rgb.b);
+    fill(colordlg, 212, 54, 188, 70, sw);
+    sunken(colordlg, 212, 54, 188, 70);
+
+    auto bar = [&](int y, const char *lab, int val, int chan) {
+        draw_str(colordlg, 212, y, 16, lab, fg.pix, false);
+        fill(colordlg, 232, y + 2, 160, 12, field.pix);
+        sunken(colordlg, 232, y + 2, 160, 12);
+        int fw = std::max(2, val * 156 / 255);
+        fill(colordlg, 234, y + 4, fw, 8, chan == color_chan ? title.pix : lo.pix);
+        char buf[8];
+        std::snprintf(buf, sizeof buf, "%d", val);
+        draw_str(colordlg, 396, y, 16, buf, fg.pix, false);
+    };
+    bar(136, "R", rgb.r, 0);
+    bar(160, "G", rgb.g, 1);
+    bar(184, "B", rgb.b, 2);
+    draw_str(colordlg, 212, 214, 32, "Click a bar or use arrows.", fg.pix, false);
+
+    const int bw = w95::kDlgBtnW, bh = w95::kDlgBtnH;
+    int by = h - 12 - bh;
+    int cancel_x = w - 12 - bw;
+    int ok_x = cancel_x - 8 - bw;
+    draw_dlg_btn(colordlg, ok_x, by, bw, bh, "OK");
+    draw_dlg_btn(colordlg, cancel_x, by, bw, bh, "Cancel");
+}
+
+void WM::draw_filedlg()
+{
+    const int w = w95::kFileW, h = w95::kFileH;
+    fill(filedlg, 0, 0, w, h, face.pix);
+    bevel(filedlg, 0, 0, w, h, true);
+    fill(filedlg, 3, 3, w - 6, w95::kTitleH, title.pix);
+    draw_str(filedlg, 8, 3, w95::kTitleH, "Browse for Wallpaper", white.pix, true);
+    draw_caption_btn(filedlg, w - 6 - w95::kBtn, 5, 2, false);
+
+    draw_str(filedlg, 12, 26, 18, "Look in", fg.pix, false);
+    fill(filedlg, 68, 26, w - 160, 20, field.pix);
+    sunken(filedlg, 68, 26, w - 160, 20);
+    draw_str_clip(filedlg, 74, 26, w - 172, 20, file_dir.c_str(), fg.pix, false);
+    draw_dlg_btn(filedlg, w - 84, 24, 32, 22, "Up");
+    draw_dlg_btn(filedlg, w - 48, 24, 36, 22, "Home");
+
+    int lx = 12, ly = 54, lw = w - 24, lh = 180;
+    fill(filedlg, lx, ly, lw, lh, field.pix);
+    sunken(filedlg, lx, ly, lw, lh);
+    int vis = (lh - 4) / w95::kListRow;
+    ensure_list_scroll(file_scroll, file_sel, vis, (int)file_ents.size());
+    for (int i = 0; i < vis; i++) {
+        int idx = file_scroll + i;
+        if (idx >= (int)file_ents.size())
+            break;
+        int iy = ly + 2 + i * w95::kListRow;
+        std::string lab = file_ents[idx].name;
+        if (file_ents[idx].dir)
+            lab += " /";
+        if (idx == file_sel) {
+            fill(filedlg, lx + 2, iy, lw - 4, w95::kListRow, title.pix);
+            draw_str_clip(filedlg, lx + 8, iy, lw - 16, w95::kListRow, lab.c_str(), white.pix, false);
+        } else
+            draw_str_clip(filedlg, lx + 8, iy, lw - 16, w95::kListRow, lab.c_str(), fg.pix, false);
+    }
+
+    draw_str(filedlg, 12, 242, 20, "File", fg.pix, false);
+    fill(filedlg, 48, 242, w - 60, 20, field.pix);
+    sunken(filedlg, 48, 242, w - 60, 20);
+    draw_str_clip(filedlg, 54, 242, w - 72, 20, file_typed.c_str(), fg.pix, false);
+    if (caret_on) {
+        int cx = 54 + text_w(file_typed.c_str());
+        fill(filedlg, cx, 246, 2, 12, fg.pix);
+    }
+
+    const int bw = w95::kDlgBtnW, bh = w95::kDlgBtnH;
+    int by = h - 12 - bh;
+    int cancel_x = w - 12 - bw;
+    int ok_x = cancel_x - 8 - bw;
+    draw_dlg_btn(filedlg, ok_x, by, bw, bh, "OK");
+    draw_dlg_btn(filedlg, cancel_x, by, bw, bh, "Cancel");
+}
+
 void WM::draw_tray()
 {
     if (!traywin)
@@ -336,6 +542,9 @@ void WM::draw_tray()
     draw_clock(traywin, wa.width - w95::kClockW, 0, w95::kClockW, wa.height);
 }
 
+// Taskbar: highlight along the top, Start, task buttons for windows on this
+// monitor, then tray/clock. The primary bar hosts traywin as a child; other
+// bars draw a clock well in place.
 void WM::draw_taskbar(Monitor &m)
 {
     fill(m.taskbar, 0, 0, m.w, w95::kTaskbarH, face.pix);
@@ -347,8 +556,9 @@ void WM::draw_taskbar(Monitor &m)
     int sbx = 2, sby = 3, sbw = w95::kStartW, sbh = w95::kTaskbarH - 6;
     fill(m.taskbar, sbx, sby, sbw, sbh, face.pix);
     bevel(m.taskbar, sbx, sby, sbw, sbh, !m.start_open);
-    draw_flag(m.taskbar, sbx + 4, sby + 4);
-    draw_str(m.taskbar, sbx + 22, sby, sbh, "Start", fg.pix, true);
+    const char *slabel = "Start";
+    int slw = text_w(slabel, true);
+    draw_str(m.taskbar, sbx + (sbw - slw) / 2, sby, sbh, slabel, fg.pix, true);
 
     int trayw = tray_width(m);
     int trayx = m.w - trayw - 4;
@@ -406,6 +616,7 @@ void WM::draw_startmenu(Monitor &m)
     fill(m.startmenu, 0, 0, mw, mh, face.pix);
     bevel(m.startmenu, 0, 0, mw, mh, true);
     fill(m.startmenu, 3, 3, w95::kBannerW - 2, mh - 6, banner.pix);
+    // Vertical "Chime" along the banner, drawn bottom-up like "Windows 95".
     const char *letters = "Chime";
     int ly = mh - 18;
     for (int i = (int)strlen(letters) - 1; i >= 0; i--) {
@@ -486,10 +697,16 @@ void WM::draw_rundlg()
     int tx = fx + 6;
     int tw = fw - 12;
     draw_str_clip(rundlg, tx, fy + 2, tw - 6, fh - 4, run_text.c_str(), fg.pix, false);
-    int caret = tx + text_w(run_text.c_str());
+    int caret = tx + text_w(run_text.c_str(), false);
+    // Prefer the insertion index if the Run dialog is using a moving caret.
+    if (run_cursor >= 0 && run_cursor <= (int)run_text.size()) {
+        std::string pre = run_text.substr(0, (size_t)run_cursor);
+        caret = tx + text_w(pre.c_str(), false);
+    }
     if (caret > tx + tw - 4)
         caret = tx + tw - 4;
-    fill(rundlg, caret, fy + 4, 1, fh - 8, fg.pix);
+    if (caret_on)
+        fill(rundlg, caret, fy + 4, 2, fh - 8, fg.pix);
 
     XSetForeground(dpy, gc, lo.pix);
     XDrawLine(dpy, rundlg, gc, 8, h - 44, w - 9, h - 44);
