@@ -30,10 +30,16 @@ constexpr int kDblClickMs = 400; // Title / desktop-icon double-click window
 constexpr int kSnapEdge = 24;   // Pointer proximity (px) that triggers Aero-style snap
 constexpr int kRunW = 372;      // Run dialog width
 constexpr int kRunH = 176;      // Run dialog height
+constexpr int kShutW = 372;     // Shut Down dialog (radios + Yes/No)
+constexpr int kShutH = 188;
+constexpr int kShutRadioX = 64; // Radio column (to the right of the computer icon)
+constexpr int kShutRadioY = 58;
+constexpr int kShutRadioH = 22;
+constexpr int kShutRadioN = 3;  // Shut down, Restart, Close Chime
 constexpr int kDlgBtnW = 75;    // Standard OK / Cancel / Apply button
 constexpr int kDlgBtnH = 23;
-constexpr int kSetW = 460;      // Display Properties dialog
-constexpr int kSetH = 408;
+constexpr int kSetW = 484;      // Display Properties dialog
+constexpr int kSetH = 436;
 constexpr int kListRow = 16;
 constexpr int kColorW = 420;    // Color scheme editor
 constexpr int kColorH = 356;
@@ -42,11 +48,18 @@ constexpr int kFileH = 320;
 constexpr int kColorRoleN = 10;
 
 // Display Properties hit boxes — keep in sync with draw_setdlg / on_button_press.
-constexpr int kWallListX = 232, kWallListY = 42, kWallListW = 212, kWallListH = 88;
-constexpr int kBrowseX = 232, kBrowseY = 134, kBrowseW = 88;
-constexpr int kSchemeListX = 16, kSchemeListY = 176, kSchemeListW = 318, kSchemeListH = 88;
-constexpr int kSchemeBtnX = 348, kSchemeBtnY = 176;
-constexpr int kResListX = 16, kResListY = 282, kResListW = 220, kResListH = 64;
+constexpr int kTabX = 12, kTabY = 24, kTabH = 20, kTabW = 100;
+constexpr int kPrevX = 16, kPrevY = 54, kPrevW = 212, kPrevH = 96;
+constexpr int kPatListX = 16, kPatListY = 172, kPatListW = 212, kPatListH = 112;
+constexpr int kPicListX = 244, kPicListY = 54, kPicListW = 224, kPicListH = 176;
+constexpr int kBrowseX = 244, kBrowseY = 238, kBrowseW = 88;
+constexpr int kPosX = 16, kPosY = 294;
+constexpr int kSchemeListX = 16, kSchemeListY = 54, kSchemeListW = 340, kSchemeListH = 280;
+constexpr int kSchemeBtnX = 372, kSchemeBtnY = 54;
+constexpr int kMonBoxX = 16, kMonBoxY = 54, kMonBoxW = 452, kMonBoxH = 196;
+constexpr int kHeadResX = 16, kHeadResY = 292, kHeadResW = 220, kHeadResH = 64;
+constexpr int kIdentX = 252, kIdentY = 292, kIdentW = 88;
+constexpr int kPrimX = 252, kPrimY = 324;
 
 // 8-bit RGB triple. Converted to an X pixel with XAllocColor (8-bit -> 16-bit
 // by multiplying by 257 so 0x80 becomes 0x8080, not 0x8000).

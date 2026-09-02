@@ -1,0 +1,19 @@
+#!/bin/sh
+# Chime X11 session. Display managers start Xorg, then exec this; when the
+# window manager exits, the session ends. Helpers live in LIBEXEC so `editor`
+# does not shadow the system editor outside this session.
+LIBEXEC=@LIBEXECDIR@
+DATA=@DATADIR@
+export PATH="$LIBEXEC:${PATH:-/usr/bin}"
+export CHIME_DATA_DIR="$DATA"
+export XDG_CURRENT_DESKTOP=Chime
+export XDG_SESSION_DESKTOP=chime
+# PREFIX/share (parent of DATADIR) so Cabinet/Editor/Terminal .desktop files
+# are visible even when PREFIX is not already on XDG_DATA_DIRS.
+SHARE=$(dirname "$DATA")
+export XDG_DATA_DIRS="$SHARE:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dbus-run-session >/dev/null 2>&1; then
+    exec dbus-run-session -- "$LIBEXEC/chime" "$@"
+fi
+exec "$LIBEXEC/chime" "$@"

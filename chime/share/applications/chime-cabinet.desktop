@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Cabinet
+Comment=Browse files and folders
+Exec=cabinet %F
+TryExec=cabinet
+Categories=Utility;FileManager;System;
+OnlyShowIn=Chime;
+Keywords=files;folders;explorer;
+Terminal=false

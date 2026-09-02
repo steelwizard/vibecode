@@ -6,10 +6,19 @@ PKG = x11 xrandr xinerama
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra
 CXXFLAGS += $(shell pkg-config --cflags $(PKG))
 LIBS = $(shell pkg-config --libs $(PKG))
-SRCS = src/main.cpp src/draw.cpp src/wm.cpp
-HDRS = src/wm.h src/theme.h
+DBUS_CFLAGS := $(shell pkg-config --cflags dbus-1 2>/dev/null)
+DBUS_LIBS := $(shell pkg-config --libs dbus-1 2>/dev/null)
+ifneq ($(strip $(DBUS_LIBS)),)
+CXXFLAGS += -DCHIME_SNI $(DBUS_CFLAGS)
+LIBS += $(DBUS_LIBS)
+endif
+SRCS = src/main.cpp src/draw.cpp src/wm.cpp src/xdg.cpp src/sni.cpp
+HDRS = src/wm.h src/theme.h src/sni.h
 
-.PHONY: all wm image run run-dual clean
+PREFIX ?= /usr/local
+DESTDIR ?=
+
+.PHONY: all wm image run run-dual install uninstall clean
 
 all: chime cabinet volicon editor
 
@@ -36,6 +45,14 @@ run: image
 
 run-dual: image
 	DUAL=1 ./scripts/run.sh
+
+# Host install: binaries under PREFIX, plus an xsessions desktop file so
+# SDDM/GDM/LightDM can offer "Chime" on the login screen.
+install: all
+	PREFIX="$(PREFIX)" DESTDIR="$(DESTDIR)" ./scripts/install.sh --from-make
+
+uninstall:
+	PREFIX="$(PREFIX)" DESTDIR="$(DESTDIR)" ./scripts/install.sh --uninstall
 
 clean:
 	rm -f chime cabinet volicon editor win95wm

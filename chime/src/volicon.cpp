@@ -126,6 +126,9 @@ int main()
     sh.width = sh.height = sh.min_width = sh.min_height = sh.max_width = sh.max_height = kSz;
     XSetWMNormalHints(dpy, icon, &sh);
     XStoreName(dpy, icon, "Volume");
+    Atom xembed_info = XInternAtom(dpy, "_XEMBED_INFO", False);
+    long xinfo[2] = {0, 1};
+    XChangeProperty(dpy, icon, xembed_info, xembed_info, 32, PropModeReplace, (unsigned char *)xinfo, 2);
 
     Window owner = 0;
     for (int i = 0; i < 80 && !owner; i++) {

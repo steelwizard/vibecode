@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Chime
+Comment=1990s-style desktop and window manager
+Exec=@BINDIR@/chime-session
+TryExec=@BINDIR@/chime-session
+Type=Application
+DesktopNames=Chime
+Keywords=wm;windowmanager;desktop;

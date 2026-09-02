@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Terminal
+Comment=Command prompt
+Exec=sh -c "aterm || xterm || x-terminal-emulator"
+Categories=System;TerminalEmulator;
+OnlyShowIn=Chime;
+Keywords=shell;prompt;
+Terminal=false

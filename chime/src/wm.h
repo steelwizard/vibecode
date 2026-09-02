@@ -14,6 +14,7 @@
 #include <vector>
 #include <memory>
 #include <cstdint>
+#include <ctime>
 
 // Allocated X colormap pixel. Named Col so drawing code can write face.pix
 // without colliding with X's Pixel typedef.
@@ -44,6 +45,8 @@ struct Client {
 
 // One physical output. Each monitor owns a wallpaper window, a taskbar, and
 // the Start menu / Programs submenu (created even when closed; we map/unmap).
+// wall_pix / desk_pix cache the wallpaper (and primary-only icons) so marquee
+// select can blit instead of retile the pattern on every motion event.
 struct Monitor {
     int x = 0, y = 0, w = 0, h = 0;
     bool primary = false;
@@ -51,6 +54,11 @@ struct Monitor {
     Window taskbar = 0;
     Window startmenu = 0;
     Window submenu = 0;
+    Pixmap wall_pix = 0;
+    Pixmap desk_pix = 0;
+    int pix_w = 0, pix_h = 0;
+    bool wall_dirty = true;
+    bool desk_dirty = true;
     int hover = -1;     // Start-menu row under the pointer, or -1
     int subhover = -1;  // Programs submenu row
     bool start_open = false;
@@ -76,7 +84,35 @@ enum class Hit {
     EdgeSW
 };
 
-enum class DragMode { Off, Move, Resize, Select };
+enum class DragMode { Off, Move, Resize, Select, Icons };
+
+// Dialog / chrome push-buttons. Armed on press, fired on release if still inside.
+enum {
+    PB_NONE = 0,
+    PB_RUN_OK,
+    PB_RUN_CANCEL,
+    PB_RUN_X,
+    PB_SHUT_YES,
+    PB_SHUT_NO,
+    PB_SHUT_X,
+    PB_COLOR_OK,
+    PB_COLOR_CANCEL,
+    PB_COLOR_X,
+    PB_FILE_OK,
+    PB_FILE_CANCEL,
+    PB_FILE_X,
+    PB_FILE_UP,
+    PB_FILE_HOME,
+    PB_SET_OK,
+    PB_SET_CANCEL,
+    PB_SET_APPLY,
+    PB_SET_X,
+    PB_SET_BROWSE,
+    PB_SET_NEW,
+    PB_SET_EDIT,
+    PB_SET_DEL,
+    PB_SET_IDENT
+};
 
 // One Start-menu row. sep draws a groove instead of a label; sub draws a
 // triangle and opens the Programs flyout. Find is present but disabled.
@@ -87,16 +123,62 @@ struct MenuItem {
     bool enabled;
 };
 
+// A desktop icon or Start → Programs row, loaded from XDG dirs (.desktop
+// files, plus ordinary files/folders on the Desktop).
+struct LaunchItem {
+    std::string name;
+    std::string exec; // Already expanded; passed to launch() / sh -c
+    std::string path; // Source file, directory, or .desktop path
+    int kind = 3;     // draw_icon: 0 computer, 1 folder, 2 terminal, 3 document
+    bool dir = false;
+    int x = -1, y = -1; // Desktop position; -1 until auto-placed or restored
+};
+
+// One docked system-tray client (XEmbed) or a StatusNotifier window we own.
+struct TrayItem {
+    Window win = 0;   // Client icon, or the 20x20 window we paint for SNI
+    Window sock = 0;  // Root-level wrapper matching the client's visual/depth
+    Colormap cmap = 0;
+    bool own_cmap = false;
+    bool own_win = false; // We created win (SNI); destroy it on undock
+    bool mapped = true;
+    std::vector<std::uint8_t> rgb; // own_win: kTrayIcon^2 RGB triples
+};
+
 extern MenuItem kMenu[];
 extern const int kMenuN;
 int menu_height();
 
-// Wallpaper entry: either a built-in pattern (pattern 0 = solid desktop color)
-// or a P6 PPM/BMP path scanned from /opt/chime/wallpapers and ~/.chime/wallpapers.
+// Wallpaper: a 32x32 pattern (pattern 0 = solid desktop color) or a photo
+// scanned from /opt/chime/wallpapers and ~/.chime/wallpapers.
 struct WallChoice {
     std::string name;
     int pattern = 0;
     std::string file;
+};
+
+enum class PicPos { Tile, Center, Stretch };
+
+struct HeadMode {
+    int w = 0, h = 0;
+    RRMode id = 0;
+};
+
+// One connected RandR output, used by the Settings tab to arrange monitors.
+struct Head {
+    std::string name;
+    RROutput output = 0;
+    RRCrtc crtc = 0;
+    RRMode mode = 0;
+    int x = 0, y = 0, w = 0, h = 0;
+    bool primary = false;
+    std::vector<HeadMode> modes;
+    int mode_i = 0;
+};
+
+struct PixCache {
+    int w = 0, h = 0;
+    Pixmap pix = 0;
 };
 
 // Runtime color scheme. Built-ins are copied from w95::kSchemes; user schemes
@@ -157,35 +239,60 @@ struct WM {
     Window rundlg = 0, shutdlg = 0, setdlg = 0, snapwin = 0, traywin = 0;
     Window colordlg = 0, filedlg = 0;
     bool run_open = false, shut_open = false, set_open = false;
+    int shut_choice = 0; // 0 shut down, 1 restart, 2 close Chime (log off)
     bool color_open = false, file_open = false;
     int dialog_mon = 0;
     std::string run_text;
     int run_cursor = 0;
     bool caret_on = true;
     long caret_ms = 0;
-    std::vector<Window> tray_icons;
+    std::vector<TrayItem> tray_items;
+    void *sni = nullptr; // SniHost in sni.cpp; null if D-Bus is unavailable
     unsigned super_mask = 0; // Actual modifier bit for Super (often Mod4)
     bool super_held = false;
     bool super_chord = false; // Super was used with another key; don't open Start on release
     bool volicon_launched = false;
 
     int scheme_i = 0;
-    int wall_i = 0;
+    int pat_i = 0;
+    int pic_i = 0;
+    PicPos pic_pos = PicPos::Stretch;
     int set_save_scheme = 0; // Snapshot when Display Properties opens (Cancel reverts)
-    int set_save_wall = 0;
-    int wall_scroll = 0;
+    int set_save_pat = 0;
+    int set_save_pic = 0;
+    PicPos set_save_pic_pos = PicPos::Stretch;
+    int pat_scroll = 0;
+    int pic_scroll = 0;
     int scheme_scroll = 0;
-    int mode_scroll = 0;
-    int set_list = 1; // 0 wallpaper, 1 scheme, 2 resolution (arrow keys)
+    int head_mode_scroll = 0;
+    int set_tab = 0;  // 0 Background, 1 Appearance, 2 Settings
+    int set_list = 1; // Which list on the current tab has keyboard focus
     int mode_i = 0;
     int set_save_mode = 0;
     std::vector<VideoMode> modes;
     std::string mode_note;
     std::vector<ColorScheme> schemes;
     std::vector<ColorScheme> set_save_schemes;
-    std::vector<WallChoice> walls;
-    Pixmap wall_tile = 0;
+    std::vector<WallChoice> patterns;
+    std::vector<WallChoice> pictures;
+    Pixmap wall_tile = 0; // 32x32 pattern
     int wall_tw = 0, wall_th = 0;
+    Raster pic_img;
+    Pixmap pic_pix = 0;
+    int pic_pw = 0, pic_ph = 0;
+    std::vector<PixCache> pic_scaled;
+
+    std::vector<Head> heads;
+    std::vector<Head> set_save_heads;
+    int head_sel = 0;
+    int head_drag = -1;
+    int head_grab_dx = 0, head_grab_dy = 0;
+    bool heads_dirty = false;
+    bool head_view_lock = false;
+    double head_sc = 1;
+    int head_ox = 0, head_oy = 0, head_minx = 0, head_miny = 0;
+    std::vector<Window> ident_wins;
+    long identify_until = 0;
 
     int color_role = 0;     // Which scheme slot the color editor is changing
     int color_chan = 0;     // 0=R 1=G 2=B for Left/Right
@@ -212,11 +319,30 @@ struct WM {
     Window last_title_win = 0;
     Time last_icon_time = 0;
     int last_icon = -1;
-    int selected_icon = -1; // Keyboard focus among the four desktop shortcuts
-    unsigned desk_mask = 0; // Bit i set → shortcut i is in the selection
+    int selected_icon = -1; // Keyboard focus among desktop icons, or -1
+    std::vector<LaunchItem> desk_items;
+    std::vector<char> desk_sel; // Parallel to desk_items; 1 = selected
+    std::string desk_dir;
+    time_t desk_mtime = 0;
+    std::vector<LaunchItem> programs;
+    int prog_scroll = 0;
+    int prog_vis = 1;
+    int sub_w = 150;
+    int sub_h = 74;
     int sel_x0 = 0, sel_y0 = 0, sel_x1 = 0, sel_y1 = 0;
     int sel_mon = 0;
-    unsigned sel_base = 0; // desk_mask at marquee start (Ctrl adds to this)
+    std::vector<char> sel_base; // desk_sel at marquee start (Ctrl adds to this)
+    int desk_press_i = -1; // Icon under the pointer at button-down, or -1
+    int desk_press_x = 0, desk_press_y = 0;
+    std::vector<int> desk_orig_x, desk_orig_y; // Positions at the start of an icon drag
+
+    int btn_id = 0;
+    Window btn_win = 0;
+    int btn_x = 0, btn_y = 0, btn_w = 0, btn_h = 0;
+    bool btn_in = false;
+    Hit cap_hit = Hit::Miss;
+    Client *cap_c = nullptr;
+    bool cap_in = false;
 
     int rr_event = 0, rr_error = 0;
     bool have_randr = false;
@@ -281,8 +407,14 @@ struct WM {
     void draw_str_clip(Drawable d, int x, int y, int w, int h, const char *s, unsigned long pix, bool bold = false);
     void draw_icon(Drawable d, int x, int y, int kind, bool selected);
     void draw_frame(Client *c);
-    void draw_caption_btn(Drawable d, int x, int y, int kind, bool maxed);
+    void draw_caption_btn(Drawable d, int x, int y, int kind, bool maxed, bool pressed = false);
     void draw_desktop(Monitor &m);
+    void paint_desk_icons(Drawable d);
+    void compose_desktop(Monitor &m);
+    void free_desk_pix(Monitor &m);
+    void invalidate_walls();
+    void invalidate_icons();
+    bool desk_shows_icons(const Monitor *m);
     void draw_taskbar(Monitor &m);
     void draw_clock(Drawable d, int x, int y, int w, int h);
     void draw_tray();
@@ -290,10 +422,11 @@ struct WM {
     void draw_submenu(Monitor &m);
     void draw_rundlg();
     void draw_shutdlg();
+    void draw_radio(Drawable d, int x, int y, bool on);
     void draw_setdlg();
     void draw_colordlg();
     void draw_filedlg();
-    void draw_dlg_btn(Drawable d, int x, int y, int w, int h, const char *lab);
+    void draw_dlg_btn(Drawable d, int x, int y, int w, int h, const char *lab, bool pressed = false);
     void draw_listbox(Drawable d, int x, int y, int w, int h, int sel, int n, const char *(*label)(int));
     void tile_wall(Drawable d, int x, int y, int w, int h);
     void draw_dotted_rect(Drawable d, int x0, int y0, int x1, int y1);
@@ -306,17 +439,38 @@ struct WM {
     void tray_dock(Window w);
     void tray_undock(Window w);
     bool is_tray_icon(Window w);
+    TrayItem *tray_by_win(Window w);
     void tray_send_xembed(Window w, long msg, long detail, long d1, long d2);
+    void tray_prepare_socket(TrayItem &t, const XWindowAttributes &wa);
+    bool read_xembed_info(Window w, long *ver, long *flags);
+    void tray_apply_xembed(TrayItem &t);
+    Window tray_add_owned();
+    void tray_set_rgb(Window w, const std::vector<std::uint8_t> &rgb);
+    void draw_tray_owned(const TrayItem &t);
+    bool tray_icon_from_path(const std::string &path, std::vector<std::uint8_t> &rgb);
+    void save_icon_layout();
+    void apply_icon_layout();
+    void auto_place_desk_icon(int i);
+    void clamp_desk_icons();
+    void snap_desk_sel();
+    int desk_neighbor(int from, int dirx, int diry);
 
     unsigned mod_mask_for(KeySym ks);
     void grab_key(KeySym ks, unsigned mod);
     void close_run();
+    void close_shut();
+    void confirm_shut();
     void close_settings(bool revert);
     void open_settings(int mi);
     void rebuild_walls();
     void make_wall_tile();
     void apply_scheme(int i);
-    void apply_wall(int i);
+    void apply_pattern(int i);
+    void apply_picture(int i);
+    void apply_picpos(PicPos p);
+    void apply_background();
+    void free_pic_cache();
+    Pixmap scaled_pic(int w, int h);
     void refresh_chrome();
     void save_display();
     void load_display();
@@ -332,9 +486,25 @@ struct WM {
     void load_file_dir(const std::string &path);
     bool import_wallpaper(const std::string &path);
     unsigned long pixel_from_rgb(std::uint8_t r, std::uint8_t g, std::uint8_t b);
-    void blit_rgb(Pixmap dst, const std::uint8_t *rgb, int w, int h);
+    void blit_rgb(Drawable dst, const std::uint8_t *rgb, int w, int h);
     void grab_dialog(Window w);
     void ungrab_if_idle();
+    void refresh_heads();
+    void save_heads();
+    void load_heads();
+    bool apply_heads();
+    void snap_head(int i);
+    void compute_head_view();
+    bool head_view(int i, int &x, int &y, int &w, int &h);
+    void view_to_layout(int px, int py, int &lx, int &ly);
+    int head_at(int px, int py);
+    void identify_heads();
+    void hide_identify();
+    void settings_apply(bool close);
+    void draw_set_tabs();
+    void draw_set_background();
+    void draw_set_appearance();
+    void draw_set_settings();
     Monitor *open_start_mon();
     void position_submenu(Monitor &m);
     void set_start_hover(Monitor &m, int idx, bool open_sub);
@@ -348,13 +518,27 @@ struct WM {
     void activate_start_item(Monitor &m, int idx);
     void activate_sub_item(int i);
     void activate_desk_icon(int i);
+    void activate_launch(const LaunchItem &it);
     void ensure_list_scroll(int &scroll, int sel, int vis, int n);
     int pointer_mon();
     void refresh_modes();
     bool apply_mode(int i);
-    void select_desk_icons(int x0, int y0, int x1, int y1, unsigned base);
+    void select_desk_icons(int x0, int y0, int x1, int y1);
     void desk_select_only(int i);
     void activate_desk_sel();
+    void load_desktop();
+    void maybe_reload_desktop();
+    void load_programs();
+    void seed_desktop();
+    std::string xdg_documents_dir();
+    void desk_cell(int i, int &x, int &y, int &w, int &h);
+    int desk_rows();
+    Monitor *mon_from_index(int i);
+    void redraw_desktops();
+    int desk_n() const;
+    bool desk_is_sel(int i) const;
+    int sub_item_at(int y);
+    void submenu_geom(Monitor &m, int &w, int &h, int &vis);
 
     Hit hit_frame(Client *c, int x, int y);
     Cursor cursor_for(Hit h);
@@ -363,6 +547,15 @@ struct WM {
     void open_run(int mi);
     void open_shut(int mi);
     void handle_event(XEvent *e);
+    bool btn_down(int id) const;
+    bool cap_down(const Client *c, Hit h) const;
+    void arm_btn(Window w, int id, int x, int y, int bw, int bh);
+    void arm_cap(Client *c, Hit h);
+    void paint_press();
+    void update_press(int x, int y);
+    void finish_press(bool activate);
+    void fire_btn(int id);
+
     void on_button_press(XEvent *e);
     void on_button_release(XEvent *e);
     void on_motion(XEvent *e);

@@ -4,8 +4,25 @@
 // X event loop. Painting lives in draw.cpp.
 
 #include "wm.h"
+#include "sni.h"
 
 #include <X11/Xproto.h>
+
+#include <algorithm>
+#include <climits>
+#include <csignal>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <dirent.h>
+#include <strings.h>
+#include <string>
+#include <sys/select.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <csignal>
@@ -24,6 +41,14 @@
 
 static WM *g_wm;       // Used only so signal/error paths can find the instance
 static bool g_other_wm; // Set if SubstructureRedirect is already taken
+
+enum {
+    XEMBED_EMBEDDED_NOTIFY = 0,
+    XEMBED_WINDOW_ACTIVATE = 1,
+    XEMBED_REQUEST_FOCUS = 3,
+    XEMBED_FOCUS_IN = 4,
+    XEMBED_MAPPED = 1
+};
 
 // Temporary handler while we try to become WM: BadAccess means another WM won.
 static int xerr_start(Display *, XErrorEvent *e)
@@ -62,8 +87,12 @@ static std::string shell_quote(const std::string &s)
     return o;
 }
 
-static const char *kEditorCmd = "editor || aterm -e vi || xterm -e vi || true";
-static const char *kTermCmd = "aterm || xterm || x-terminal-emulator || true";
+static const char *kPoweroffCmd =
+    "systemctl poweroff 2>/dev/null || poweroff -f 2>/dev/null || "
+    "sudo poweroff 2>/dev/null || sudo halt 2>/dev/null || true";
+static const char *kRebootCmd =
+    "systemctl reboot 2>/dev/null || reboot -f 2>/dev/null || "
+    "sudo reboot 2>/dev/null || sudo shutdown -r now 2>/dev/null || true";
 
 static uint16_t read_u16(FILE *f)
 {
@@ -504,6 +533,314 @@ std::vector<Monitor> WM::query_monitors()
     return out;
 }
 
+void WM::refresh_heads()
+{
+    heads.clear();
+    head_sel = 0;
+    head_drag = -1;
+    heads_dirty = false;
+    head_view_lock = false;
+    if (!have_randr)
+        return;
+    XRRScreenResources *res = XRRGetScreenResourcesCurrent(dpy, root);
+    if (!res)
+        return;
+    RROutput prim = XRRGetOutputPrimary(dpy, root);
+    for (int i = 0; i < res->noutput; i++) {
+        XRROutputInfo *oi = XRRGetOutputInfo(dpy, res, res->outputs[i]);
+        if (!oi)
+            continue;
+        if (oi->connection != RR_Connected || oi->crtc == 0) {
+            XRRFreeOutputInfo(oi);
+            continue;
+        }
+        XRRCrtcInfo *ci = XRRGetCrtcInfo(dpy, res, oi->crtc);
+        if (!ci || ci->mode == 0 || ci->width < 1) {
+            if (ci)
+                XRRFreeCrtcInfo(ci);
+            XRRFreeOutputInfo(oi);
+            continue;
+        }
+        Head h;
+        h.name = oi->name ? oi->name : "Monitor";
+        h.output = res->outputs[i];
+        h.crtc = oi->crtc;
+        h.mode = ci->mode;
+        h.x = ci->x;
+        h.y = ci->y;
+        h.w = (int)ci->width;
+        h.h = (int)ci->height;
+        h.primary = (prim && res->outputs[i] == prim);
+        for (int m = 0; m < oi->nmode; m++) {
+            RRMode id = oi->modes[m];
+            for (int k = 0; k < res->nmode; k++) {
+                if (res->modes[k].id != id)
+                    continue;
+                int ww = (int)res->modes[k].width, hh = (int)res->modes[k].height;
+                bool seen = false;
+                for (auto &hm : h.modes)
+                    if (hm.w == ww && hm.h == hh) {
+                        seen = true;
+                        break;
+                    }
+                if (!seen)
+                    h.modes.push_back({ww, hh, id});
+                break;
+            }
+        }
+        std::sort(h.modes.begin(), h.modes.end(), [](const HeadMode &a, const HeadMode &b) {
+            return a.w != b.w ? a.w < b.w : a.h < b.h;
+        });
+        h.mode_i = 0;
+        for (int m = 0; m < (int)h.modes.size(); m++)
+            if (h.modes[m].w == h.w && h.modes[m].h == h.h)
+                h.mode_i = m;
+        heads.push_back(std::move(h));
+        XRRFreeCrtcInfo(ci);
+        XRRFreeOutputInfo(oi);
+    }
+    XRRFreeScreenResources(res);
+    if (!heads.empty()) {
+        bool any = false;
+        for (auto &h : heads)
+            any = any || h.primary;
+        if (!any)
+            heads[0].primary = true;
+    }
+}
+
+void WM::save_heads()
+{
+    const char *home = getenv("HOME");
+    if (!home || !*home || heads.empty())
+        return;
+    mkdir((std::string(home) + "/.chime").c_str(), 0755);
+    std::string path = std::string(home) + "/.chime/monitors";
+    FILE *f = fopen(path.c_str(), "w");
+    if (!f)
+        return;
+    for (auto &h : heads)
+        std::fprintf(f, "%s %d %d %d %d %d\n", h.name.c_str(), h.x, h.y, h.w, h.h, h.primary ? 1 : 0);
+    fclose(f);
+}
+
+void WM::load_heads()
+{
+    refresh_heads();
+    const char *home = getenv("HOME");
+    if (!home || !*home || heads.empty())
+        return;
+    std::string path = std::string(home) + "/.chime/monitors";
+    FILE *f = fopen(path.c_str(), "r");
+    if (!f)
+        return;
+    char name[128];
+    int x, y, w, h, prim;
+    bool changed = false;
+    std::string prim_name;
+    while (fscanf(f, "%127s %d %d %d %d %d", name, &x, &y, &w, &h, &prim) == 6) {
+        for (auto &hd : heads) {
+            if (hd.name != name)
+                continue;
+            if (hd.x != x || hd.y != y || hd.w != w || hd.h != h)
+                changed = true;
+            hd.x = x;
+            hd.y = y;
+            if (prim)
+                prim_name = name;
+            for (int i = 0; i < (int)hd.modes.size(); i++) {
+                if (hd.modes[i].w == w && hd.modes[i].h == h) {
+                    if (hd.mode_i != i)
+                        changed = true;
+                    hd.mode_i = i;
+                    hd.w = w;
+                    hd.h = h;
+                    hd.mode = hd.modes[i].id;
+                    break;
+                }
+            }
+        }
+    }
+    fclose(f);
+    if (!prim_name.empty()) {
+        for (auto &hd : heads) {
+            bool want = hd.name == prim_name;
+            if (hd.primary != want)
+                changed = true;
+            hd.primary = want;
+        }
+    }
+    if (changed)
+        apply_heads();
+}
+
+bool WM::apply_heads()
+{
+    if (!have_randr || heads.empty())
+        return false;
+    int minx = heads[0].x, miny = heads[0].y;
+    int maxx = heads[0].x + heads[0].w, maxy = heads[0].y + heads[0].h;
+    for (auto &h : heads) {
+        minx = std::min(minx, h.x);
+        miny = std::min(miny, h.y);
+        maxx = std::max(maxx, h.x + h.w);
+        maxy = std::max(maxy, h.y + h.h);
+    }
+    for (auto &h : heads) {
+        h.x -= minx;
+        h.y -= miny;
+    }
+    std::string cmd = "xrandr";
+    for (auto &h : heads) {
+        if (h.mode_i >= 0 && h.mode_i < (int)h.modes.size()) {
+            h.w = h.modes[h.mode_i].w;
+            h.h = h.modes[h.mode_i].h;
+        }
+        cmd += " --output " + h.name;
+        cmd += " --mode " + std::to_string(h.w) + "x" + std::to_string(h.h);
+        cmd += " --pos " + std::to_string(h.x) + "x" + std::to_string(h.y);
+        if (h.primary)
+            cmd += " --primary";
+    }
+    cmd += " >/dev/null 2>&1";
+    if (system(cmd.c_str()) != 0) {
+        mode_note = "Could not apply that layout.";
+        return false;
+    }
+    heads_dirty = false;
+    mode_note.clear();
+    XSync(dpy, False);
+    sync_monitors();
+    refresh_heads();
+    return true;
+}
+
+void WM::snap_head(int i)
+{
+    if (i < 0 || i >= (int)heads.size())
+        return;
+    Head &h = heads[i];
+    const int S = 32;
+    auto nearv = [](int a, int b) { return std::abs(a - b) < S; };
+    for (int j = 0; j < (int)heads.size(); j++) {
+        if (j == i)
+            continue;
+        Head &o = heads[j];
+        if (nearv(h.x, o.x + o.w))
+            h.x = o.x + o.w;
+        if (nearv(h.x + h.w, o.x))
+            h.x = o.x - h.w;
+        if (nearv(h.x, o.x))
+            h.x = o.x;
+        if (nearv(h.x + h.w, o.x + o.w))
+            h.x = o.x + o.w - h.w;
+        if (nearv(h.y, o.y + o.h))
+            h.y = o.y + o.h;
+        if (nearv(h.y + h.h, o.y))
+            h.y = o.y - h.h;
+        if (nearv(h.y, o.y))
+            h.y = o.y;
+        if (nearv(h.y + h.h, o.y + o.h))
+            h.y = o.y + o.h - h.h;
+        if (nearv(h.y + h.h / 2, o.y + o.h / 2))
+            h.y = o.y + o.h / 2 - h.h / 2;
+        if (nearv(h.x + h.w / 2, o.x + o.w / 2))
+            h.x = o.x + o.w / 2 - h.w / 2;
+    }
+    if (nearv(h.x, 0))
+        h.x = 0;
+    if (nearv(h.y, 0))
+        h.y = 0;
+}
+
+void WM::compute_head_view()
+{
+    if (head_view_lock || heads.empty())
+        return;
+    int minx = heads[0].x, miny = heads[0].y;
+    int maxx = heads[0].x + heads[0].w, maxy = heads[0].y + heads[0].h;
+    for (auto &h : heads) {
+        minx = std::min(minx, h.x);
+        miny = std::min(miny, h.y);
+        maxx = std::max(maxx, h.x + h.w);
+        maxy = std::max(maxy, h.y + h.h);
+    }
+    int spanw = std::max(1, maxx - minx), spanh = std::max(1, maxy - miny);
+    int cx = w95::kMonBoxX + 8, cy = w95::kMonBoxY + 8;
+    int cw = w95::kMonBoxW - 16, ch = w95::kMonBoxH - 16;
+    double sx = (double)cw / spanw, sy = (double)ch / spanh;
+    head_sc = std::min(sx, sy) * 0.88;
+    if (head_sc < 0.02)
+        head_sc = 0.02;
+    int dw = (int)(spanw * head_sc), dh = (int)(spanh * head_sc);
+    head_ox = cx + (cw - dw) / 2;
+    head_oy = cy + (ch - dh) / 2;
+    head_minx = minx;
+    head_miny = miny;
+}
+
+bool WM::head_view(int i, int &x, int &y, int &w, int &h)
+{
+    if (i < 0 || i >= (int)heads.size())
+        return false;
+    compute_head_view();
+    Head &hd = heads[i];
+    x = head_ox + (int)((hd.x - head_minx) * head_sc);
+    y = head_oy + (int)((hd.y - head_miny) * head_sc);
+    w = std::max(28, (int)(hd.w * head_sc));
+    h = std::max(20, (int)(hd.h * head_sc));
+    return true;
+}
+
+void WM::view_to_layout(int px, int py, int &lx, int &ly)
+{
+    compute_head_view();
+    lx = head_minx + (int)((px - head_ox) / head_sc);
+    ly = head_miny + (int)((py - head_oy) / head_sc);
+}
+
+int WM::head_at(int px, int py)
+{
+    for (int i = (int)heads.size() - 1; i >= 0; i--) {
+        int x, y, w, h;
+        if (!head_view(i, x, y, w, h))
+            continue;
+        if (px >= x && py >= y && px < x + w && py < y + h)
+            return i;
+    }
+    return -1;
+}
+
+void WM::hide_identify()
+{
+    for (Window w : ident_wins)
+        if (w)
+            XDestroyWindow(dpy, w);
+    ident_wins.clear();
+    identify_until = 0;
+}
+
+void WM::identify_heads()
+{
+    hide_identify();
+    auto &src = mons;
+    for (int i = 0; i < (int)src.size(); i++) {
+        int ww = 96, hh = 72;
+        int x = src[i].x + (src[i].w - ww) / 2;
+        int y = src[i].y + (src[i].h - hh) / 3;
+        Window w = mkwin(x, y, ww, hh, title.pix, ExposureMask, true);
+        XMapRaised(dpy, w);
+        fill(w, 0, 0, ww, hh, title.pix);
+        bevel(w, 0, 0, ww, hh, true);
+        char lab[16];
+        std::snprintf(lab, sizeof lab, "%d", i + 1);
+        int tw = text_w(lab, true);
+        draw_str(w, (ww - tw) / 2, 0, hh, lab, white.pix, true);
+        ident_wins.push_back(w);
+    }
+    identify_until = now_ms() + 2500;
+}
+
 void WM::create_shell(Monitor &m)
 {
     // Desktop fills the work area; taskbar sits on the bottom edge. Menus are
@@ -517,7 +854,7 @@ void WM::create_shell(Monitor &m)
     int mw = w95::kBannerW + w95::kMenuBodyW;
     int mh = menu_height();
     m.startmenu = mkwin(m.x + 2, m.y + m.h - w95::kTaskbarH - mh, mw, mh, face.pix, mmask, true);
-    m.submenu = mkwin(0, 0, 150, 8 + 3 * w95::kMenuItemH, face.pix, mmask, true);
+    m.submenu = mkwin(0, 0, 150, 8 + w95::kMenuItemH, face.pix, mmask, true);
     XChangeProperty(dpy, m.desktop, net_wm_window_type, XA_ATOM, 32, PropModeReplace, (unsigned char *)&net_type_desktop,
                     1);
     XChangeProperty(dpy, m.taskbar, net_wm_window_type, XA_ATOM, 32, PropModeReplace, (unsigned char *)&net_type_dock, 1);
@@ -528,6 +865,7 @@ void WM::create_shell(Monitor &m)
 void WM::destroy_shell(Monitor &m)
 {
     // Submenu first so we don't leave an orphan mapped after the Start menu dies.
+    free_desk_pix(m);
     if (m.submenu)
         XDestroyWindow(dpy, m.submenu);
     if (m.startmenu)
@@ -588,6 +926,7 @@ void WM::sync_monitors()
     }
     restack_shell();
     tray_create();
+    clamp_desk_icons();
     for (auto &m : mons) {
         draw_desktop(m);
         draw_taskbar(m);
@@ -598,13 +937,21 @@ void WM::sync_monitors()
 void WM::restack_shell()
 {
     // Desktop always at the bottom, taskbar always on top of clients, then
-    // menus and modal dialogs. Raise order matters for click-through.
+    // tray sockets (root-level, so they sit on the well), then menus.
     for (auto &m : mons)
         if (m.desktop)
             XLowerWindow(dpy, m.desktop);
     for (auto &m : mons)
         if (m.taskbar)
             XRaiseWindow(dpy, m.taskbar);
+    for (auto &t : tray_items) {
+        if (!t.mapped)
+            continue;
+        if (t.sock)
+            XRaiseWindow(dpy, t.sock);
+        else if (t.own_win)
+            XRaiseWindow(dpy, t.win);
+    }
     for (auto &m : mons) {
         if (m.start_open)
             XRaiseWindow(dpy, m.startmenu);
@@ -621,6 +968,9 @@ void WM::restack_shell()
         XRaiseWindow(dpy, colordlg);
     if (file_open)
         XRaiseWindow(dpy, filedlg);
+    for (Window w : ident_wins)
+        if (w)
+            XRaiseWindow(dpy, w);
 }
 
 int WM::monitor_at(int x, int y)
@@ -692,12 +1042,213 @@ int WM::pointer_mon()
     return monitor_at(rx, ry);
 }
 
-static void desk_cell(int i, int &x, int &y, int &w, int &h)
+int WM::desk_n() const
+{
+    return (int)desk_items.size();
+}
+
+bool WM::desk_is_sel(int i) const
+{
+    return i >= 0 && i < (int)desk_sel.size() && desk_sel[i];
+}
+
+Monitor *WM::mon_from_index(int i)
+{
+    if (i >= 0 && i < (int)mons.size())
+        return &mons[i];
+    return primary_mon();
+}
+
+void WM::redraw_desktops()
+{
+    for (auto &m : mons)
+        draw_desktop(m);
+}
+
+int WM::desk_rows()
+{
+    const Monitor *m = primary_mon();
+    int dh = m ? (m->h - w95::kTaskbarH) : 480;
+    int rows = (dh - 12) / w95::kCellH;
+    return std::max(1, rows);
+}
+
+void WM::desk_cell(int i, int &x, int &y, int &w, int &h)
 {
     x = 12;
-    y = 12 + i * w95::kCellH;
+    y = 12;
+    if (i >= 0 && i < (int)desk_items.size()) {
+        if (desk_items[i].x >= 0 && desk_items[i].y >= 0) {
+            x = desk_items[i].x;
+            y = desk_items[i].y;
+        } else {
+            int rows = desk_rows();
+            x = 12 + (i / rows) * w95::kCellW;
+            y = 12 + (i % rows) * w95::kCellH;
+        }
+    }
     w = w95::kCellW;
     h = w95::kCellH;
+}
+
+void WM::auto_place_desk_icon(int i)
+{
+    if (i < 0 || i >= desk_n())
+        return;
+    int rows = desk_rows();
+    Monitor *m = primary_mon();
+    int cols = m ? std::max(1, (m->w - 12) / w95::kCellW) : 8;
+    for (int col = 0; col < cols; col++) {
+        for (int row = 0; row < rows; row++) {
+            int x = 12 + col * w95::kCellW;
+            int y = 12 + row * w95::kCellH;
+            bool taken = false;
+            for (int j = 0; j < desk_n(); j++) {
+                if (j == i)
+                    continue;
+                if (desk_items[j].x == x && desk_items[j].y == y)
+                    taken = true;
+            }
+            if (!taken) {
+                desk_items[i].x = x;
+                desk_items[i].y = y;
+                return;
+            }
+        }
+    }
+    desk_items[i].x = 12;
+    desk_items[i].y = 12;
+}
+
+void WM::clamp_desk_icons()
+{
+    Monitor *m = primary_mon();
+    int maxx = m ? std::max(12, m->w - w95::kCellW) : 12;
+    int maxy = m ? std::max(12, m->h - w95::kTaskbarH - w95::kCellH) : 12;
+    for (auto &it : desk_items) {
+        if (it.x < 12)
+            it.x = 12;
+        if (it.y < 12)
+            it.y = 12;
+        if (it.x > maxx)
+            it.x = maxx;
+        if (it.y > maxy)
+            it.y = maxy;
+    }
+}
+
+void WM::snap_desk_sel()
+{
+    Monitor *m = primary_mon();
+    int maxx = m ? std::max(12, m->w - w95::kCellW) : 12;
+    int maxy = m ? std::max(12, m->h - w95::kTaskbarH - w95::kCellH) : 12;
+    auto snap = [](int v, int origin, int step, int maxv) {
+        int i = (v - origin + step / 2) / step;
+        if (i < 0)
+            i = 0;
+        int out = origin + i * step;
+        if (out > maxv) {
+            i = (maxv - origin) / step;
+            if (i < 0)
+                i = 0;
+            out = origin + i * step;
+        }
+        return out;
+    };
+    for (int i = 0; i < desk_n(); i++) {
+        if (!desk_is_sel(i))
+            continue;
+        desk_items[i].x = snap(desk_items[i].x, 12, w95::kCellW, maxx);
+        desk_items[i].y = snap(desk_items[i].y, 12, w95::kCellH, maxy);
+    }
+}
+
+int WM::desk_neighbor(int from, int dirx, int diry)
+{
+    if (from < 0 || from >= desk_n())
+        return 0;
+    int fx, fy, fw, fh;
+    desk_cell(from, fx, fy, fw, fh);
+    int fcx = fx + fw / 2, fcy = fy + fh / 2;
+    int best = from, best_d = INT_MAX;
+    for (int i = 0; i < desk_n(); i++) {
+        if (i == from)
+            continue;
+        int ix, iy, iw, ih;
+        desk_cell(i, ix, iy, iw, ih);
+        int icx = ix + iw / 2, icy = iy + ih / 2;
+        int vx = icx - fcx, vy = icy - fcy;
+        if (dirx && vx * dirx <= 0)
+            continue;
+        if (diry && vy * diry <= 0)
+            continue;
+        int primary = dirx ? std::abs(vx) : std::abs(vy);
+        int off = dirx ? std::abs(vy) : std::abs(vx);
+        int d = primary * 4 + off;
+        if (d < best_d) {
+            best_d = d;
+            best = i;
+        }
+    }
+    return best;
+}
+
+bool WM::desk_shows_icons(const Monitor *m)
+{
+    return m && primary_mon() == m;
+}
+
+void WM::free_desk_pix(Monitor &m)
+{
+    if (dpy) {
+        if (m.wall_pix)
+            XFreePixmap(dpy, m.wall_pix);
+        if (m.desk_pix)
+            XFreePixmap(dpy, m.desk_pix);
+    }
+    m.wall_pix = m.desk_pix = 0;
+    m.pix_w = m.pix_h = 0;
+    m.wall_dirty = m.desk_dirty = true;
+}
+
+void WM::invalidate_walls()
+{
+    for (auto &m : mons) {
+        m.wall_dirty = true;
+        m.desk_dirty = true;
+    }
+}
+
+void WM::invalidate_icons()
+{
+    for (auto &m : mons)
+        m.desk_dirty = true;
+}
+
+void WM::compose_desktop(Monitor &m)
+{
+    int dw = std::max(1, m.w);
+    int dh = std::max(1, m.h - w95::kTaskbarH);
+    if (!m.wall_pix || !m.desk_pix || m.pix_w != dw || m.pix_h != dh) {
+        free_desk_pix(m);
+        Drawable ref = m.desktop ? m.desktop : root;
+        m.wall_pix = XCreatePixmap(dpy, ref, (unsigned)dw, (unsigned)dh, (unsigned)depth);
+        m.desk_pix = XCreatePixmap(dpy, ref, (unsigned)dw, (unsigned)dh, (unsigned)depth);
+        m.pix_w = dw;
+        m.pix_h = dh;
+        m.wall_dirty = m.desk_dirty = true;
+    }
+    if (m.wall_dirty) {
+        tile_wall(m.wall_pix, 0, 0, m.pix_w, m.pix_h);
+        m.wall_dirty = false;
+        m.desk_dirty = true;
+    }
+    if (m.desk_dirty) {
+        XCopyArea(dpy, m.wall_pix, m.desk_pix, gc, 0, 0, m.pix_w, m.pix_h, 0, 0);
+        if (desk_shows_icons(&m))
+            paint_desk_icons(m.desk_pix);
+        m.desk_dirty = false;
+    }
 }
 
 static bool rects_hit(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh)
@@ -707,43 +1258,63 @@ static bool rects_hit(int ax, int ay, int aw, int ah, int bx, int by, int bw, in
 
 void WM::desk_select_only(int i)
 {
-    if (i < 0 || i > 3) {
+    desk_sel.assign(desk_items.size(), 0);
+    if (i < 0 || i >= desk_n()) {
         selected_icon = -1;
-        desk_mask = 0;
+        invalidate_icons();
         return;
     }
     selected_icon = i;
-    desk_mask = 1u << i;
+    desk_sel[i] = 1;
+    invalidate_icons();
 }
 
-void WM::select_desk_icons(int x0, int y0, int x1, int y1, unsigned base)
+void WM::select_desk_icons(int x0, int y0, int x1, int y1)
 {
     int rx = std::min(x0, x1), ry = std::min(y0, y1);
     int rw = std::abs(x1 - x0), rh = std::abs(y1 - y0);
-    unsigned m = base;
+    std::vector<char> prev = desk_sel;
+    desk_sel = sel_base;
+    desk_sel.resize(desk_items.size(), 0);
     int last = selected_icon;
-    for (int i = 0; i < 4; i++) {
-        int ix, iy, iw, ih;
-        desk_cell(i, ix, iy, iw, ih);
-        if (rects_hit(rx, ry, rw, rh, ix, iy, iw, ih)) {
-            m |= 1u << i;
-            last = i;
+    const Monitor *mon = mon_from_index(sel_mon);
+    if (desk_shows_icons(mon)) {
+        for (int i = 0; i < desk_n(); i++) {
+            int ix, iy, iw, ih;
+            desk_cell(i, ix, iy, iw, ih);
+            if (rects_hit(rx, ry, rw, rh, ix, iy, iw, ih)) {
+                desk_sel[i] = 1;
+                last = i;
+            }
         }
     }
-    desk_mask = m;
-    if (m)
-        selected_icon = last;
+    for (char c : desk_sel) {
+        if (c) {
+            selected_icon = last;
+            break;
+        }
+    }
+    if (desk_sel != prev)
+        invalidate_icons();
 }
 
 void WM::activate_desk_sel()
 {
-    if (!desk_mask && selected_icon >= 0)
-        activate_desk_icon(selected_icon);
-    else {
-        for (int i = 0; i < 4; i++)
-            if (desk_mask & (1u << i))
-                activate_desk_icon(i);
+    bool any = false;
+    for (int i = 0; i < desk_n(); i++) {
+        if (desk_is_sel(i)) {
+            activate_desk_icon(i);
+            any = true;
+        }
     }
+    if (!any && selected_icon >= 0)
+        activate_desk_icon(selected_icon);
+}
+
+void WM::activate_launch(const LaunchItem &it)
+{
+    if (!it.exec.empty())
+        launch(it.exec.c_str());
 }
 
 void WM::refresh_modes()
@@ -784,7 +1355,6 @@ void WM::refresh_modes()
     for (int i = 0; i < (int)modes.size(); i++)
         if (modes[i].w == sw && modes[i].h == sh)
             mode_i = i;
-    mode_scroll = 0;
     mode_note.clear();
 }
 
@@ -837,17 +1407,28 @@ int WM::tray_width(const Monitor &m)
 {
     // Only the primary bar grows for docked icons; other bars stay clock-sized.
     int w = w95::kClockW;
-    if (m.primary && !tray_icons.empty())
-        w += 4 + (int)tray_icons.size() * w95::kTraySlot;
+    int n = 0;
+    for (const auto &t : tray_items)
+        if (t.mapped)
+            n++;
+    if (m.primary && n)
+        w += 4 + n * w95::kTraySlot;
     return w;
+}
+
+TrayItem *WM::tray_by_win(Window w)
+{
+    if (!w)
+        return nullptr;
+    for (auto &t : tray_items)
+        if (t.win == w || t.sock == w)
+            return &t;
+    return nullptr;
 }
 
 bool WM::is_tray_icon(Window w)
 {
-    for (Window t : tray_icons)
-        if (t == w)
-            return true;
-    return false;
+    return tray_by_win(w) != nullptr;
 }
 
 void WM::tray_send_xembed(Window w, long msg, long detail, long d1, long d2)
@@ -868,12 +1449,8 @@ void WM::tray_send_xembed(Window w, long msg, long detail, long d1, long d2)
 
 void WM::tray_stash()
 {
-    // Park icons on the root while we destroy/recreate traywin on monitor sync.
-    for (Window w : tray_icons) {
-        XSelectInput(dpy, w, StructureNotifyMask);
-        XReparentWindow(dpy, w, root, 0, 0);
-        XUnmapWindow(dpy, w);
-    }
+    // Icons live in root-level sockets, so destroying traywin (a taskbar
+    // child) does not take them with it. Drop the pointer before the bar dies.
     traywin = 0;
 }
 
@@ -908,7 +1485,8 @@ void WM::tray_claim()
 
 void WM::tray_create()
 {
-    // Child of the primary taskbar, right-aligned. Reparents any stashed icons.
+    // Child of the primary taskbar: the sunken well and clock. Icons are
+    // separate root-level sockets so 32-bit clients are not BadMatch.
     Monitor *p = primary_mon();
     if (!p || !p->taskbar)
         return;
@@ -917,18 +1495,86 @@ void WM::tray_create()
     int x = p->w - tw - 4;
     XSetWindowAttributes swa{};
     swa.background_pixel = face.pix;
-    swa.event_mask = ExposureMask | SubstructureNotifyMask | SubstructureRedirectMask;
+    swa.event_mask = ExposureMask | StructureNotifyMask;
     swa.colormap = cmap;
     swa.border_pixel = 0;
     swa.cursor = cur_left;
     traywin = XCreateWindow(dpy, p->taskbar, x, 3, (unsigned)tw, (unsigned)th, 0, depth, InputOutput, vis,
                             CWBackPixel | CWEventMask | CWColormap | CWBorderPixel | CWCursor, &swa);
     XMapWindow(dpy, traywin);
-    for (Window w : tray_icons) {
-        XReparentWindow(dpy, w, traywin, 0, 0);
-        XMapWindow(dpy, w);
-    }
     tray_claim();
+    tray_layout();
+}
+
+void WM::tray_prepare_socket(TrayItem &t, const XWindowAttributes &wa)
+{
+    Visual *v = wa.visual ? wa.visual : vis;
+    int d = wa.depth > 0 ? wa.depth : depth;
+    Colormap cm = wa.colormap;
+    t.own_cmap = false;
+    if (!cm) {
+        cm = XCreateColormap(dpy, root, v, AllocNone);
+        t.own_cmap = true;
+    }
+    t.cmap = cm;
+    w95::Rgb frgb = w95::rgb_face;
+    if (scheme_i >= 0 && scheme_i < (int)schemes.size())
+        frgb = schemes[scheme_i].face;
+    XColor xc{};
+    xc.red = (unsigned short)(frgb.r * 257);
+    xc.green = (unsigned short)(frgb.g * 257);
+    xc.blue = (unsigned short)(frgb.b * 257);
+    xc.flags = DoRed | DoGreen | DoBlue;
+    unsigned long bg = 0;
+    if (XAllocColor(dpy, cm, &xc))
+        bg = xc.pixel;
+    unsigned long extra = 0xFFFFFFFFul & ~(v->red_mask | v->green_mask | v->blue_mask);
+    bg |= extra;
+    XSetWindowAttributes swa{};
+    swa.background_pixel = bg;
+    swa.border_pixel = bg;
+    swa.colormap = cm;
+    swa.event_mask = SubstructureNotifyMask | StructureNotifyMask;
+    swa.override_redirect = True;
+    swa.cursor = cur_left;
+    t.sock = XCreateWindow(dpy, root, 0, 0, (unsigned)w95::kTrayIcon, (unsigned)w95::kTrayIcon, 0, d, InputOutput, v,
+                           CWBackPixel | CWBorderPixel | CWColormap | CWEventMask | CWOverrideRedirect | CWCursor, &swa);
+}
+
+bool WM::read_xembed_info(Window w, long *ver, long *flags)
+{
+    Atom type = 0;
+    int fmt = 0;
+    unsigned long n = 0, extra = 0;
+    unsigned char *prop = nullptr;
+    if (XGetWindowProperty(dpy, w, xembed_info, 0, 2, False, AnyPropertyType, &type, &fmt, &n, &extra, &prop) !=
+            Success ||
+        !prop)
+        return false;
+    bool ok = false;
+    if (fmt == 32 && n >= 2) {
+        auto *v = (long *)prop;
+        if (ver)
+            *ver = v[0];
+        if (flags)
+            *flags = v[1];
+        ok = true;
+    }
+    XFree(prop);
+    return ok;
+}
+
+void WM::tray_apply_xembed(TrayItem &t)
+{
+    if (t.own_win)
+        return;
+    long ver = 0, flags = 0;
+    if (!read_xembed_info(t.win, &ver, &flags))
+        return;
+    bool want = (flags & XEMBED_MAPPED) != 0;
+    if (want == t.mapped)
+        return;
+    t.mapped = want;
     tray_layout();
 }
 
@@ -936,17 +1582,38 @@ void WM::tray_layout()
 {
     // Resize the well, then pack icons left-to-right and the clock on the right.
     Monitor *p = primary_mon();
-    if (!p || !traywin || !p->taskbar)
+    if (!p || !p->taskbar)
         return;
     int tw = tray_width(*p);
     int th = w95::kTaskbarH - 6;
     int x = p->w - tw - 4;
-    XMoveResizeWindow(dpy, traywin, x, 3, (unsigned)tw, (unsigned)th);
+    if (traywin)
+        XMoveResizeWindow(dpy, traywin, x, 3, (unsigned)tw, (unsigned)th);
+    int root_x = p->x + x;
+    int root_y = p->y + p->h - w95::kTaskbarH + 3;
     int ix = 3;
     int iy = (th - w95::kTrayIcon) / 2;
-    for (Window w : tray_icons) {
-        XMoveResizeWindow(dpy, w, ix, iy, w95::kTrayIcon, w95::kTrayIcon);
-        XMapWindow(dpy, w);
+    for (auto &t : tray_items) {
+        if (!t.mapped) {
+            if (t.sock)
+                XUnmapWindow(dpy, t.sock);
+            if (t.win)
+                XUnmapWindow(dpy, t.win);
+            continue;
+        }
+        int wx = root_x + ix, wy = root_y + iy;
+        if (t.own_win) {
+            XMoveResizeWindow(dpy, t.win, wx, wy, w95::kTrayIcon, w95::kTrayIcon);
+            XMapRaised(dpy, t.win);
+            draw_tray_owned(t);
+        } else {
+            if (t.sock) {
+                XMoveResizeWindow(dpy, t.sock, wx, wy, w95::kTrayIcon, w95::kTrayIcon);
+                XMapRaised(dpy, t.sock);
+            }
+            XMoveResizeWindow(dpy, t.win, 0, 0, w95::kTrayIcon, w95::kTrayIcon);
+            XMapWindow(dpy, t.win);
+        }
         ix += w95::kTraySlot;
     }
     draw_tray();
@@ -955,8 +1622,8 @@ void WM::tray_layout()
 
 void WM::tray_dock(Window w)
 {
-    // SYSTEM_TRAY_REQUEST_DOCK. If the window was already managed as a client
-    // (rare), drop the frame first so it becomes a 20x20 child of traywin.
+    // SYSTEM_TRAY_REQUEST_DOCK. Wrap the icon in a socket that matches its
+    // visual so 32-bit ARGB clients (GTK/Qt) are not BadMatch against the bar.
     if (!w || w == traywin || is_internal(w) || is_tray_icon(w))
         return;
     if (Client *c = find_client(w))
@@ -965,23 +1632,102 @@ void WM::tray_dock(Window w)
         tray_create();
     if (!traywin)
         return;
+    XWindowAttributes wa{};
+    if (!XGetWindowAttributes(dpy, w, &wa))
+        return;
+    TrayItem t;
+    t.win = w;
+    t.mapped = true;
+    tray_prepare_socket(t, wa);
+    if (!t.sock)
+        return;
     XSelectInput(dpy, w, StructureNotifyMask | PropertyChangeMask);
     XAddToSaveSet(dpy, w);
     XSetWindowBorderWidth(dpy, w, 0);
-    XReparentWindow(dpy, w, traywin, 0, 0);
-    XMapRaised(dpy, w);
-    tray_send_xembed(w, 0, 0, (long)traywin, 0);
-    tray_icons.push_back(w);
+    XReparentWindow(dpy, w, t.sock, 0, 0);
+    XSync(dpy, False);
+    long ver = 0, flags = XEMBED_MAPPED;
+    if (read_xembed_info(w, &ver, &flags))
+        t.mapped = (flags & XEMBED_MAPPED) != 0;
+    tray_send_xembed(w, XEMBED_EMBEDDED_NOTIFY, ver, (long)t.sock, 0);
+    tray_items.push_back(t);
     tray_layout();
 }
 
 void WM::tray_undock(Window w)
 {
-    auto it = std::find(tray_icons.begin(), tray_icons.end(), w);
-    if (it == tray_icons.end())
+    TrayItem *hit = tray_by_win(w);
+    if (!hit)
         return;
-    tray_icons.erase(it);
+    Window sock = hit->sock;
+    Window win = hit->win;
+    bool own_win = hit->own_win;
+    bool own_cmap = hit->own_cmap;
+    Colormap cm = hit->cmap;
+    for (auto it = tray_items.begin(); it != tray_items.end(); ++it) {
+        if (it->win == win || it->sock == w) {
+            tray_items.erase(it);
+            break;
+        }
+    }
+    if (sock) {
+        if (!own_win && win)
+            XReparentWindow(dpy, win, root, 0, 0);
+        XDestroyWindow(dpy, sock);
+    }
+    if (own_win && win)
+        XDestroyWindow(dpy, win);
+    if (own_cmap && cm)
+        XFreeColormap(dpy, cm);
     tray_layout();
+}
+
+Window WM::tray_add_owned()
+{
+    Window w = mkwin(-80, -80, w95::kTrayIcon, w95::kTrayIcon, face.pix,
+                     ExposureMask | ButtonPressMask | ButtonReleaseMask, true);
+    TrayItem t;
+    t.win = w;
+    t.own_win = true;
+    t.mapped = true;
+    tray_items.push_back(t);
+    tray_layout();
+    return w;
+}
+
+void WM::tray_set_rgb(Window w, const std::vector<std::uint8_t> &rgb)
+{
+    TrayItem *t = tray_by_win(w);
+    if (!t)
+        return;
+    t->rgb = rgb;
+    draw_tray_owned(*t);
+}
+
+void WM::draw_tray_owned(const TrayItem &t)
+{
+    if (!t.own_win || !t.win)
+        return;
+    fill(t.win, 0, 0, w95::kTrayIcon, w95::kTrayIcon, face.pix);
+    if (t.rgb.size() >= (size_t)w95::kTrayIcon * w95::kTrayIcon * 3)
+        blit_rgb(t.win, t.rgb.data(), w95::kTrayIcon, w95::kTrayIcon);
+}
+
+bool WM::tray_icon_from_path(const std::string &path, std::vector<std::uint8_t> &rgb)
+{
+    Raster r;
+    if (!load_image_path(path.c_str(), r) || r.w < 1 || r.h < 1)
+        return false;
+    const int S = w95::kTrayIcon;
+    rgb.resize((size_t)S * S * 3);
+    for (int y = 0; y < S; y++) {
+        int sy = y * r.h / S;
+        for (int x = 0; x < S; x++) {
+            int sx = x * r.w / S;
+            memcpy(&rgb[((size_t)y * S + x) * 3], &r.rgb[((size_t)sy * r.w + sx) * 3], 3);
+        }
+    }
+    return true;
 }
 
 bool WM::is_internal(Window w)
@@ -1070,6 +1816,9 @@ void WM::manage(Window w)
     // the monitor that currently has the pointer. override_redirect windows
     // (menus, dmenu, our own chrome) are left alone.
     if (is_internal(w) || find_client(w) || find_frame(w) || is_tray_icon(w) || w == traywin)
+        return;
+    long xv = 0, xf = 0;
+    if (read_xembed_info(w, &xv, &xf))
         return;
     XWindowAttributes wa{};
     if (!XGetWindowAttributes(dpy, w, &wa))
@@ -1578,19 +2327,46 @@ void WM::open_run(int mi)
 void WM::open_shut(int mi)
 {
     close_menus();
+    if (mons.empty())
+        return;
+    if (mi < 0 || mi >= (int)mons.size())
+        mi = 0;
     dialog_mon = mi;
     Monitor &m = mons[mi];
-    int w = 320, h = 120;
+    int w = w95::kShutW, h = w95::kShutH;
     int x = m.x + (m.w - w) / 2;
     int y = m.y + (m.h - w95::kTaskbarH - h) / 3;
+    if (y < m.y + 8)
+        y = m.y + 8;
     XMoveResizeWindow(dpy, shutdlg, x, y, (unsigned)w, (unsigned)h);
+    shut_choice = 0;
     shut_open = true;
     XMapRaised(dpy, shutdlg);
     focus(nullptr);
     draw_shutdlg();
 }
 
-static void add_wall_dir(std::vector<WallChoice> &walls, const char *dir)
+void WM::close_shut()
+{
+    if (!shut_open)
+        return;
+    shut_open = false;
+    XUnmapWindow(dpy, shutdlg);
+    ungrab_if_idle();
+}
+
+void WM::confirm_shut()
+{
+    int choice = shut_choice;
+    close_shut();
+    if (choice == 1)
+        launch(kRebootCmd);
+    else if (choice == 0)
+        launch(kPoweroffCmd);
+    running = false;
+}
+
+static void add_pic_dir(std::vector<WallChoice> &pics, const char *dir)
 {
     DIR *d = opendir(dir);
     if (!d)
@@ -1599,111 +2375,156 @@ static void add_wall_dir(std::vector<WallChoice> &walls, const char *dir)
         const char *n = e->d_name;
         if (!is_image_name(n))
             continue;
+        bool seen = false;
+        for (auto &p : pics)
+            if (p.name == n) {
+                seen = true;
+                break;
+            }
+        if (seen)
+            continue;
         WallChoice w;
         w.name = n;
-        w.pattern = 0;
         w.file = std::string(dir) + "/" + n;
-        walls.push_back(std::move(w));
+        pics.push_back(std::move(w));
     }
     closedir(d);
 }
 
 void WM::rebuild_walls()
 {
-    // Built-in patterns first so indices stay stable, then files from the image
-    // and the user's ~/.chime/wallpapers.
-    walls.clear();
+    std::string keep_pat = (pat_i >= 0 && pat_i < (int)patterns.size()) ? patterns[pat_i].name : "(None)";
+    std::string keep_pic = (pic_i >= 0 && pic_i < (int)pictures.size()) ? pictures[pic_i].name : "(None)";
+    patterns.clear();
     const char *pats[] = {"(None)", "Bricks", "Dots", "Weave", "Waves", "Checker"};
     for (int i = 0; i < 6; i++) {
         WallChoice w;
         w.name = pats[i];
         w.pattern = i;
-        walls.push_back(w);
+        patterns.push_back(w);
     }
-    add_wall_dir(walls, "/opt/chime/wallpapers");
+    pictures.clear();
+    WallChoice none;
+    none.name = "(None)";
+    pictures.push_back(none);
+    add_pic_dir(pictures, "/opt/chime/wallpapers");
+    add_pic_dir(pictures, "/usr/local/share/chime/wallpapers");
+    add_pic_dir(pictures, "/usr/share/chime/wallpapers");
+    if (const char *data = getenv("CHIME_DATA_DIR")) {
+        std::string p = std::string(data) + "/wallpapers";
+        add_pic_dir(pictures, p.c_str());
+    }
     const char *home = getenv("HOME");
     if (home && *home) {
         std::string p = std::string(home) + "/.chime/wallpapers";
-        add_wall_dir(walls, p.c_str());
+        add_pic_dir(pictures, p.c_str());
     }
+    std::sort(pictures.begin() + 1, pictures.end(),
+              [](const WallChoice &a, const WallChoice &b) { return strcasecmp(a.name.c_str(), b.name.c_str()) < 0; });
+    pat_i = 0;
+    pic_i = 0;
+    for (int i = 0; i < (int)patterns.size(); i++)
+        if (patterns[i].name == keep_pat)
+            pat_i = i;
+    for (int i = 0; i < (int)pictures.size(); i++)
+        if (pictures[i].name == keep_pic)
+            pic_i = i;
+}
+
+void WM::free_pic_cache()
+{
+    if (pic_pix) {
+        XFreePixmap(dpy, pic_pix);
+        pic_pix = 0;
+    }
+    pic_pw = pic_ph = 0;
+    for (auto &c : pic_scaled) {
+        if (c.pix)
+            XFreePixmap(dpy, c.pix);
+    }
+    pic_scaled.clear();
+    pic_img = Raster{};
+}
+
+Pixmap WM::scaled_pic(int w, int h)
+{
+    if (w < 1 || h < 1 || pic_img.w < 1)
+        return 0;
+    for (auto &c : pic_scaled)
+        if (c.w == w && c.h == h)
+            return c.pix;
+    Raster s = scale_nn(pic_img, w, h);
+    Pixmap p = XCreatePixmap(dpy, root, (unsigned)w, (unsigned)h, (unsigned)depth);
+    blit_rgb(p, s.rgb.data(), w, h);
+    pic_scaled.push_back({w, h, p});
+    return p;
 }
 
 void WM::make_wall_tile()
 {
-    // Build a pixmap to XCopyArea in tile_wall(). File wallpapers are P6 PPM
-    // (binary RGB). Patterns 1–5 are 32x32 doodles in the current scheme colors.
+    // Pattern pixmap is 32x32 in scheme colors. The photo is kept at native
+    // size; tile_wall() tiles, centers, or stretches it to the destination.
     if (wall_tile) {
         XFreePixmap(dpy, wall_tile);
         wall_tile = 0;
     }
     wall_tw = wall_th = 0;
-    if (wall_i < 0 || wall_i >= (int)walls.size())
-        return;
-    const WallChoice &W = walls[wall_i];
-    if (!W.file.empty()) {
-        Raster img;
-        if (!load_image_path(W.file.c_str(), img))
-            return;
-        Monitor *p = primary_mon();
-        int dw = p ? p->w : sw;
-        int dh = p ? p->h - w95::kTaskbarH : sh - w95::kTaskbarH;
-        if (dh < 8)
-            dh = 8;
-        // Photos fill the monitor; small tiles (patterns, textures) repeat.
-        if (img.w >= 128 || img.h >= 128) {
-            img = scale_nn(img, dw, dh);
-        }
-        wall_tw = img.w;
-        wall_th = img.h;
-        wall_tile = XCreatePixmap(dpy, root, (unsigned)img.w, (unsigned)img.h, (unsigned)depth);
-        blit_rgb(wall_tile, img.rgb.data(), img.w, img.h);
-        return;
-    }
-    if (W.pattern <= 0)
-        return;
-    wall_tw = wall_th = 32;
-    wall_tile = XCreatePixmap(dpy, root, 32, 32, (unsigned)depth);
-    fill(wall_tile, 0, 0, 32, 32, desktop.pix);
-    if (W.pattern == 1) {
-        // Bricks: mortar lines, staggered every other row.
-        XSetForeground(dpy, gc, lo.pix);
-        for (int y = 0; y < 32; y += 8) {
-            XDrawLine(dpy, wall_tile, gc, 0, y, 31, y);
-            int off = (y / 8) & 1 ? 16 : 0;
-            XDrawLine(dpy, wall_tile, gc, off, y, off, y + 7);
-        }
-        XSetForeground(dpy, gc, hi.pix);
-        for (int y = 1; y < 32; y += 8)
-            XDrawLine(dpy, wall_tile, gc, 0, y, 31, y);
-    } else if (W.pattern == 2) {
-        // Dots.
-        XSetForeground(dpy, gc, dk.pix);
-        for (int y = 2; y < 32; y += 4)
-            for (int x = 2; x < 32; x += 4)
+    free_pic_cache();
+    if (pat_i >= 0 && pat_i < (int)patterns.size() && patterns[pat_i].pattern > 0) {
+        int W = patterns[pat_i].pattern;
+        wall_tw = wall_th = 32;
+        wall_tile = XCreatePixmap(dpy, root, 32, 32, (unsigned)depth);
+        fill(wall_tile, 0, 0, 32, 32, desktop.pix);
+        if (W == 1) {
+            XSetForeground(dpy, gc, lo.pix);
+            for (int y = 0; y < 32; y += 8) {
+                XDrawLine(dpy, wall_tile, gc, 0, y, 31, y);
+                int off = (y / 8) & 1 ? 16 : 0;
+                XDrawLine(dpy, wall_tile, gc, off, y, off, y + 7);
+            }
+            XSetForeground(dpy, gc, hi.pix);
+            for (int y = 1; y < 32; y += 8)
+                XDrawLine(dpy, wall_tile, gc, 0, y, 31, y);
+        } else if (W == 2) {
+            XSetForeground(dpy, gc, dk.pix);
+            for (int y = 2; y < 32; y += 4)
+                for (int x = 2; x < 32; x += 4)
+                    XDrawPoint(dpy, wall_tile, gc, x, y);
+        } else if (W == 3) {
+            XSetForeground(dpy, gc, lo.pix);
+            for (int i = -32; i < 32; i += 4)
+                XDrawLine(dpy, wall_tile, gc, i, 0, i + 32, 32);
+            XSetForeground(dpy, gc, hi.pix);
+            for (int i = -30; i < 32; i += 4)
+                XDrawLine(dpy, wall_tile, gc, i, 0, i + 32, 32);
+        } else if (W == 4) {
+            XSetForeground(dpy, gc, title.pix);
+            for (int y = 0; y < 32; y++) {
+                int x = 16 + (int)((y % 16 < 8 ? y % 8 : 8 - (y % 8)) * 1.5);
                 XDrawPoint(dpy, wall_tile, gc, x, y);
-    } else if (W.pattern == 3) {
-        // Weave: paired diagonal lines in lo/hi.
-        XSetForeground(dpy, gc, lo.pix);
-        for (int i = -32; i < 32; i += 4)
-            XDrawLine(dpy, wall_tile, gc, i, 0, i + 32, 32);
-        XSetForeground(dpy, gc, hi.pix);
-        for (int i = -30; i < 32; i += 4)
-            XDrawLine(dpy, wall_tile, gc, i, 0, i + 32, 32);
-    } else if (W.pattern == 4) {
-        // Waves: a triangle-wave column of points.
-        XSetForeground(dpy, gc, title.pix);
-        for (int y = 0; y < 32; y++) {
-            int x = 16 + (int)((y % 16 < 8 ? y % 8 : 8 - (y % 8)) * 1.5);
-            XDrawPoint(dpy, wall_tile, gc, x, y);
-            XDrawPoint(dpy, wall_tile, gc, x + 1, y);
+                XDrawPoint(dpy, wall_tile, gc, x + 1, y);
+            }
+        } else if (W == 5) {
+            for (int y = 0; y < 32; y += 8)
+                for (int x = 0; x < 32; x += 8)
+                    if (((x / 8) + (y / 8)) & 1)
+                        fill(wall_tile, x, y, 8, 8, lo.pix);
         }
-    } else if (W.pattern == 5) {
-        // Checker: 8x8 cells in lo over the desktop color.
-        for (int y = 0; y < 32; y += 8)
-            for (int x = 0; x < 32; x += 8)
-                if (((x / 8) + (y / 8)) & 1)
-                    fill(wall_tile, x, y, 8, 8, lo.pix);
     }
+    if (pic_i > 0 && pic_i < (int)pictures.size() && !pictures[pic_i].file.empty()) {
+        if (load_image_path(pictures[pic_i].file.c_str(), pic_img) && pic_img.w > 0) {
+            pic_pw = pic_img.w;
+            pic_ph = pic_img.h;
+            pic_pix = XCreatePixmap(dpy, root, (unsigned)pic_pw, (unsigned)pic_ph, (unsigned)depth);
+            blit_rgb(pic_pix, pic_img.rgb.data(), pic_pw, pic_ph);
+        }
+    }
+}
+
+void WM::apply_background()
+{
+    make_wall_tile();
+    refresh_chrome();
 }
 
 void WM::apply_scheme(int i)
@@ -1724,18 +2545,32 @@ void WM::apply_scheme(int i)
     fg.pix = alloc_rgb(s.text);
     field.pix = alloc_rgb(s.field);
     banner.pix = alloc_rgb(s.banner);
-    make_wall_tile();
-    refresh_chrome();
+    apply_background();
 }
 
-void WM::apply_wall(int i)
+void WM::apply_pattern(int i)
 {
-    if (walls.empty())
+    if (patterns.empty())
         rebuild_walls();
-    if (i < 0 || i >= (int)walls.size())
+    if (i < 0 || i >= (int)patterns.size())
         i = 0;
-    wall_i = i;
-    make_wall_tile();
+    pat_i = i;
+    apply_background();
+}
+
+void WM::apply_picture(int i)
+{
+    if (pictures.empty())
+        rebuild_walls();
+    if (i < 0 || i >= (int)pictures.size())
+        i = 0;
+    pic_i = i;
+    apply_background();
+}
+
+void WM::apply_picpos(PicPos p)
+{
+    pic_pos = p;
     refresh_chrome();
 }
 
@@ -1745,6 +2580,7 @@ void WM::refresh_chrome()
     // pixel and repaint. Frames are redrawn so captions pick up the new title color.
     if (!dpy)
         return;
+    invalidate_walls();
     XSetWindowBackground(dpy, root, desktop.pix);
     if (rundlg)
         XSetWindowBackground(dpy, rundlg, face.pix);
@@ -1790,7 +2626,6 @@ void WM::refresh_chrome()
 
 void WM::save_display()
 {
-    // ~/.chime/display is two lines: scheme=<name> and wall=<name>.
     const char *home = getenv("HOME");
     if (!home || !*home)
         return;
@@ -1801,17 +2636,17 @@ void WM::save_display()
     if (!f)
         return;
     const char *sn = (scheme_i >= 0 && scheme_i < (int)schemes.size()) ? schemes[scheme_i].name.c_str() : "Chicago";
-    const char *wn = (wall_i >= 0 && wall_i < (int)walls.size()) ? walls[wall_i].name.c_str() : "(None)";
-    int mw = (mode_i >= 0 && mode_i < (int)modes.size()) ? modes[mode_i].w : sw;
-    int mh = (mode_i >= 0 && mode_i < (int)modes.size()) ? modes[mode_i].h : sh;
-    std::fprintf(f, "scheme=%s\nwall=%s\nmode=%dx%d\n", sn, wn, mw, mh);
+    const char *pn = (pat_i >= 0 && pat_i < (int)patterns.size()) ? patterns[pat_i].name.c_str() : "(None)";
+    const char *picn = (pic_i >= 0 && pic_i < (int)pictures.size()) ? pictures[pic_i].name.c_str() : "(None)";
+    const char *pos = pic_pos == PicPos::Tile ? "tile" : pic_pos == PicPos::Center ? "center" : "stretch";
+    std::fprintf(f, "scheme=%s\npattern=%s\npicture=%s\npicpos=%s\n", sn, pn, picn, pos);
     fclose(f);
     save_schemes();
+    save_heads();
 }
 
 void WM::load_display()
 {
-    // Missing file is fine: Chicago + "(None)" stay at index 0.
     init_schemes();
     rebuild_walls();
     refresh_modes();
@@ -1829,40 +2664,57 @@ void WM::load_display()
                     for (int i = 0; i < (int)schemes.size(); i++)
                         if (schemes[i].name == (line + 7))
                             scheme_i = i;
+                } else if (!strncmp(line, "pattern=", 8)) {
+                    for (int i = 0; i < (int)patterns.size(); i++)
+                        if (patterns[i].name == (line + 8))
+                            pat_i = i;
+                } else if (!strncmp(line, "picture=", 8)) {
+                    for (int i = 0; i < (int)pictures.size(); i++)
+                        if (pictures[i].name == (line + 8))
+                            pic_i = i;
+                } else if (!strncmp(line, "picpos=", 7)) {
+                    if (!strcmp(line + 7, "tile"))
+                        pic_pos = PicPos::Tile;
+                    else if (!strcmp(line + 7, "center"))
+                        pic_pos = PicPos::Center;
+                    else
+                        pic_pos = PicPos::Stretch;
                 } else if (!strncmp(line, "wall=", 5)) {
-                    for (int i = 0; i < (int)walls.size(); i++)
-                        if (walls[i].name == (line + 5))
-                            wall_i = i;
-                } else if (!strncmp(line, "mode=", 5)) {
-                    int mw = 0, mh = 0;
-                    if (sscanf(line + 5, "%dx%d", &mw, &mh) == 2) {
-                        for (int i = 0; i < (int)modes.size(); i++)
-                            if (modes[i].w == mw && modes[i].h == mh)
-                                mode_i = i;
-                    }
+                    std::string n = line + 5;
+                    for (int i = 0; i < (int)patterns.size(); i++)
+                        if (patterns[i].name == n)
+                            pat_i = i;
+                    for (int i = 0; i < (int)pictures.size(); i++)
+                        if (pictures[i].name == n)
+                            pic_i = i;
                 }
             }
             fclose(f);
         }
     }
     apply_scheme(scheme_i);
-    apply_wall(wall_i);
+    load_heads();
 }
 
 void WM::close_settings(bool revert)
 {
-    // Cancel passes revert=true and restores the snapshot taken in open_settings.
     close_colordlg(false);
     close_filedlg();
+    head_drag = -1;
+    head_view_lock = false;
+    hide_identify();
     if (!set_open)
         return;
     set_open = false;
     XUnmapWindow(dpy, setdlg);
     if (revert) {
         schemes = set_save_schemes;
+        pat_i = set_save_pat;
+        pic_i = set_save_pic;
+        pic_pos = set_save_pic_pos;
         apply_scheme(set_save_scheme);
-        apply_wall(set_save_wall);
-        mode_i = set_save_mode;
+        heads = set_save_heads;
+        heads_dirty = false;
         mode_note.clear();
     }
     ungrab_if_idle();
@@ -1870,7 +2722,6 @@ void WM::close_settings(bool revert)
 
 void WM::open_settings(int mi)
 {
-    // Snapshot scheme/wall so Cancel can revert live preview changes.
     close_menus();
     if (mons.empty())
         return;
@@ -1878,13 +2729,21 @@ void WM::open_settings(int mi)
         mi = 0;
     dialog_mon = mi;
     rebuild_walls();
+    refresh_heads();
     set_save_scheme = scheme_i;
-    set_save_wall = wall_i;
+    set_save_pat = pat_i;
+    set_save_pic = pic_i;
+    set_save_pic_pos = pic_pos;
     set_save_schemes = schemes;
+    set_save_heads = heads;
     refresh_modes();
     set_save_mode = mode_i;
-    wall_scroll = scheme_scroll = mode_scroll = 0;
+    pat_scroll = pic_scroll = scheme_scroll = head_mode_scroll = 0;
+    set_tab = 0;
     set_list = 1;
+    heads_dirty = false;
+    head_drag = -1;
+    head_view_lock = false;
     mode_note.clear();
     Monitor &m = mons[mi];
     int w = w95::kSetW, h = w95::kSetH;
@@ -1897,6 +2756,26 @@ void WM::open_settings(int mi)
     XMapRaised(dpy, setdlg);
     focus(nullptr);
     draw_setdlg();
+}
+
+void WM::settings_apply(bool close)
+{
+    save_display();
+    if (heads_dirty)
+        apply_heads();
+    else if (heads.empty())
+        apply_mode(mode_i);
+    set_save_scheme = scheme_i;
+    set_save_pat = pat_i;
+    set_save_pic = pic_i;
+    set_save_pic_pos = pic_pos;
+    set_save_mode = mode_i;
+    set_save_schemes = schemes;
+    set_save_heads = heads;
+    if (close)
+        close_settings(false);
+    else
+        draw_setdlg();
 }
 
 void WM::grab_dialog(Window w)
@@ -1979,7 +2858,7 @@ unsigned long WM::pixel_from_rgb(std::uint8_t r, std::uint8_t g, std::uint8_t b)
     return alloc_rgb({r, g, b});
 }
 
-void WM::blit_rgb(Pixmap dst, const std::uint8_t *rgb, int w, int h)
+void WM::blit_rgb(Drawable dst, const std::uint8_t *rgb, int w, int h)
 {
     if (!rgb || w < 1 || h < 1)
         return;
@@ -2164,15 +3043,45 @@ Monitor *WM::open_start_mon()
     return nullptr;
 }
 
+void WM::submenu_geom(Monitor &m, int &w, int &h, int &vis)
+{
+    int n = std::max(1, (int)programs.size());
+    int maxh = m.h - w95::kTaskbarH - 16;
+    vis = std::max(1, std::min(n, maxh / w95::kMenuItemH));
+    h = 8 + vis * w95::kMenuItemH;
+    w = 150;
+    for (const auto &p : programs)
+        w = std::max(w, text_w(p.name.c_str()) + 28);
+    w = std::min(w, std::max(120, m.w - 16));
+}
+
+int WM::sub_item_at(int y)
+{
+    int i = (y - 4) / w95::kMenuItemH;
+    if (i < 0 || i >= prog_vis)
+        return -1;
+    int idx = prog_scroll + i;
+    if (idx < 0 || idx >= (int)programs.size())
+        return -1;
+    return idx;
+}
+
 void WM::position_submenu(Monitor &m)
 {
+    load_programs();
+    submenu_geom(m, sub_w, sub_h, prog_vis);
+    ensure_list_scroll(prog_scroll, m.subhover, prog_vis, (int)programs.size());
     int mw = w95::kBannerW + w95::kMenuBodyW;
     int mh = menu_height();
     int sx = m.x + 2 + mw - 4;
     int sy = m.y + m.h - w95::kTaskbarH - mh + 4;
-    if (sx + 150 > m.x + m.w)
-        sx = m.x + 2 - 150 + 4;
-    XMoveWindow(dpy, m.submenu, sx, sy);
+    if (sy + sub_h > m.y + m.h - w95::kTaskbarH)
+        sy = m.y + m.h - w95::kTaskbarH - sub_h;
+    if (sy < m.y)
+        sy = m.y;
+    if (sx + sub_w > m.x + m.w)
+        sx = m.x + 2 - sub_w + 4;
+    XMoveResizeWindow(dpy, m.submenu, sx, sy, (unsigned)sub_w, (unsigned)sub_h);
     m.sub_open = true;
     XMapRaised(dpy, m.submenu);
     draw_submenu(m);
@@ -2190,14 +3099,6 @@ static int start_item_at(int x, int y)
         yy += ih;
     }
     return -1;
-}
-
-static int sub_item_at(int y)
-{
-    int i = (y - 4) / w95::kMenuItemH;
-    if (i < 0 || i > 2)
-        return -1;
-    return i;
 }
 
 void WM::set_start_hover(Monitor &m, int idx, bool open_sub)
@@ -2260,13 +3161,11 @@ int WM::menu_step(int from, int dir)
 
 void WM::activate_sub_item(int i)
 {
+    if (i < 0 || i >= (int)programs.size())
+        return;
+    LaunchItem it = programs[i];
     close_menus();
-    if (i == 0)
-        launch(kTermCmd);
-    else if (i == 1)
-        launch(kEditorCmd);
-    else if (i == 2)
-        launch("cabinet /");
+    activate_launch(it);
 }
 
 void WM::activate_start_item(Monitor &m, int idx)
@@ -2275,16 +3174,18 @@ void WM::activate_start_item(Monitor &m, int idx)
         return;
     if (idx == 0) {
         position_submenu(m);
-        m.subhover = 0;
+        m.subhover = programs.empty() ? -1 : 0;
+        prog_scroll = 0;
         draw_submenu(m);
         ungrab_if_idle();
         return;
     }
     int mi = mon_index(&m);
     close_menus();
-    if (idx == 1)
-        launch("cabinet \"$HOME\"");
-    else if (idx == 2)
+    if (idx == 1) {
+        std::string cmd = "cabinet " + shell_quote(xdg_documents_dir());
+        launch(cmd.c_str());
+    } else if (idx == 2)
         open_settings(mi);
     else if (idx == 4)
         launch("aterm -e sh -c 'echo Chime desktop; read x' || true");
@@ -2296,14 +3197,9 @@ void WM::activate_start_item(Monitor &m, int idx)
 
 void WM::activate_desk_icon(int i)
 {
-    if (i == 0)
-        launch("cabinet /");
-    else if (i == 1)
-        launch("cabinet \"$HOME\"");
-    else if (i == 2)
-        launch(kTermCmd);
-    else if (i == 3)
-        launch(kEditorCmd);
+    if (i < 0 || i >= desk_n())
+        return;
+    activate_launch(desk_items[i]);
 }
 
 void WM::menu_key(KeySym ks)
@@ -2311,8 +3207,9 @@ void WM::menu_key(KeySym ks)
     Monitor *mon = open_start_mon();
     if (!mon)
         return;
-    bool in_sub = mon->sub_open && mon->subhover >= 0;
+    bool in_sub = mon->sub_open && mon->hover == 0;
     if (in_sub) {
+        int n = (int)programs.size();
         if (ks == XK_Escape || ks == XK_Left) {
             XUnmapWindow(dpy, mon->submenu);
             mon->sub_open = false;
@@ -2321,20 +3218,37 @@ void WM::menu_key(KeySym ks)
             ungrab_if_idle();
             return;
         }
+        if (n < 1)
+            return;
         if (ks == XK_Down) {
             if (mon->subhover < 0)
                 mon->subhover = 0;
             else
-                mon->subhover = std::min(2, mon->subhover + 1);
-            draw_submenu(*mon);
+                mon->subhover = std::min(n - 1, mon->subhover + 1);
         } else if (ks == XK_Up) {
             if (mon->subhover < 0)
                 mon->subhover = 0;
             else
                 mon->subhover = std::max(0, mon->subhover - 1);
-            draw_submenu(*mon);
-        } else if (ks == XK_Return || ks == XK_KP_Enter)
+        } else if (ks == XK_Page_Down || ks == XK_Next) {
+            if (mon->subhover < 0)
+                mon->subhover = 0;
+            mon->subhover = std::min(n - 1, mon->subhover + prog_vis);
+        } else if (ks == XK_Page_Up || ks == XK_Prior) {
+            if (mon->subhover < 0)
+                mon->subhover = 0;
+            mon->subhover = std::max(0, mon->subhover - prog_vis);
+        } else if (ks == XK_Home)
+            mon->subhover = 0;
+        else if (ks == XK_End)
+            mon->subhover = n - 1;
+        else if (ks == XK_Return || ks == XK_KP_Enter) {
             activate_sub_item(mon->subhover);
+            return;
+        } else
+            return;
+        ensure_list_scroll(prog_scroll, mon->subhover, prog_vis, n);
+        draw_submenu(*mon);
         return;
     }
     if (ks == XK_Escape) {
@@ -2351,7 +3265,7 @@ void WM::menu_key(KeySym ks)
         set_start_hover(*mon, menu_step(0, -1), false);
     else if (ks == XK_Right && mon->hover == 0) {
         position_submenu(*mon);
-        mon->subhover = 0;
+        mon->subhover = programs.empty() ? -1 : 0;
         draw_startmenu(*mon);
         draw_submenu(*mon);
         ungrab_if_idle();
@@ -2366,41 +3280,75 @@ void WM::desktop_key(KeySym ks, unsigned st)
 {
     if (focused)
         return;
+    maybe_reload_desktop();
+    int n = desk_n();
+    if (n < 1)
+        return;
+    desk_sel.resize(desk_items.size(), 0);
     bool ctrl = (st & ControlMask) != 0;
     bool shift = (st & ShiftMask) != 0;
+    auto any_sel = [&] {
+        for (char c : desk_sel)
+            if (c)
+                return true;
+        return false;
+    };
+    auto select_move = [&](int i) {
+        selected_icon = i;
+        if (shift && any_sel())
+            desk_sel[i] = 1;
+        else if (!ctrl) {
+            std::fill(desk_sel.begin(), desk_sel.end(), 0);
+            desk_sel[i] = 1;
+        }
+    };
     if (ks == XK_a && ctrl) {
-        desk_mask = 0xf;
+        std::fill(desk_sel.begin(), desk_sel.end(), 1);
         if (selected_icon < 0)
             selected_icon = 0;
-    } else if (ks == XK_Down || ks == XK_Right) {
+    } else if (ks == XK_Down) {
         if (selected_icon < 0)
-            selected_icon = 0;
+            select_move(0);
         else
-            selected_icon = std::min(3, selected_icon + 1);
-        if (shift && desk_mask)
-            desk_mask |= 1u << selected_icon;
-        else if (!ctrl)
-            desk_mask = 1u << selected_icon;
-    } else if (ks == XK_Up || ks == XK_Left) {
+            select_move(desk_neighbor(selected_icon, 0, 1));
+    } else if (ks == XK_Right) {
         if (selected_icon < 0)
-            selected_icon = 0;
+            select_move(0);
         else
-            selected_icon = std::max(0, selected_icon - 1);
-        if (shift && desk_mask)
-            desk_mask |= 1u << selected_icon;
-        else if (!ctrl)
-            desk_mask = 1u << selected_icon;
+            select_move(desk_neighbor(selected_icon, 1, 0));
+    } else if (ks == XK_Up) {
+        if (selected_icon < 0)
+            select_move(0);
+        else
+            select_move(desk_neighbor(selected_icon, 0, -1));
+    } else if (ks == XK_Left) {
+        if (selected_icon < 0)
+            select_move(0);
+        else
+            select_move(desk_neighbor(selected_icon, -1, 0));
     } else if (ks == XK_Home) {
-        selected_icon = 0;
-        if (!ctrl)
-            desk_mask = 1u;
+        int best = 0;
+        for (int i = 1; i < n; i++) {
+            int ax, ay, bx, by, w, h;
+            desk_cell(best, ax, ay, w, h);
+            desk_cell(i, bx, by, w, h);
+            if (by < ay || (by == ay && bx < ax))
+                best = i;
+        }
+        select_move(best);
     } else if (ks == XK_End) {
-        selected_icon = 3;
-        if (!ctrl)
-            desk_mask = 1u << 3;
+        int best = 0;
+        for (int i = 1; i < n; i++) {
+            int ax, ay, bx, by, w, h;
+            desk_cell(best, ax, ay, w, h);
+            desk_cell(i, bx, by, w, h);
+            if (by > ay || (by == ay && bx > ax))
+                best = i;
+        }
+        select_move(best);
     } else if (ks == XK_space && ctrl) {
-        if (selected_icon >= 0)
-            desk_mask ^= 1u << selected_icon;
+        if (selected_icon >= 0 && selected_icon < n)
+            desk_sel[selected_icon] = desk_sel[selected_icon] ? 0 : 1;
     } else if (ks == XK_Return || ks == XK_KP_Enter || (ks == XK_space && !ctrl)) {
         activate_desk_sel();
         return;
@@ -2408,8 +3356,8 @@ void WM::desktop_key(KeySym ks, unsigned st)
         desk_select_only(-1);
     } else
         return;
-    if (Monitor *p = primary_mon())
-        draw_desktop(*p);
+    invalidate_icons();
+    redraw_desktops();
 }
 
 void WM::open_colordlg()
@@ -2505,7 +3453,19 @@ void WM::open_filedlg()
     if (mons.empty())
         return;
     const char *home = getenv("HOME");
-    load_file_dir(home && *home ? home : "/");
+    std::string start = home && *home ? home : "/";
+    if (home && *home) {
+        const char *cands[] = {"/Bilder", "/Pictures", "/pictures"};
+        for (const char *c : cands) {
+            std::string p = std::string(home) + c;
+            struct stat st{};
+            if (stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+                start = p;
+                break;
+            }
+        }
+    }
+    load_file_dir(start);
     file_typed.clear();
     Monitor &m = mons[dialog_mon < (int)mons.size() ? dialog_mon : 0];
     int w = w95::kFileW, h = w95::kFileH;
@@ -2553,11 +3513,11 @@ bool WM::import_wallpaper(const std::string &src)
         return false;
     std::string keep = base_name(dest);
     rebuild_walls();
-    wall_i = 0;
-    for (int i = 0; i < (int)walls.size(); i++)
-        if (walls[i].name == keep)
-            wall_i = i;
-    apply_wall(wall_i);
+    pic_i = 0;
+    for (int i = 0; i < (int)pictures.size(); i++)
+        if (pictures[i].name == keep)
+            pic_i = i;
+    apply_picture(pic_i);
     return true;
 }
 
@@ -2690,13 +3650,7 @@ void WM::color_key(KeySym ks, const char *buf, int n)
 void WM::settings_key(KeySym ks, const char *, int)
 {
     if (ks == XK_Return) {
-        save_display();
-        apply_mode(mode_i);
-        set_save_scheme = scheme_i;
-        set_save_wall = wall_i;
-        set_save_mode = mode_i;
-        set_save_schemes = schemes;
-        close_settings(false);
+        settings_apply(true);
         return;
     }
     if (ks == XK_Escape) {
@@ -2704,20 +3658,48 @@ void WM::settings_key(KeySym ks, const char *, int)
         return;
     }
     if (ks == XK_Tab) {
-        set_list = (set_list + 1) % 3;
+        set_tab = (set_tab + 1) % 3;
+        set_list = 0;
         draw_setdlg();
         return;
     }
-    int *sel = &scheme_i;
-    int n = (int)schemes.size();
-    if (set_list == 0) {
-        sel = &wall_i;
-        n = (int)walls.size();
-    } else if (set_list == 2) {
+    if (set_tab == 2 && head_sel >= 0 && head_sel < (int)heads.size() &&
+        (ks == XK_Left || ks == XK_Right || ks == XK_Up || ks == XK_Down)) {
+        int step = 8;
+        if (ks == XK_Left)
+            heads[head_sel].x -= step;
+        else if (ks == XK_Right)
+            heads[head_sel].x += step;
+        else if (ks == XK_Up)
+            heads[head_sel].y -= step;
+        else
+            heads[head_sel].y += step;
+        snap_head(head_sel);
+        heads_dirty = true;
+        draw_setdlg();
+        return;
+    }
+    int *sel = nullptr;
+    int n = 0;
+    if (set_tab == 0) {
+        if (set_list == 0) {
+            sel = &pat_i;
+            n = (int)patterns.size();
+        } else {
+            sel = &pic_i;
+            n = (int)pictures.size();
+        }
+    } else if (set_tab == 1) {
+        sel = &scheme_i;
+        n = (int)schemes.size();
+    } else if (set_tab == 2 && heads.empty()) {
         sel = &mode_i;
         n = (int)modes.size();
+    } else if (head_sel >= 0 && head_sel < (int)heads.size()) {
+        sel = &heads[head_sel].mode_i;
+        n = (int)heads[head_sel].modes.size();
     }
-    if (n < 1)
+    if (!sel || n < 1)
         return;
     if (ks == XK_Down)
         *sel = std::min(n - 1, *sel + 1);
@@ -2729,10 +3711,21 @@ void WM::settings_key(KeySym ks, const char *, int)
         *sel = n - 1;
     else
         return;
-    if (set_list == 1)
+    if (set_tab == 0 && set_list == 0)
+        apply_pattern(pat_i);
+    else if (set_tab == 0)
+        apply_picture(pic_i);
+    else if (set_tab == 1)
         apply_scheme(scheme_i);
-    else if (set_list == 0)
-        apply_wall(wall_i);
+    else if (head_sel >= 0 && head_sel < (int)heads.size()) {
+        Head &h = heads[head_sel];
+        if (h.mode_i >= 0 && h.mode_i < (int)h.modes.size()) {
+            h.w = h.modes[h.mode_i].w;
+            h.h = h.modes[h.mode_i].h;
+            h.mode = h.modes[h.mode_i].id;
+            heads_dirty = true;
+        }
+    }
     draw_setdlg();
 }
 
@@ -2751,11 +3744,232 @@ static int dir_from_hit(Hit h)
     return d;
 }
 
+static bool in_rect(int x, int y, int rx, int ry, int rw, int rh)
+{
+    return x >= rx && y >= ry && x < rx + rw && y < ry + rh;
+}
+
+bool WM::btn_down(int id) const
+{
+    return btn_id == id && btn_in;
+}
+
+bool WM::cap_down(const Client *c, Hit h) const
+{
+    return cap_c == c && cap_hit == h && cap_in;
+}
+
+void WM::paint_press()
+{
+    if (cap_c)
+        draw_frame(cap_c);
+    else if (btn_win == rundlg)
+        draw_rundlg();
+    else if (btn_win == shutdlg)
+        draw_shutdlg();
+    else if (btn_win == colordlg)
+        draw_colordlg();
+    else if (btn_win == filedlg)
+        draw_filedlg();
+    else if (btn_win == setdlg)
+        draw_setdlg();
+}
+
+void WM::arm_btn(Window w, int id, int x, int y, int bw, int bh)
+{
+    btn_id = id;
+    btn_win = w;
+    btn_x = x;
+    btn_y = y;
+    btn_w = bw;
+    btn_h = bh;
+    btn_in = true;
+    cap_c = nullptr;
+    cap_hit = Hit::Miss;
+    cap_in = false;
+    XGrabPointer(dpy, w, False, PointerMotionMask | ButtonReleaseMask, GrabModeAsync, GrabModeAsync, None, None,
+                 CurrentTime);
+    paint_press();
+}
+
+void WM::arm_cap(Client *c, Hit h)
+{
+    cap_c = c;
+    cap_hit = h;
+    cap_in = true;
+    btn_id = 0;
+    btn_win = 0;
+    btn_in = false;
+    XGrabPointer(dpy, c->frame, False, PointerMotionMask | ButtonReleaseMask, GrabModeAsync, GrabModeAsync, None, None,
+                 CurrentTime);
+    draw_frame(c);
+}
+
+void WM::update_press(int x, int y)
+{
+    if (cap_c) {
+        bool in = hit_frame(cap_c, x, y) == cap_hit;
+        if (in != cap_in) {
+            cap_in = in;
+            draw_frame(cap_c);
+        }
+        return;
+    }
+    if (btn_id) {
+        bool in = in_rect(x, y, btn_x, btn_y, btn_w, btn_h);
+        if (in != btn_in) {
+            btn_in = in;
+            paint_press();
+        }
+    }
+}
+
+void WM::fire_btn(int id)
+{
+    switch (id) {
+    case PB_RUN_OK:
+        if (!run_text.empty())
+            launch(run_text.c_str());
+        close_run();
+        break;
+    case PB_RUN_CANCEL:
+    case PB_RUN_X:
+        close_run();
+        break;
+    case PB_SHUT_YES:
+        confirm_shut();
+        break;
+    case PB_SHUT_NO:
+    case PB_SHUT_X:
+        close_shut();
+        break;
+    case PB_COLOR_OK:
+        close_colordlg(true);
+        break;
+    case PB_COLOR_CANCEL:
+    case PB_COLOR_X:
+        close_colordlg(false);
+        break;
+    case PB_FILE_OK:
+        file_key(XK_Return, "", 0);
+        break;
+    case PB_FILE_CANCEL:
+    case PB_FILE_X:
+        close_filedlg();
+        break;
+    case PB_FILE_UP:
+        load_file_dir(file_full(file_dir, ".."));
+        draw_filedlg();
+        break;
+    case PB_FILE_HOME: {
+        const char *home = getenv("HOME");
+        load_file_dir(home && *home ? home : "/");
+        draw_filedlg();
+        break;
+    }
+    case PB_SET_OK:
+        settings_apply(true);
+        break;
+    case PB_SET_CANCEL:
+    case PB_SET_X:
+        close_settings(true);
+        break;
+    case PB_SET_APPLY:
+        settings_apply(false);
+        break;
+    case PB_SET_BROWSE:
+        open_filedlg();
+        break;
+    case PB_SET_NEW: {
+        ColorScheme s = (scheme_i >= 0 && scheme_i < (int)schemes.size()) ? schemes[scheme_i]
+                                                                        : scheme_from_builtin(w95::kSchemes[0]);
+        s.builtin = false;
+        s.name = unique_scheme_name("Custom");
+        schemes.push_back(s);
+        scheme_i = (int)schemes.size() - 1;
+        apply_scheme(scheme_i);
+        open_colordlg();
+        break;
+    }
+    case PB_SET_EDIT:
+        open_colordlg();
+        break;
+    case PB_SET_DEL:
+        if (scheme_i >= 0 && scheme_i < (int)schemes.size() && !schemes[scheme_i].builtin && (int)schemes.size() > 1) {
+            schemes.erase(schemes.begin() + scheme_i);
+            if (scheme_i >= (int)schemes.size())
+                scheme_i = (int)schemes.size() - 1;
+            apply_scheme(scheme_i);
+            draw_setdlg();
+        }
+        break;
+    case PB_SET_IDENT:
+        identify_heads();
+        break;
+    default:
+        break;
+    }
+}
+
+void WM::finish_press(bool activate)
+{
+    Hit h = cap_hit;
+    Client *c = cap_c;
+    bool cin = cap_in;
+    int id = btn_id;
+    bool bin = btn_in;
+    Window w = btn_win;
+    cap_c = nullptr;
+    cap_hit = Hit::Miss;
+    cap_in = false;
+    btn_id = 0;
+    btn_win = 0;
+    btn_in = false;
+    XUngrabPointer(dpy, CurrentTime);
+    if (activate && c && cin) {
+        if (h == Hit::Close)
+            close_client(c);
+        else if (h == Hit::Min)
+            minimize(c);
+        else if (h == Hit::Max)
+            maximize_toggle(c);
+        return;
+    }
+    if (activate && id && bin) {
+        fire_btn(id);
+        if (w == rundlg && run_open)
+            draw_rundlg();
+        else if (w == shutdlg && shut_open)
+            draw_shutdlg();
+        else if (w == colordlg && color_open)
+            draw_colordlg();
+        else if (w == filedlg && file_open)
+            draw_filedlg();
+        else if (w == setdlg && set_open)
+            draw_setdlg();
+        return;
+    }
+    if (c)
+        draw_frame(c);
+    else if (w == rundlg && run_open)
+        draw_rundlg();
+    else if (w == shutdlg && shut_open)
+        draw_shutdlg();
+    else if (w == colordlg && color_open)
+        draw_colordlg();
+    else if (w == filedlg && file_open)
+        draw_filedlg();
+    else if (w == setdlg && set_open)
+        draw_setdlg();
+}
+
 void WM::on_button_press(XEvent *e)
 {
     // Dispatch by window: client (click-to-focus), dialogs, menus, taskbar,
     // desktop icons, then frame chrome (buttons / move / resize).
     XButtonEvent *b = &e->xbutton;
+    if (sni_handle_click(this, b))
+        return;
     if (run_open && b->window != rundlg) {
         if (b->window != shutdlg) {
             /* keep run dialog until click inside / buttons */
@@ -2782,32 +3996,48 @@ void WM::on_button_press(XEvent *e)
         const int by = h - 12 - bh;
         const int cancel_x = w - 12 - bw;
         const int ok_x = cancel_x - 8 - bw;
-        if (b->x >= w - 6 - w95::kBtn && b->y >= 4 && b->y < 4 + w95::kTitleH) {
-            close_run();
+        int cx = w - 6 - w95::kBtn, cy = 5;
+        if (in_rect(b->x, b->y, cx, cy, w95::kBtn, w95::kBtnH)) {
+            arm_btn(rundlg, PB_RUN_X, cx, cy, w95::kBtn, w95::kBtnH);
             return;
         }
-        if (b->y >= by && b->y < by + bh) {
-            if (b->x >= ok_x && b->x < ok_x + bw) {
-                if (!run_text.empty())
-                    launch(run_text.c_str());
-                close_run();
-            } else if (b->x >= cancel_x && b->x < cancel_x + bw) {
-                close_run();
-            }
+        if (in_rect(b->x, b->y, ok_x, by, bw, bh)) {
+            arm_btn(rundlg, PB_RUN_OK, ok_x, by, bw, bh);
+            return;
+        }
+        if (in_rect(b->x, b->y, cancel_x, by, bw, bh)) {
+            arm_btn(rundlg, PB_RUN_CANCEL, cancel_x, by, bw, bh);
+            return;
         }
         return;
     }
     if (b->window == shutdlg) {
-        int w = 320, h = 120, bw = 74, bh = 24;
-        if (b->y >= h - 36 && b->y < h - 36 + bh) {
-            if (b->x >= w / 2 - bw - 8 && b->x < w / 2 - 8) {
-                running = false;
-                launch("poweroff -f 2>/dev/null || sudo poweroff 2>/dev/null || sudo halt 2>/dev/null || true");
-            } else if (b->x >= w / 2 + 8 && b->x < w / 2 + 8 + bw) {
-                shut_open = false;
-                XUnmapWindow(dpy, shutdlg);
-                ungrab_if_idle();
+        const int w = w95::kShutW, h = w95::kShutH;
+        const int bw = w95::kDlgBtnW, bh = w95::kDlgBtnH;
+        const int by = h - 12 - bh;
+        const int no_x = w - 12 - bw;
+        const int yes_x = no_x - 8 - bw;
+        int cx = w - 6 - w95::kBtn, cy = 5;
+        if (in_rect(b->x, b->y, cx, cy, w95::kBtn, w95::kBtnH)) {
+            arm_btn(shutdlg, PB_SHUT_X, cx, cy, w95::kBtn, w95::kBtnH);
+            return;
+        }
+        if (b->y >= w95::kShutRadioY && b->y < w95::kShutRadioY + w95::kShutRadioN * w95::kShutRadioH &&
+            b->x >= w95::kShutRadioX - 4 && b->x < w - 12) {
+            int i = (b->y - w95::kShutRadioY) / w95::kShutRadioH;
+            if (i >= 0 && i < w95::kShutRadioN) {
+                shut_choice = i;
+                draw_shutdlg();
             }
+            return;
+        }
+        if (in_rect(b->x, b->y, yes_x, by, bw, bh)) {
+            arm_btn(shutdlg, PB_SHUT_YES, yes_x, by, bw, bh);
+            return;
+        }
+        if (in_rect(b->x, b->y, no_x, by, bw, bh)) {
+            arm_btn(shutdlg, PB_SHUT_NO, no_x, by, bw, bh);
+            return;
         }
         return;
     }
@@ -2818,8 +4048,9 @@ void WM::on_button_press(XEvent *e)
         const int by = h - 12 - bh;
         const int cancel_x = w - 12 - bw;
         const int ok_x = cancel_x - 8 - bw;
-        if (b->x >= w - 6 - w95::kBtn && b->y >= 4 && b->y < 4 + w95::kTitleH) {
-            close_colordlg(false);
+        int cx = w - 6 - w95::kBtn, cy = 5;
+        if (in_rect(b->x, b->y, cx, cy, w95::kBtn, w95::kBtnH)) {
+            arm_btn(colordlg, PB_COLOR_X, cx, cy, w95::kBtn, w95::kBtnH);
             return;
         }
         if (b->x >= 60 && b->y >= 26 && b->x < w - 16 && b->y < 46) {
@@ -2861,11 +4092,13 @@ void WM::on_button_press(XEvent *e)
             draw_colordlg();
             return;
         }
-        if (b->y >= by && b->y < by + bh) {
-            if (b->x >= ok_x && b->x < ok_x + bw)
-                close_colordlg(true);
-            else if (b->x >= cancel_x && b->x < cancel_x + bw)
-                close_colordlg(false);
+        if (in_rect(b->x, b->y, ok_x, by, bw, bh)) {
+            arm_btn(colordlg, PB_COLOR_OK, ok_x, by, bw, bh);
+            return;
+        }
+        if (in_rect(b->x, b->y, cancel_x, by, bw, bh)) {
+            arm_btn(colordlg, PB_COLOR_CANCEL, cancel_x, by, bw, bh);
+            return;
         }
         return;
     }
@@ -2876,19 +4109,17 @@ void WM::on_button_press(XEvent *e)
         const int by = h - 12 - bh;
         const int cancel_x = w - 12 - bw;
         const int ok_x = cancel_x - 8 - bw;
-        if (b->x >= w - 6 - w95::kBtn && b->y >= 4 && b->y < 4 + w95::kTitleH) {
-            close_filedlg();
+        int cx = w - 6 - w95::kBtn, cy = 5;
+        if (in_rect(b->x, b->y, cx, cy, w95::kBtn, w95::kBtnH)) {
+            arm_btn(filedlg, PB_FILE_X, cx, cy, w95::kBtn, w95::kBtnH);
             return;
         }
-        if (b->y >= 24 && b->y < 46) {
-            if (b->x >= w - 84 && b->x < w - 52) {
-                load_file_dir(file_full(file_dir, ".."));
-                draw_filedlg();
-            } else if (b->x >= w - 48 && b->x < w - 12) {
-                const char *home = getenv("HOME");
-                load_file_dir(home && *home ? home : "/");
-                draw_filedlg();
-            }
+        if (in_rect(b->x, b->y, w - 84, 24, 32, 22)) {
+            arm_btn(filedlg, PB_FILE_UP, w - 84, 24, 32, 22);
+            return;
+        }
+        if (in_rect(b->x, b->y, w - 48, 24, 36, 22)) {
+            arm_btn(filedlg, PB_FILE_HOME, w - 48, 24, 36, 22);
             return;
         }
         if (b->button == 4) {
@@ -2925,12 +4156,13 @@ void WM::on_button_press(XEvent *e)
             }
             return;
         }
-        if (b->y >= by && b->y < by + bh) {
-            if (b->x >= ok_x && b->x < ok_x + bw) {
-                KeySym ks = XK_Return;
-                file_key(ks, "", 0);
-            } else if (b->x >= cancel_x && b->x < cancel_x + bw)
-                close_filedlg();
+        if (in_rect(b->x, b->y, ok_x, by, bw, bh)) {
+            arm_btn(filedlg, PB_FILE_OK, ok_x, by, bw, bh);
+            return;
+        }
+        if (in_rect(b->x, b->y, cancel_x, by, bw, bh)) {
+            arm_btn(filedlg, PB_FILE_CANCEL, cancel_x, by, bw, bh);
+            return;
         }
         return;
     }
@@ -2954,112 +4186,185 @@ void WM::on_button_press(XEvent *e)
                 return -1;
             return idx;
         };
-        if (b->x >= w - 6 - w95::kBtn && b->y >= 4 && b->y < 4 + w95::kTitleH) {
-            close_settings(true);
+        if (in_rect(b->x, b->y, w - 6 - w95::kBtn, 5, w95::kBtn, w95::kBtnH)) {
+            arm_btn(setdlg, PB_SET_X, w - 6 - w95::kBtn, 5, w95::kBtn, w95::kBtnH);
             return;
+        }
+        if (b->y >= w95::kTabY - 1 && b->y < w95::kTabY + w95::kTabH + 2) {
+            int x = w95::kTabX;
+            for (int i = 0; i < 3; i++) {
+                if (b->x >= x && b->x < x + w95::kTabW) {
+                    set_tab = i;
+                    set_list = 0;
+                    head_drag = -1;
+                    draw_setdlg();
+                    return;
+                }
+                x += w95::kTabW + 2;
+            }
         }
         if (b->button == 4 || b->button == 5) {
             int *sc = &scheme_scroll;
             int n = (int)schemes.size();
             int vis = (w95::kSchemeListH - 4) / w95::kListRow;
-            if (b->x >= w95::kWallListX && b->y >= w95::kWallListY && b->y < w95::kWallListY + w95::kWallListH) {
-                sc = &wall_scroll;
-                n = (int)walls.size();
-                vis = (w95::kWallListH - 4) / w95::kListRow;
-            } else if (b->x >= w95::kResListX && b->y >= w95::kResListY && b->y < w95::kResListY + w95::kResListH) {
-                sc = &mode_scroll;
+            if (set_tab == 0) {
+                if (b->x >= w95::kPatListX && b->y >= w95::kPatListY && b->y < w95::kPatListY + w95::kPatListH) {
+                    sc = &pat_scroll;
+                    n = (int)patterns.size();
+                    vis = (w95::kPatListH - 4) / w95::kListRow;
+                } else {
+                    sc = &pic_scroll;
+                    n = (int)pictures.size();
+                    vis = (w95::kPicListH - 4) / w95::kListRow;
+                }
+            } else if (set_tab == 2 && heads.empty()) {
+                sc = &head_mode_scroll;
                 n = (int)modes.size();
-                vis = (w95::kResListH - 4) / w95::kListRow;
+                vis = (w95::kHeadResH - 4) / w95::kListRow;
+            } else if (set_tab == 2 && head_sel >= 0 && head_sel < (int)heads.size()) {
+                sc = &head_mode_scroll;
+                n = (int)heads[head_sel].modes.size();
+                vis = (w95::kHeadResH - 4) / w95::kListRow;
             }
             *sc += (b->button == 5) ? 1 : -1;
             ensure_list_scroll(*sc, -1, vis, n);
             draw_setdlg();
             return;
         }
-        int wi = listhit(w95::kWallListX, w95::kWallListY, w95::kWallListW, w95::kWallListH, wall_scroll,
-                         (int)walls.size());
-        if (wi >= 0) {
-            set_list = 0;
-            apply_wall(wi);
-            draw_setdlg();
-            return;
-        }
-        int si = listhit(w95::kSchemeListX, w95::kSchemeListY, w95::kSchemeListW, w95::kSchemeListH, scheme_scroll,
-                         (int)schemes.size());
-        if (si >= 0) {
-            set_list = 1;
-            apply_scheme(si);
-            draw_setdlg();
-            return;
-        }
-        int mi = listhit(w95::kResListX, w95::kResListY, w95::kResListW, w95::kResListH, mode_scroll,
-                         (int)modes.size());
-        if (mi >= 0) {
-            set_list = 2;
-            mode_i = mi;
-            mode_note.clear();
-            draw_setdlg();
-            return;
-        }
-        if (b->x >= w95::kBrowseX && b->x < w95::kBrowseX + w95::kBrowseW && b->y >= w95::kBrowseY &&
-            b->y < w95::kBrowseY + w95::kDlgBtnH) {
-            open_filedlg();
-            return;
-        }
-        int bx = w95::kSchemeBtnX, byb = w95::kSchemeBtnY;
-        if (b->x >= bx && b->x < bx + 96) {
-            if (b->y >= byb && b->y < byb + w95::kDlgBtnH) {
-                ColorScheme s = (scheme_i >= 0 && scheme_i < (int)schemes.size()) ? schemes[scheme_i]
-                                                                                : scheme_from_builtin(w95::kSchemes[0]);
-                s.builtin = false;
-                s.name = unique_scheme_name("Custom");
-                schemes.push_back(s);
-                scheme_i = (int)schemes.size() - 1;
-                apply_scheme(scheme_i);
-                open_colordlg();
+        if (set_tab == 0) {
+            int pi = listhit(w95::kPatListX, w95::kPatListY, w95::kPatListW, w95::kPatListH, pat_scroll,
+                             (int)patterns.size());
+            if (pi >= 0) {
+                set_list = 0;
+                apply_pattern(pi);
+                draw_setdlg();
                 return;
             }
-            if (b->y >= byb + 28 && b->y < byb + 28 + w95::kDlgBtnH) {
-                open_colordlg();
+            int qi = listhit(w95::kPicListX, w95::kPicListY, w95::kPicListW, w95::kPicListH, pic_scroll,
+                             (int)pictures.size());
+            if (qi >= 0) {
+                set_list = 1;
+                apply_picture(qi);
+                draw_setdlg();
                 return;
             }
-            if (b->y >= byb + 56 && b->y < byb + 56 + w95::kDlgBtnH) {
-                if (scheme_i >= 0 && scheme_i < (int)schemes.size() && !schemes[scheme_i].builtin &&
-                    (int)schemes.size() > 1) {
-                    schemes.erase(schemes.begin() + scheme_i);
-                    if (scheme_i >= (int)schemes.size())
-                        scheme_i = (int)schemes.size() - 1;
-                    apply_scheme(scheme_i);
+            if (in_rect(b->x, b->y, w95::kBrowseX, w95::kBrowseY, w95::kBrowseW, w95::kDlgBtnH)) {
+                arm_btn(setdlg, PB_SET_BROWSE, w95::kBrowseX, w95::kBrowseY, w95::kBrowseW, w95::kDlgBtnH);
+                return;
+            }
+            PicPos posv[] = {PicPos::Tile, PicPos::Center, PicPos::Stretch};
+            for (int i = 0; i < 3; i++) {
+                int rx = w95::kPosX + 70 + i * 90;
+                if (b->x >= rx && b->x < rx + 80 && b->y >= w95::kPosY && b->y < w95::kPosY + 18) {
+                    apply_picpos(posv[i]);
+                    draw_setdlg();
+                    return;
+                }
+            }
+        } else if (set_tab == 1) {
+            int si = listhit(w95::kSchemeListX, w95::kSchemeListY, w95::kSchemeListW, w95::kSchemeListH, scheme_scroll,
+                             (int)schemes.size());
+            if (si >= 0) {
+                apply_scheme(si);
+                draw_setdlg();
+                return;
+            }
+            int bx = w95::kSchemeBtnX, byb = w95::kSchemeBtnY;
+            if (b->x >= bx && b->x < bx + 96) {
+                if (b->y >= byb && b->y < byb + w95::kDlgBtnH) {
+                    arm_btn(setdlg, PB_SET_NEW, bx, byb, 96, w95::kDlgBtnH);
+                    return;
+                }
+                if (b->y >= byb + 28 && b->y < byb + 28 + w95::kDlgBtnH) {
+                    arm_btn(setdlg, PB_SET_EDIT, bx, byb + 28, 96, w95::kDlgBtnH);
+                    return;
+                }
+                if (b->y >= byb + 56 && b->y < byb + 56 + w95::kDlgBtnH) {
+                    arm_btn(setdlg, PB_SET_DEL, bx, byb + 56, 96, w95::kDlgBtnH);
+                    return;
+                }
+            }
+        } else if (set_tab == 2) {
+            if (heads.empty()) {
+                int mi = listhit(w95::kHeadResX, w95::kHeadResY, w95::kHeadResW, w95::kHeadResH, head_mode_scroll,
+                                 (int)modes.size());
+                if (mi >= 0) {
+                    mode_i = mi;
+                    mode_note.clear();
+                    draw_setdlg();
+                    return;
+                }
+            } else if (b->x >= w95::kMonBoxX && b->y >= w95::kMonBoxY && b->x < w95::kMonBoxX + w95::kMonBoxW &&
+                b->y < w95::kMonBoxY + w95::kMonBoxH) {
+                int hit = head_at(b->x, b->y);
+                if (hit >= 0) {
+                    head_sel = hit;
+                    compute_head_view();
+                    int lx, ly;
+                    view_to_layout(b->x, b->y, lx, ly);
+                    head_grab_dx = heads[hit].x - lx;
+                    head_grab_dy = heads[hit].y - ly;
+                    head_drag = hit;
+                    head_view_lock = true;
+                    XGrabPointer(dpy, setdlg, False, PointerMotionMask | ButtonReleaseMask, GrabModeAsync, GrabModeAsync,
+                                 None, cur_move, CurrentTime);
                     draw_setdlg();
                 }
                 return;
             }
-        }
-        if (b->y >= by && b->y < by + bh) {
-            if (b->x >= ok_x && b->x < ok_x + bw) {
-                save_display();
-                apply_mode(mode_i);
-                set_save_scheme = scheme_i;
-                set_save_wall = wall_i;
-                set_save_mode = mode_i;
-                set_save_schemes = schemes;
-                close_settings(false);
-            } else if (b->x >= cancel_x && b->x < cancel_x + bw) {
-                close_settings(true);
-            } else if (b->x >= apply_x && b->x < apply_x + bw) {
-                save_display();
-                apply_mode(mode_i);
-                set_save_scheme = scheme_i;
-                set_save_wall = wall_i;
-                set_save_mode = mode_i;
-                set_save_schemes = schemes;
-                draw_setdlg();
+            if (head_sel >= 0 && head_sel < (int)heads.size()) {
+                int mi = listhit(w95::kHeadResX, w95::kHeadResY, w95::kHeadResW, w95::kHeadResH, head_mode_scroll,
+                                 (int)heads[head_sel].modes.size());
+                if (mi >= 0) {
+                    Head &hd = heads[head_sel];
+                    hd.mode_i = mi;
+                    hd.w = hd.modes[mi].w;
+                    hd.h = hd.modes[mi].h;
+                    hd.mode = hd.modes[mi].id;
+                    heads_dirty = true;
+                    draw_setdlg();
+                    return;
+                }
             }
+            if (in_rect(b->x, b->y, w95::kIdentX, w95::kIdentY, w95::kIdentW, w95::kDlgBtnH)) {
+                arm_btn(setdlg, PB_SET_IDENT, w95::kIdentX, w95::kIdentY, w95::kIdentW, w95::kDlgBtnH);
+                return;
+            }
+            if (b->x >= w95::kPrimX && b->x < w95::kPrimX + 220 && b->y >= w95::kPrimY && b->y < w95::kPrimY + 18 &&
+                head_sel >= 0 && head_sel < (int)heads.size()) {
+                for (auto &hd : heads)
+                    hd.primary = false;
+                heads[head_sel].primary = true;
+                heads_dirty = true;
+                draw_setdlg();
+                return;
+            }
+        }
+        if (in_rect(b->x, b->y, ok_x, by, bw, bh)) {
+            arm_btn(setdlg, PB_SET_OK, ok_x, by, bw, bh);
+            return;
+        }
+        if (in_rect(b->x, b->y, cancel_x, by, bw, bh)) {
+            arm_btn(setdlg, PB_SET_CANCEL, cancel_x, by, bw, bh);
+            return;
+        }
+        if (in_rect(b->x, b->y, apply_x, by, bw, bh)) {
+            arm_btn(setdlg, PB_SET_APPLY, apply_x, by, bw, bh);
+            return;
         }
         return;
     }
 
     if (mon && b->window == mon->submenu && mon->sub_open) {
+        if (b->button == 4 || b->button == 5) {
+            int n = (int)programs.size();
+            prog_scroll += (b->button == 5) ? 1 : -1;
+            ensure_list_scroll(prog_scroll, -1, prog_vis, n);
+            draw_submenu(*mon);
+            return;
+        }
+        if (b->button != 1)
+            return;
         int i = sub_item_at(b->y);
         mon->subhover = i;
         activate_sub_item(i);
@@ -3117,39 +4422,61 @@ void WM::on_button_press(XEvent *e)
     if (mon && b->window == mon->desktop) {
         close_menus();
         focus(nullptr);
-        if (!mon->primary)
-            return; // Icons exist only on the primary wallpaper.
+        if (b->button != 1)
+            return;
+        maybe_reload_desktop();
         int hit = -1;
-        for (int i = 0; i < 4; i++) {
-            int ix, iy, iw, ih;
-            desk_cell(i, ix, iy, iw, ih);
-            if (b->x >= ix && b->y >= iy && b->x < ix + iw && b->y < iy + ih)
-                hit = i;
+        if (desk_shows_icons(mon)) {
+            for (int i = 0; i < desk_n(); i++) {
+                int ix, iy, iw, ih;
+                desk_cell(i, ix, iy, iw, ih);
+                if (b->x >= ix && b->y >= iy && b->x < ix + iw && b->y < iy + ih)
+                    hit = i;
+            }
         }
         bool ctrl = (b->state & ControlMask) != 0;
         bool shift = (b->state & ShiftMask) != 0;
+        desk_sel.resize(desk_items.size(), 0);
         if (hit >= 0) {
-            if ((desk_mask & (1u << hit)) && last_icon == hit && b->time - last_icon_time < w95::kDblClickMs) {
+            if (desk_is_sel(hit) && last_icon == hit && b->time - last_icon_time < w95::kDblClickMs) {
                 activate_desk_sel();
                 last_icon = -1;
+                desk_press_i = -1;
+                invalidate_icons();
+                redraw_desktops();
+                return;
             } else if (ctrl) {
-                desk_mask ^= 1u << hit;
+                desk_sel[hit] = desk_sel[hit] ? 0 : 1;
                 selected_icon = hit;
             } else if (shift && selected_icon >= 0) {
                 int a = std::min(selected_icon, hit), c = std::max(selected_icon, hit);
-                desk_mask = 0;
-                for (int i = a; i <= c; i++)
-                    desk_mask |= 1u << i;
+                std::fill(desk_sel.begin(), desk_sel.end(), 0);
+                for (int i = a; i <= c && i < desk_n(); i++)
+                    desk_sel[i] = 1;
                 selected_icon = hit;
-            } else
+            } else if (!desk_is_sel(hit))
                 desk_select_only(hit);
+            else
+                selected_icon = hit;
             last_icon = hit;
             last_icon_time = b->time;
-            draw_desktop(*mon);
+            desk_press_i = hit;
+            desk_press_x = b->x;
+            desk_press_y = b->y;
+            desk_orig_x.resize(desk_items.size());
+            desk_orig_y.resize(desk_items.size());
+            for (int i = 0; i < desk_n(); i++) {
+                desk_orig_x[i] = desk_items[i].x;
+                desk_orig_y[i] = desk_items[i].y;
+            }
+            XGrabPointer(dpy, root, False, PointerMotionMask | ButtonReleaseMask, GrabModeAsync, GrabModeAsync, None,
+                         cur_left, CurrentTime);
+            invalidate_icons();
+            redraw_desktops();
         } else {
             if (!ctrl)
                 desk_select_only(-1);
-            sel_base = ctrl ? desk_mask : 0;
+            sel_base = ctrl ? desk_sel : std::vector<char>(desk_items.size(), 0);
             sel_x0 = sel_x1 = b->x;
             sel_y0 = sel_y1 = b->y;
             sel_mon = mon_index(mon);
@@ -3157,7 +4484,8 @@ void WM::on_button_press(XEvent *e)
             drag_c = nullptr;
             XGrabPointer(dpy, root, False, PointerMotionMask | ButtonReleaseMask, GrabModeAsync, GrabModeAsync, None,
                          cur_left, CurrentTime);
-            draw_desktop(*mon);
+            invalidate_icons();
+            redraw_desktops();
         }
         return;
     }
@@ -3167,16 +4495,8 @@ void WM::on_button_press(XEvent *e)
         raise_client(fr);
         focus(fr);
         Hit h = hit_frame(fr, b->x, b->y);
-        if (h == Hit::Close) {
-            close_client(fr);
-            return;
-        }
-        if (h == Hit::Min) {
-            minimize(fr);
-            return;
-        }
-        if (h == Hit::Max) {
-            maximize_toggle(fr);
+        if (h == Hit::Close || h == Hit::Min || h == Hit::Max) {
+            arm_cap(fr, h);
             return;
         }
         if (h == Hit::Sys) {
@@ -3238,11 +4558,40 @@ void WM::on_button_press(XEvent *e)
 
 void WM::on_button_release(XEvent *e)
 {
+    if (btn_id || cap_c) {
+        update_press(e->xbutton.x, e->xbutton.y);
+        finish_press(true);
+        return;
+    }
+    if (head_drag >= 0) {
+        snap_head(head_drag);
+        head_drag = -1;
+        head_view_lock = false;
+        heads_dirty = true;
+        XUngrabPointer(dpy, CurrentTime);
+        if (set_open)
+            draw_setdlg();
+        (void)e;
+        return;
+    }
+    if (desk_press_i >= 0 || drag == DragMode::Icons) {
+        if (drag == DragMode::Icons) {
+            snap_desk_sel();
+            clamp_desk_icons();
+            save_icon_layout();
+            invalidate_icons();
+            last_icon = -1;
+        }
+        drag = DragMode::Off;
+        desk_press_i = -1;
+        XUngrabPointer(dpy, CurrentTime);
+        redraw_desktops();
+        return;
+    }
     if (drag == DragMode::Select) {
         drag = DragMode::Off;
         XUngrabPointer(dpy, CurrentTime);
-        if (Monitor *p = primary_mon())
-            draw_desktop(*p);
+        redraw_desktops();
         return;
     }
     if (drag != DragMode::Off) {
@@ -3273,14 +4622,51 @@ void WM::on_motion(XEvent *e)
     // During a drag we update geometry every motion; otherwise we only refresh
     // resize cursors and Start-menu hover.
     XMotionEvent *m = &e->xmotion;
+    if (btn_id || cap_c) {
+        update_press(m->x, m->y);
+        return;
+    }
+    if (head_drag >= 0 && head_drag < (int)heads.size()) {
+        int lx, ly;
+        view_to_layout(m->x, m->y, lx, ly);
+        heads[head_drag].x = lx + head_grab_dx;
+        heads[head_drag].y = ly + head_grab_dy;
+        snap_head(head_drag);
+        heads_dirty = true;
+        draw_setdlg();
+        return;
+    }
     if (drag == DragMode::Select) {
         Monitor *mon = (sel_mon >= 0 && sel_mon < (int)mons.size()) ? &mons[sel_mon] : primary_mon();
         if (mon) {
             sel_x1 = m->x_root - mon->x;
             sel_y1 = m->y_root - mon->y;
-            select_desk_icons(sel_x0, sel_y0, sel_x1, sel_y1, sel_base);
+            select_desk_icons(sel_x0, sel_y0, sel_x1, sel_y1);
             draw_desktop(*mon);
         }
+        return;
+    }
+    if (desk_press_i >= 0 || drag == DragMode::Icons) {
+        Monitor *p = primary_mon();
+        if (!p)
+            return;
+        int dx = (m->x_root - p->x) - desk_press_x;
+        int dy = (m->y_root - p->y) - desk_press_y;
+        if (drag != DragMode::Icons) {
+            if (std::abs(dx) < 5 && std::abs(dy) < 5)
+                return;
+            drag = DragMode::Icons;
+            last_icon = -1;
+            XChangeActivePointerGrab(dpy, PointerMotionMask | ButtonReleaseMask, cur_move, CurrentTime);
+        }
+        for (int i = 0; i < desk_n() && i < (int)desk_orig_x.size(); i++) {
+            if (!desk_is_sel(i))
+                continue;
+            desk_items[i].x = desk_orig_x[i] + dx;
+            desk_items[i].y = desk_orig_y[i] + dy;
+        }
+        invalidate_icons();
+        draw_desktop(*p);
         return;
     }
     if (drag != DragMode::Off && drag_c) {
@@ -3395,12 +4781,15 @@ void WM::on_key(XEvent *e)
 
     if (shut_open) {
         if (ks2 == XK_Escape || ks2 == XK_n || ks2 == XK_N) {
-            shut_open = false;
-            XUnmapWindow(dpy, shutdlg);
-            ungrab_if_idle();
-        } else if (ks2 == XK_Return || ks2 == XK_y || ks2 == XK_Y) {
-            running = false;
-            launch("poweroff -f 2>/dev/null || sudo poweroff 2>/dev/null || sudo halt 2>/dev/null || true");
+            close_shut();
+        } else if (ks2 == XK_Return || ks2 == XK_KP_Enter || ks2 == XK_y || ks2 == XK_Y) {
+            confirm_shut();
+        } else if (ks2 == XK_Up || ks2 == XK_Left) {
+            shut_choice = (shut_choice + w95::kShutRadioN - 1) % w95::kShutRadioN;
+            draw_shutdlg();
+        } else if (ks2 == XK_Down || ks2 == XK_Right) {
+            shut_choice = (shut_choice + 1) % w95::kShutRadioN;
+            draw_shutdlg();
         }
         return;
     }
@@ -3521,6 +4910,11 @@ void WM::on_expose(XEvent *e)
         draw_tray();
         return;
     }
+    if (const TrayItem *t = tray_by_win(e->xexpose.window)) {
+        if (t->own_win)
+            draw_tray_owned(*t);
+        return;
+    }
     if (Monitor *m = mon_by_window(e->xexpose.window)) {
         if (e->xexpose.window == m->desktop)
             draw_desktop(*m);
@@ -3548,7 +4942,7 @@ void WM::handle_event(XEvent *e)
     switch (e->type) {
     case MapRequest:
         // New top-level, or a minimized client asking to come back. Tray icons
-        // are already children of traywin and just need XMapWindow.
+        // sit in root-level sockets and just need XMapWindow.
         if (is_tray_icon(e->xmaprequest.window))
             XMapWindow(dpy, e->xmaprequest.window);
         else if (Client *c = find_client(e->xmaprequest.window))
@@ -3590,6 +4984,8 @@ void WM::handle_event(XEvent *e)
         break;
     }
     case UnmapNotify:
+        if (is_tray_icon(e->xunmap.window))
+            break;
         if (Client *c = find_client(e->xunmap.window)) {
             if (c->ignore_unmap) {
                 c->ignore_unmap--;
@@ -3639,9 +5035,9 @@ void WM::handle_event(XEvent *e)
         break;
     case PropertyNotify:
         // Title changes refresh caption + task button. Tray XEMBED_INFO can
-        // mean the icon wants to show/hide; we just relayout.
-        if (is_tray_icon(e->xproperty.window) && e->xproperty.atom == xembed_info)
-            tray_layout();
+        // mean the icon wants to show/hide.
+        if (TrayItem *t = tray_by_win(e->xproperty.window); t && e->xproperty.atom == xembed_info)
+            tray_apply_xembed(*t);
         else if (Client *c = find_client(e->xproperty.window)) {
             if (e->xproperty.atom == XA_WM_NAME || e->xproperty.atom == net_wm_name) {
                 c->name = get_name(c->win);
@@ -3655,6 +5051,9 @@ void WM::handle_event(XEvent *e)
         if (e->xclient.message_type == net_system_tray_opcode) {
             if (e->xclient.data.l[1] == 0) // SYSTEM_TRAY_REQUEST_DOCK
                 tray_dock((Window)e->xclient.data.l[2]);
+        } else if (e->xclient.message_type == xembed) {
+            if (e->xclient.data.l[1] == XEMBED_REQUEST_FOCUS && is_tray_icon(e->xclient.window))
+                tray_send_xembed(e->xclient.window, XEMBED_FOCUS_IN, 0, 0, 0);
         } else if (e->xclient.message_type == net_active) {
             if (Client *c = find_client(e->xclient.window)) {
                 if (c->iconic)
@@ -3665,6 +5064,10 @@ void WM::handle_event(XEvent *e)
                 }
             }
         }
+        break;
+    case SelectionClear:
+        if (e->xselectionclear.selection == net_system_tray)
+            tray_claim();
         break;
     case MappingNotify:
         XRefreshKeyboardMapping(&e->xmapping);
@@ -3755,6 +5158,7 @@ bool WM::init()
     banner.pix = alloc_rgb(w95::rgb_banner);
 
     gc = XCreateGC(dpy, root, 0, nullptr);
+    XSetGraphicsExposures(dpy, gc, False);
     // Helvetica if the server has it (TinyCore Xfonts often don't), else "fixed".
     const char *fn[] = {"-*-helvetica-medium-r-*-*-12-*-*-*-*-*-*-*", "-*-helvetica-medium-r-*-*-11-*-*-*-*-*-*-*",
                         "fixed", nullptr};
@@ -3791,9 +5195,11 @@ bool WM::init()
     // relevant monitor when opened. override_redirect so we don't manage them.
     rundlg = mkwin(0, 0, w95::kRunW, w95::kRunH, face.pix,
                    ExposureMask | ButtonPressMask | KeyPressMask | KeyReleaseMask, true);
-    shutdlg = mkwin(0, 0, 320, 120, face.pix, ExposureMask | ButtonPressMask | KeyPressMask, true);
+    shutdlg = mkwin(0, 0, w95::kShutW, w95::kShutH, face.pix, ExposureMask | ButtonPressMask | KeyPressMask, true);
     setdlg = mkwin(0, 0, w95::kSetW, w95::kSetH, face.pix,
-                   ExposureMask | ButtonPressMask | KeyPressMask | KeyReleaseMask, true);
+                   ExposureMask | ButtonPressMask | ButtonReleaseMask | ButtonMotionMask | PointerMotionMask |
+                       KeyPressMask | KeyReleaseMask,
+                   true);
     snapwin = mkwin(0, 0, 40, 40, title.pix, ExposureMask, true);
     colordlg = mkwin(0, 0, w95::kColorW, w95::kColorH, face.pix,
                      ExposureMask | ButtonPressMask | KeyPressMask | KeyReleaseMask, true);
@@ -3831,6 +5237,9 @@ bool WM::init()
         XFree(kids);
     }
     restack_shell();
+    load_desktop();
+    redraw_desktops();
+    sni_start(this);
     // Desktop owns the keyboard until a client maps, so arrow keys hit icons.
     if (!focused)
         focus(nullptr);
@@ -3845,6 +5254,7 @@ void WM::run()
     int last_min = -1;
     caret_ms = now_ms();
     while (running) {
+        sni_dispatch(this);
         while (XPending(dpy)) {
             XEvent e;
             XNextEvent(dpy, &e);
@@ -3859,6 +5269,8 @@ void WM::run()
                 draw_taskbar(m);
         }
         long t = now_ms();
+        if (identify_until && t >= identify_until)
+            hide_identify();
         if (t - caret_ms >= 530) {
             caret_ms = t;
             caret_on = !caret_on;
@@ -3872,8 +5284,16 @@ void WM::run()
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(fd, &fds);
+        int nfds = fd;
+        int sfd = sni_fd(this);
+        if (sfd >= 0) {
+            FD_SET(sfd, &fds);
+            if (sfd > nfds)
+                nfds = sfd;
+        }
         struct timeval tv{0, 250000};
-        select(fd + 1, &fds, nullptr, nullptr, &tv);
+        select(nfds + 1, &fds, nullptr, nullptr, &tv);
+        sni_dispatch(this);
     }
 }
 
@@ -3881,8 +5301,20 @@ void WM::finish()
 {
     // Drop the tray selection so another WM can claim it, then close Display.
     close_run();
+    close_shut();
     close_settings(false);
     close_menus();
+    hide_identify();
+    sni_stop(this);
+    while (!tray_items.empty())
+        tray_undock(tray_items.front().win);
+    free_pic_cache();
+    for (auto &m : mons)
+        free_desk_pix(m);
+    if (wall_tile) {
+        XFreePixmap(dpy, wall_tile);
+        wall_tile = 0;
+    }
     if (dpy && traywin)
         XSetSelectionOwner(dpy, net_system_tray, None, CurrentTime);
     if (dpy)

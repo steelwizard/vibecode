@@ -257,7 +257,11 @@ export LD_LIBRARY_PATH="$D${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 exec "$D/editor" "$@"
 EOF
 chmod +x "$OV/usr/local/bin/editor"
-mkdir -p "$OV/opt/chime/wallpapers" "$OV/home/tc/.chime/wallpapers"
+mkdir -p "$OV/opt/chime/wallpapers" "$OV/home/tc/.chime/wallpapers" \
+    "$OV/usr/local/share/applications"
+for app in chime-cabinet chime-editor chime-terminal; do
+    cp "$ROOT/share/applications/$app.desktop" "$OV/usr/local/share/applications/"
+done
 
 # Stock wallpaper so Display Properties has a photo besides the 32x32 patterns.
 # PPM (P6) loads in the WM with no ImageMagick in the guest.
@@ -315,6 +319,9 @@ else
 fi
 export XPID=$!
 waitforX || { echo failed in waitforX; cat /tmp/Xfbdev.log 2>/dev/null; exit 1; }
+export XDG_CURRENT_DESKTOP=Chime
+export XDG_SESSION_DESKTOP=chime
+export XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 "$DESKTOP" 2>/tmp/wm_errors &
 export WM_PID=$!
 volicon >/tmp/volicon.log 2>&1 &

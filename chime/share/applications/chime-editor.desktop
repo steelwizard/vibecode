@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Editor
+Comment=Plain text editor
+Exec=editor %F
+TryExec=editor
+Categories=Utility;TextEditor;
+OnlyShowIn=Chime;
+Keywords=text;notepad;
+Terminal=false
