@@ -326,11 +326,23 @@ std::string wrap_term(const std::string &cmd)
     return std::string("aterm -e sh -c ") + q + " || xterm -e sh -c " + q + " || x-terminal-emulator -e sh -c " + q;
 }
 
+bool is_shell_script(const std::string &path)
+{
+    return ends_with(path, ".sh");
+}
+
+// Directories open in Cabinet. .sh files run (with sh if they lack +x, like a
+// .bat on the 90s desktop). Other +x files run as-is. Everything else is
+// handed to xdg-open / editor.
 std::string file_cmd(const std::string &path, bool dir)
 {
     std::string q = quote(path);
     if (dir)
         return "cabinet " + q;
+    if (is_shell_script(path))
+        return access(path.c_str(), X_OK) == 0 ? q : ("sh " + q);
+    if (access(path.c_str(), X_OK) == 0)
+        return q;
     return "xdg-open " + q + " 2>/dev/null || editor " + q + " 2>/dev/null || aterm -e vi " + q + " || xterm -e vi " + q;
 }
 
@@ -364,6 +376,8 @@ bool desktop_to_launch(const std::string &path, const DeskFile &df, bool for_men
         out.exec = file_cmd(url, dir);
         out.dir = dir;
         out.kind = icon_kind(out.name, out.exec, df.icon, df.categories, dir);
+        if (!dir && is_shell_script(url))
+            out.kind = 2;
         return true;
     }
     if (type != "Application")
@@ -580,7 +594,7 @@ void WM::load_desktop()
             it.name = n;
             it.dir = false;
             it.exec = file_cmd(full, false);
-            it.kind = 3;
+            it.kind = is_shell_script(full) ? 2 : 3;
             desk_items.push_back(std::move(it));
         }
         closedir(d);

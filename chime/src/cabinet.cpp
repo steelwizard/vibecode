@@ -1,7 +1,7 @@
 // Cabinet — Chime's Explorer-style file manager.
 // Menu bar, toolbar, address well, details list, and status line. Directory IO
-// is POSIX; opening a file shells out to editor or vi. Toolbar hit boxes live
-// in kTools[] and must match the painted buttons.
+// is POSIX. Opening a .sh or +x file runs it; other files go to editor or vi.
+// Toolbar hit boxes live in kTools[] and must match the painted buttons.
 
 #include "theme.h"
 
@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <strings.h>
 #include <ctime>
 #include <cerrno>
 #include <dirent.h>
@@ -428,6 +429,24 @@ std::string shell_quote(const std::string &s)
     return o;
 }
 
+bool is_shell_script(const std::string &path)
+{
+    size_t n = 3;
+    return path.size() >= n && strcasecmp(path.c_str() + path.size() - n, ".sh") == 0;
+}
+
+// Match the desktop: .sh runs even without +x; other executables run; else edit.
+std::string open_file_cmd(const std::string &path)
+{
+    std::string q = shell_quote(path);
+    if (is_shell_script(path))
+        return access(path.c_str(), X_OK) == 0 ? q : ("sh " + q);
+    std::string edit = "editor " + q + " 2>/dev/null || aterm -e vi " + q + " || xterm -e vi " + q;
+    if (access(path.c_str(), X_OK) == 0)
+        return q + " || " + edit;
+    return edit;
+}
+
 void set_title()
 {
     std::string t = "Cabinet - " + cwd;
@@ -782,11 +801,7 @@ void open_sel()
             load_dir(e.path);
             return;
         }
-        std::string q = shell_quote(e.path);
-        std::string cmd = "editor " + q + " 2>/dev/null || aterm -e vi " + q + " || xterm -e vi " + q;
-        if (access(e.path.c_str(), X_OK) == 0)
-            cmd = q + " || " + cmd;
-        spawn(cmd.c_str());
+        spawn(open_file_cmd(e.path).c_str());
         status = "Opened " + e.name;
         return;
     }
@@ -794,11 +809,7 @@ void open_sel()
     for (int i = 0; i < (int)ents.size(); i++) {
         if (!marked[i] || ents[i].is_dir)
             continue;
-        std::string q = shell_quote(ents[i].path);
-        std::string cmd = "editor " + q + " 2>/dev/null || aterm -e vi " + q + " || xterm -e vi " + q;
-        if (access(ents[i].path.c_str(), X_OK) == 0)
-            cmd = q + " || " + cmd;
-        spawn(cmd.c_str());
+        spawn(open_file_cmd(ents[i].path).c_str());
         opened++;
     }
     status = opened ? ("Opened " + std::to_string(opened) + " file(s)") : "Nothing to open";
