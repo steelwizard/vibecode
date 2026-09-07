@@ -17,6 +17,10 @@ void WM::fill(Drawable d, int x, int y, int w, int h, unsigned long p)
 {
     if (w <= 0 || h <= 0)
         return;
+    if (wayland) {
+        soft_fill(d, x, y, w, h, p);
+        return;
+    }
     XSetForeground(dpy, gc, p);
     XFillRectangle(dpy, d, gc, x, y, w, h);
 }
@@ -31,20 +35,16 @@ void WM::bevel(Drawable d, int x, int y, int w, int h, bool raised)
     unsigned long br = raised ? dk.pix : hi.pix;
     unsigned long tl2 = raised ? face.pix : dk.pix;
     unsigned long br2 = raised ? lo.pix : face.pix;
-    XSetForeground(dpy, gc, tl);
-    XDrawLine(dpy, d, gc, x, y, x + w - 1, y);
-    XDrawLine(dpy, d, gc, x, y, x, y + h - 1);
-    XSetForeground(dpy, gc, br);
-    XDrawLine(dpy, d, gc, x, y + h - 1, x + w - 1, y + h - 1);
-    XDrawLine(dpy, d, gc, x + w - 1, y, x + w - 1, y + h - 1);
+    stroke(d, x, y, x + w - 1, y, tl);
+    stroke(d, x, y, x, y + h - 1, tl);
+    stroke(d, x, y + h - 1, x + w - 1, y + h - 1, br);
+    stroke(d, x + w - 1, y, x + w - 1, y + h - 1, br);
     if (w < 4 || h < 4)
         return;
-    XSetForeground(dpy, gc, tl2);
-    XDrawLine(dpy, d, gc, x + 1, y + 1, x + w - 3, y + 1);
-    XDrawLine(dpy, d, gc, x + 1, y + 1, x + 1, y + h - 3);
-    XSetForeground(dpy, gc, br2);
-    XDrawLine(dpy, d, gc, x + 1, y + h - 2, x + w - 2, y + h - 2);
-    XDrawLine(dpy, d, gc, x + w - 2, y + 1, x + w - 2, y + h - 2);
+    stroke(d, x + 1, y + 1, x + w - 3, y + 1, tl2);
+    stroke(d, x + 1, y + 1, x + 1, y + h - 3, tl2);
+    stroke(d, x + 1, y + h - 2, x + w - 2, y + h - 2, br2);
+    stroke(d, x + w - 2, y + 1, x + w - 2, y + h - 2, br2);
 }
 
 void WM::sunken(Drawable d, int x, int y, int w, int h)
@@ -56,6 +56,8 @@ int WM::text_w(const char *s, bool bold)
 {
     if (!s)
         return 0;
+    if (wayland || !font)
+        return wayland ? soft_text_w(s, bold) : (int)strlen(s) * 8;
     XFontStruct *f = (bold && font_b) ? font_b : font;
     if (!f)
         return (int)strlen(s) * 8;
@@ -68,6 +70,10 @@ void WM::draw_str(Drawable d, int x, int y, int box_h, const char *s, unsigned l
 {
     if (!s)
         return;
+    if (wayland) {
+        soft_text(d, x, y, box_h, s, pix, bold);
+        return;
+    }
     XFontStruct *f = (bold && font_b) ? font_b : font;
     if (!f)
         return;
@@ -82,14 +88,9 @@ void WM::draw_str_clip(Drawable d, int x, int y, int w, int h, const char *s, un
 {
     if (w <= 0 || h <= 0 || !s)
         return;
-    XRectangle r;
-    r.x = (short)x;
-    r.y = (short)y;
-    r.width = (unsigned short)w;
-    r.height = (unsigned short)h;
-    XSetClipRectangles(dpy, gc, 0, 0, &r, 1, Unsorted);
+    clip_set(x, y, w, h);
     draw_str(d, x, y, h, s, pix, bold);
-    XSetClipMask(dpy, gc, None);
+    clip_clear();
 }
 
 // Caption chrome: kind 0 = minimize, 1 = maximize/restore, 2 = close (X).
@@ -100,26 +101,22 @@ void WM::draw_caption_btn(Drawable d, int x, int y, int kind, bool maxed, bool p
     int ox = pressed ? 1 : 0;
     x += ox;
     y += ox;
-    XSetForeground(dpy, gc, fg.pix);
     if (kind == 0) {
-        // Underscore at the bottom of the button.
-        XDrawLine(dpy, d, gc, x + 3, y + w95::kBtnH - 5, x + w95::kBtn - 4, y + w95::kBtnH - 5);
-        XDrawLine(dpy, d, gc, x + 3, y + w95::kBtnH - 4, x + w95::kBtn - 4, y + w95::kBtnH - 4);
+        stroke(d, x + 3, y + w95::kBtnH - 5, x + w95::kBtn - 4, y + w95::kBtnH - 5, fg.pix);
+        stroke(d, x + 3, y + w95::kBtnH - 4, x + w95::kBtn - 4, y + w95::kBtnH - 4, fg.pix);
     } else if (kind == 1) {
         if (maxed) {
-            // Two overlapping rects = "restore".
-            XDrawRectangle(dpy, d, gc, x + 5, y + 3, 6, 5);
-            XDrawRectangle(dpy, d, gc, x + 3, y + 5, 6, 5);
+            stroke_rect(d, x + 5, y + 3, 7, 6, fg.pix);
+            stroke_rect(d, x + 3, y + 5, 7, 6, fg.pix);
         } else {
-            XDrawRectangle(dpy, d, gc, x + 3, y + 3, w95::kBtn - 7, w95::kBtnH - 7);
-            XDrawLine(dpy, d, gc, x + 3, y + 4, x + w95::kBtn - 5, y + 4);
+            stroke_rect(d, x + 3, y + 3, w95::kBtn - 6, w95::kBtnH - 6, fg.pix);
+            stroke(d, x + 3, y + 4, x + w95::kBtn - 5, y + 4, fg.pix);
         }
     } else {
-        // Close: two-pixel-thick X.
-        XDrawLine(dpy, d, gc, x + 4, y + 3, x + w95::kBtn - 5, y + w95::kBtnH - 4);
-        XDrawLine(dpy, d, gc, x + 5, y + 3, x + w95::kBtn - 4, y + w95::kBtnH - 4);
-        XDrawLine(dpy, d, gc, x + w95::kBtn - 5, y + 3, x + 4, y + w95::kBtnH - 4);
-        XDrawLine(dpy, d, gc, x + w95::kBtn - 4, y + 3, x + 5, y + w95::kBtnH - 4);
+        stroke(d, x + 4, y + 3, x + w95::kBtn - 5, y + w95::kBtnH - 4, fg.pix);
+        stroke(d, x + 5, y + 3, x + w95::kBtn - 4, y + w95::kBtnH - 4, fg.pix);
+        stroke(d, x + w95::kBtn - 5, y + 3, x + 4, y + w95::kBtnH - 4, fg.pix);
+        stroke(d, x + w95::kBtn - 4, y + 3, x + 5, y + w95::kBtnH - 4, fg.pix);
     }
 }
 
@@ -140,27 +137,23 @@ void WM::draw_icon(Drawable d, int x, int y, int kind, bool selected)
     } else if (kind == 1) {
         fill(d, x + 4, y + 8, 24, 18, yellow.pix);
         fill(d, x + 6, y + 4, 12, 6, yellow.pix);
-        XSetForeground(dpy, gc, lo.pix);
-        XDrawRectangle(dpy, d, gc, x + 4, y + 8, 24, 18);
+        stroke_rect(d, x + 4, y + 8, 25, 19, lo.pix);
     } else if (kind == 2) {
         fill(d, x + 2, y + 4, 28, 22, lo.pix);
         fill(d, x + 4, y + 6, 24, 16, dk.pix);
-        XSetForeground(dpy, gc, green.pix);
-        XDrawLine(dpy, d, gc, x + 7, y + 10, x + 18, y + 10);
-        XDrawLine(dpy, d, gc, x + 7, y + 13, x + 22, y + 13);
-        XDrawLine(dpy, d, gc, x + 7, y + 16, x + 14, y + 16);
+        stroke(d, x + 7, y + 10, x + 18, y + 10, green.pix);
+        stroke(d, x + 7, y + 13, x + 22, y + 13, green.pix);
+        stroke(d, x + 7, y + 16, x + 14, y + 16, green.pix);
         fill(d, x + 12, y + 22, 8, 4, face.pix);
         fill(d, x + 6, y + 26, 20, 3, lo.pix);
     } else {
         fill(d, x + 6, y + 2, 20, 26, white.pix);
-        XSetForeground(dpy, gc, lo.pix);
-        XDrawRectangle(dpy, d, gc, x + 6, y + 2, 20, 26);
+        stroke_rect(d, x + 6, y + 2, 21, 27, lo.pix);
         fill(d, x + 8, y + 4, 16, 4, title.pix);
-        XSetForeground(dpy, gc, dk.pix);
-        XDrawLine(dpy, d, gc, x + 9, y + 12, x + 23, y + 12);
-        XDrawLine(dpy, d, gc, x + 9, y + 16, x + 21, y + 16);
-        XDrawLine(dpy, d, gc, x + 9, y + 20, x + 23, y + 20);
-        XDrawLine(dpy, d, gc, x + 9, y + 24, x + 18, y + 24);
+        stroke(d, x + 9, y + 12, x + 23, y + 12, dk.pix);
+        stroke(d, x + 9, y + 16, x + 21, y + 16, dk.pix);
+        stroke(d, x + 9, y + 20, x + 23, y + 20, dk.pix);
+        stroke(d, x + 9, y + 24, x + 18, y + 24, dk.pix);
     }
 }
 
@@ -213,13 +206,8 @@ void WM::paint_desk_icons(Drawable d)
         int ly = iy + w95::kIcon + 6;
         if (sel)
             fill(d, lx - 2, ly, std::min(lw + 4, w95::kCellW), 16, title.pix);
-        if (!sel) {
-            // 1px black offset under white text so labels read on teal/patterns.
-            XSetForeground(dpy, gc, dk.pix);
-            XFontStruct *f = font;
-            if (f)
-                XDrawString(dpy, d, gc, lx + 1, ly + f->ascent + 1, lab, (int)strlen(lab));
-        }
+        if (!sel)
+            draw_str_clip(d, lx + 1, ly + 1, w95::kCellW - 2, 16, lab, dk.pix, false);
         draw_str_clip(d, lx, ly, w95::kCellW - 2, 16, lab, white.pix, false);
     }
 }
@@ -230,9 +218,8 @@ void WM::draw_desktop(Monitor &m)
     if (!m.desktop)
         return;
     compose_desktop(m);
-    XSetClipMask(dpy, gc, None);
-    XSetFunction(dpy, gc, GXcopy);
-    XCopyArea(dpy, m.desk_pix, m.desktop, gc, 0, 0, m.pix_w, m.pix_h, 0, 0);
+    clip_clear();
+    copy_area(m.desktop, m.desk_pix, 0, 0, m.pix_w, m.pix_h, 0, 0);
     if (drag == DragMode::Select && sel_mon == mon_index(&m))
         draw_dotted_rect(m.desktop, sel_x0, sel_y0, sel_x1, sel_y1);
 }
@@ -243,15 +230,20 @@ void WM::draw_dotted_rect(Drawable d, int x0, int y0, int x1, int y1)
     int w = std::abs(x1 - x0), h = std::abs(y1 - y0);
     if (w < 1 || h < 1)
         return;
-    char dash[] = {1, 1};
-    XSetDashes(dpy, gc, 0, dash, 2);
-    XSetLineAttributes(dpy, gc, 0, LineOnOffDash, CapButt, JoinMiter);
-    XSetForeground(dpy, gc, dk.pix);
-    XDrawRectangle(dpy, d, gc, x, y, (unsigned)w, (unsigned)h);
-    XSetForeground(dpy, gc, white.pix);
-    XSetDashes(dpy, gc, 1, dash, 2);
-    XDrawRectangle(dpy, d, gc, x, y, (unsigned)w, (unsigned)h);
-    XSetLineAttributes(dpy, gc, 0, LineSolid, CapButt, JoinMiter);
+    auto dash = [&](int x0, int y0, int x1, int y1, unsigned long a, unsigned long b) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int n = std::max(std::abs(dx), std::abs(dy));
+        if (n < 1)
+            return;
+        for (int i = 0; i <= n; i++) {
+            int px = x0 + dx * i / n, py = y0 + dy * i / n;
+            plot(d, px, py, (i & 1) ? a : b);
+        }
+    };
+    dash(x, y, x + w, y, dk.pix, white.pix);
+    dash(x, y + h, x + w, y + h, dk.pix, white.pix);
+    dash(x, y, x, y + h, dk.pix, white.pix);
+    dash(x + w, y, x + w, y + h, dk.pix, white.pix);
 }
 
 void WM::draw_clock(Drawable d, int x, int y, int w, int h)
@@ -277,7 +269,7 @@ void WM::tile_wall(Drawable d, int x, int y, int w, int h)
                 int cw = std::min(wall_tw, x + w - px);
                 int ch = std::min(wall_th, y + h - py);
                 if (cw > 0 && ch > 0)
-                    XCopyArea(dpy, wall_tile, d, gc, 0, 0, cw, ch, px, py);
+                    copy_area(d, wall_tile, 0, 0, cw, ch, px, py);
             }
         }
     }
@@ -286,7 +278,7 @@ void WM::tile_wall(Drawable d, int x, int y, int w, int h)
     if (pic_pos == PicPos::Stretch) {
         Pixmap sp = scaled_pic(w, h);
         if (sp)
-            XCopyArea(dpy, sp, d, gc, 0, 0, w, h, x, y);
+            copy_area(d, sp, 0, 0, w, h, x, y);
         return;
     }
     if (pic_pos == PicPos::Center) {
@@ -308,7 +300,7 @@ void WM::tile_wall(Drawable d, int x, int y, int w, int h)
         if (dy + ch > y + h)
             ch = y + h - dy;
         if (cw > 0 && ch > 0)
-            XCopyArea(dpy, pic_pix, d, gc, sx, sy, cw, ch, dx, dy);
+            copy_area(d, pic_pix, sx, sy, cw, ch, dx, dy);
         return;
     }
     for (int py = y; py < y + h; py += pic_ph) {
@@ -316,7 +308,7 @@ void WM::tile_wall(Drawable d, int x, int y, int w, int h)
             int cw = std::min(pic_pw, x + w - px);
             int ch = std::min(pic_ph, y + h - py);
             if (cw > 0 && ch > 0)
-                XCopyArea(dpy, pic_pix, d, gc, 0, 0, cw, ch, px, py);
+                copy_area(d, pic_pix, 0, 0, cw, ch, px, py);
         }
     }
 }
@@ -522,9 +514,8 @@ void WM::draw_set_settings()
     fill(setdlg, w95::kPrimX, w95::kPrimY + 2, 12, 12, field.pix);
     sunken(setdlg, w95::kPrimX, w95::kPrimY + 2, 12, 12);
     if (prim) {
-        XSetForeground(dpy, gc, fg.pix);
-        XDrawLine(dpy, setdlg, gc, w95::kPrimX + 2, w95::kPrimY + 8, w95::kPrimX + 5, w95::kPrimY + 11);
-        XDrawLine(dpy, setdlg, gc, w95::kPrimX + 5, w95::kPrimY + 11, w95::kPrimX + 10, w95::kPrimY + 4);
+        stroke(setdlg, w95::kPrimX + 2, w95::kPrimY + 8, w95::kPrimX + 5, w95::kPrimY + 11, fg.pix);
+        stroke(setdlg, w95::kPrimX + 5, w95::kPrimY + 11, w95::kPrimX + 10, w95::kPrimY + 4, fg.pix);
     }
     draw_str(setdlg, w95::kPrimX + 18, w95::kPrimY, 16, "Use as primary monitor", fg.pix, false);
     if (!mode_note.empty())
@@ -551,10 +542,8 @@ void WM::draw_setdlg()
     else
         draw_set_settings();
 
-    XSetForeground(dpy, gc, lo.pix);
-    XDrawLine(dpy, setdlg, gc, 8, h - 44, w - 9, h - 44);
-    XSetForeground(dpy, gc, hi.pix);
-    XDrawLine(dpy, setdlg, gc, 8, h - 43, w - 9, h - 43);
+    stroke(setdlg, 8, h - 44, w - 9, h - 44, lo.pix);
+    stroke(setdlg, 8, h - 43, w - 9, h - 43, hi.pix);
 
     const int bw = w95::kDlgBtnW, bh = w95::kDlgBtnH;
     int by = h - 12 - bh;
@@ -685,12 +674,13 @@ void WM::draw_tray()
 {
     if (!traywin)
         return;
-    XWindowAttributes wa{};
-    if (!XGetWindowAttributes(dpy, traywin, &wa) || wa.map_state == IsUnmapped)
+    int tw = 0, th = 0;
+    bool mapped = true;
+    if (!win_geom(traywin, &tw, &th, &mapped) || !mapped)
         return;
-    fill(traywin, 0, 0, wa.width, wa.height, face.pix);
-    sunken(traywin, 0, 0, wa.width, wa.height);
-    draw_clock(traywin, wa.width - w95::kClockW, 0, w95::kClockW, wa.height);
+    fill(traywin, 0, 0, tw, th, face.pix);
+    sunken(traywin, 0, 0, tw, th);
+    draw_clock(traywin, tw - w95::kClockW, 0, w95::kClockW, th);
 }
 
 // Taskbar: highlight along the top, Start, task buttons for windows on this
@@ -699,10 +689,8 @@ void WM::draw_tray()
 void WM::draw_taskbar(Monitor &m)
 {
     fill(m.taskbar, 0, 0, m.w, w95::kTaskbarH, face.pix);
-    XSetForeground(dpy, gc, hi.pix);
-    XDrawLine(dpy, m.taskbar, gc, 0, 0, m.w, 0);
-    XSetForeground(dpy, gc, face.pix);
-    XDrawLine(dpy, m.taskbar, gc, 0, 1, m.w, 1);
+    stroke(m.taskbar, 0, 0, m.w, 0, hi.pix);
+    stroke(m.taskbar, 0, 1, m.w, 1, face.pix);
 
     int sbx = 2, sby = 3, sbw = w95::kStartW, sbh = w95::kTaskbarH - 6;
     fill(m.taskbar, sbx, sby, sbw, sbh, face.pix);
@@ -795,14 +783,9 @@ void WM::draw_startmenu(Monitor &m)
         unsigned long col = !kMenu[i].enabled ? lo.pix : (hot ? white.pix : fg.pix);
         draw_str(m.startmenu, bx + 10, y, ih, kMenu[i].label, col, false);
         if (kMenu[i].sub) {
-            XPoint p[3];
             int ax = bx + w95::kMenuBodyW - 16;
             int ay = y + ih / 2;
-            p[0] = {(short)ax, (short)(ay - 4)};
-            p[1] = {(short)ax, (short)(ay + 4)};
-            p[2] = {(short)(ax + 5), (short)ay};
-            XSetForeground(dpy, gc, col);
-            XFillPolygon(dpy, m.startmenu, gc, p, 3, Convex, CoordModeOrigin);
+            fill_tri(m.startmenu, ax, ay - 4, ax, ay + 4, ax + 5, ay, col);
         }
         y += ih;
     }
@@ -867,10 +850,8 @@ void WM::draw_rundlg()
     if (caret_on)
         fill(rundlg, caret, fy + 4, 2, fh - 8, fg.pix);
 
-    XSetForeground(dpy, gc, lo.pix);
-    XDrawLine(dpy, rundlg, gc, 8, h - 44, w - 9, h - 44);
-    XSetForeground(dpy, gc, hi.pix);
-    XDrawLine(dpy, rundlg, gc, 8, h - 43, w - 9, h - 43);
+    stroke(rundlg, 8, h - 44, w - 9, h - 44, lo.pix);
+    stroke(rundlg, 8, h - 43, w - 9, h - 43, hi.pix);
 
     const int bw = w95::kDlgBtnW, bh = w95::kDlgBtnH;
     int by = h - 12 - bh;
@@ -883,18 +864,11 @@ void WM::draw_rundlg()
 void WM::draw_radio(Drawable d, int x, int y, bool on)
 {
     const int s = 12;
-    XSetForeground(dpy, gc, field.pix);
-    XFillArc(dpy, d, gc, x, y, s, s, 0, 360 * 64);
-    XSetForeground(dpy, gc, lo.pix);
-    XDrawArc(dpy, d, gc, x, y, s, s, 45 * 64, 180 * 64);
-    XSetForeground(dpy, gc, hi.pix);
-    XDrawArc(dpy, d, gc, x, y, s, s, 225 * 64, 180 * 64);
-    XSetForeground(dpy, gc, dk.pix);
-    XDrawArc(dpy, d, gc, x + 1, y + 1, s - 2, s - 2, 45 * 64, 180 * 64);
-    if (on) {
-        XSetForeground(dpy, gc, fg.pix);
-        XFillArc(dpy, d, gc, x + 3, y + 3, s - 6, s - 6, 0, 360 * 64);
-    }
+    fill_oval(d, x, y, s, field.pix);
+    stroke_oval(d, x, y, s, lo.pix);
+    stroke_oval(d, x + 1, y + 1, s - 2, dk.pix);
+    if (on)
+        fill_oval(d, x + 3, y + 3, s - 6, fg.pix);
 }
 
 void WM::draw_shutdlg()

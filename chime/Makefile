@@ -1,6 +1,6 @@
 # Host binaries plus TinyCore remaster. `make` builds chime (WM), cabinet
 # (file manager), volicon (tray speaker), and editor (notepad). `make image`
-# needs the ISO tooling listed in README.md.
+# rebuilds the WM without wlroots so the live ISO stays X11-only.
 CXX ?= g++
 PKG = x11 xrandr xinerama
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra
@@ -12,8 +12,44 @@ ifneq ($(strip $(DBUS_LIBS)),)
 CXXFLAGS += -DCHIME_SNI $(DBUS_CFLAGS)
 LIBS += $(DBUS_LIBS)
 endif
-SRCS = src/main.cpp src/draw.cpp src/wm.cpp src/xdg.cpp src/sni.cpp
-HDRS = src/wm.h src/theme.h src/sni.h
+
+# Wayland/wlroots: on if headers + lib are present, unless CHIME_WL=0.
+WL_PC := $(firstword $(foreach p,wlroots-0.19 wlroots,$(if $(shell pkg-config --exists $(p) && echo y),$(p))))
+HAVE_WL_DEPS := $(wildcard deps/wlroots-0.19/wlr/backend.h)
+HAVE_WL_LIB := $(wildcard /usr/lib/*/libwlroots-0.19.so)
+ifeq ($(origin CHIME_WL), undefined)
+  ifneq ($(shell command -v wayland-scanner 2>/dev/null),)
+    ifneq ($(WL_PC),)
+      CHIME_WL := 1
+    else ifneq ($(HAVE_WL_DEPS),)
+      ifneq ($(HAVE_WL_LIB),)
+        CHIME_WL := 1
+      endif
+    endif
+  endif
+endif
+CHIME_WL ?= 0
+
+SRCS = src/main.cpp src/draw.cpp src/wm.cpp src/xdg.cpp src/sni.cpp src/plat.cpp
+HDRS = src/wm.h src/theme.h src/sni.h src/plat_wl.h
+WL_PROTO =
+
+ifeq ($(CHIME_WL),1)
+SRCS += src/plat_wl.cpp
+CXXFLAGS += -DCHIME_WAYLAND -DWLR_USE_UNSTABLE
+ifneq ($(WL_PC),)
+CXXFLAGS += $(shell pkg-config --cflags $(WL_PC))
+LIBS += $(shell pkg-config --libs $(WL_PC))
+else
+CXXFLAGS += -Ideps/wlroots-0.19 -Ideps/xcb $(shell pkg-config --cflags pixman-1 libdrm wayland-server xkbcommon 2>/dev/null)
+LIBS += -lwlroots-0.19
+endif
+CXXFLAGS += -Ibuild
+LIBS += -lwayland-server -lxkbcommon
+WL_PROTO = build/xdg-shell-protocol.h
+WAYLAND_PROTOCOLS ?= $(shell pkg-config --variable=pkgdatadir wayland-protocols)
+XDG_XML = $(WAYLAND_PROTOCOLS)/stable/xdg-shell/xdg-shell.xml
+endif
 
 PREFIX ?= /usr/local
 DESTDIR ?=
@@ -24,7 +60,11 @@ all: chime cabinet volicon editor
 
 wm: chime
 
-chime: $(SRCS) $(HDRS)
+build/xdg-shell-protocol.h:
+	mkdir -p build
+	wayland-scanner server-header "$(XDG_XML)" $@
+
+chime: $(SRCS) $(HDRS) $(WL_PROTO)
 	$(CXX) $(CXXFLAGS) -o $@ $(SRCS) $(LIBS)
 
 # File manager, tray icon, and notepad only need libX11 (no RandR).
@@ -37,7 +77,10 @@ volicon: src/volicon.cpp
 editor: src/editor.cpp src/theme.h
 	$(CXX) $(CXXFLAGS) -o $@ src/editor.cpp $(shell pkg-config --libs x11)
 
-image: chime cabinet volicon editor
+# TinyCore/Xfbdev has no wlroots; force an X11-only binary into the ISO.
+image:
+	rm -f chime
+	$(MAKE) CHIME_WL=0 chime cabinet volicon editor
 	./scripts/mkimage.sh
 
 run: image
@@ -46,8 +89,8 @@ run: image
 run-dual: image
 	DUAL=1 ./scripts/run.sh
 
-# Host install: binaries under PREFIX, plus an xsessions desktop file so
-# SDDM/GDM/LightDM can offer "Chime" on the login screen.
+# Host install: binaries under PREFIX, plus xsessions / wayland-sessions
+# desktop files so SDDM/GDM/LightDM can offer "Chime".
 install: all
 	PREFIX="$(PREFIX)" DESTDIR="$(DESTDIR)" ./scripts/install.sh --from-make
 

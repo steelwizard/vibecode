@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build Chime and install it as a selectable X11 session on this machine.
+# Build Chime and install it as a selectable X11/Wayland session on this machine.
 # Usage:
 #   ./scripts/install.sh              # deps, compile, install (needs sudo)
 #   ./scripts/install.sh --uninstall
@@ -18,7 +18,7 @@ SKIP_BUILD=0
 
 usage() {
     cat <<EOF
-Build Chime and install a login-screen session (xsessions).
+Build Chime and install login-screen sessions (xsessions + wayland-sessions).
 
   ./scripts/install.sh [options]
 
@@ -51,7 +51,9 @@ BINDIR=${BINDIR:-$PREFIX/bin}
 LIBEXECDIR=${LIBEXECDIR:-$PREFIX/libexec/chime}
 DATADIR=${DATADIR:-$PREFIX/share/chime}
 XSESSIONDIR=${XSESSIONDIR:-$PREFIX/share/xsessions}
+WLSESSIONDIR=${WLSESSIONDIR:-$PREFIX/share/wayland-sessions}
 SYS_XSESSIONDIR=/usr/share/xsessions
+SYS_WLSESSIONDIR=/usr/share/wayland-sessions
 
 as_root() {
     if [ "$(id -u)" -eq 0 ]; then
@@ -105,7 +107,7 @@ run_install() {
         "$@"
         return
     fi
-    if need_root_for "$PREFIX" || need_root_for "$SYS_XSESSIONDIR"; then
+    if need_root_for "$PREFIX" || need_root_for "$SYS_XSESSIONDIR" || need_root_for "$SYS_WLSESSIONDIR"; then
         as_root "$@"
     else
         "$@"
@@ -125,14 +127,15 @@ ensure_deps() {
     [ -n "$DESTDIR" ] && return 0
     is_debian || {
         echo "not a Debian/Ubuntu system; install g++, pkg-config, libx11-dev," >&2
-        echo "libxrandr-dev, libxinerama-dev, libdbus-1-dev, and an Xorg input driver yourself." >&2
+        echo "libxrandr-dev, libxinerama-dev, libdbus-1-dev, libwlroots-0.19-dev," >&2
+        echo "libwayland-dev, libxkbcommon-dev, wayland-protocols, and an Xorg input driver yourself." >&2
         return 0
     }
 
-    build="g++ make pkg-config python3 libx11-dev libxrandr-dev libxinerama-dev libdbus-1-dev"
+    build="g++ make pkg-config python3 libx11-dev libxrandr-dev libxinerama-dev libdbus-1-dev libwlroots-0.19-dev libwayland-dev libxkbcommon-dev wayland-protocols"
     # Wayland-only desktops often omit this; without it an X11 session has no
     # keyboard or mouse.
-    runtime="xserver-xorg-core xserver-xorg-input-libinput x11-xserver-utils xterm"
+    runtime="xserver-xorg-core xserver-xorg-input-libinput x11-xserver-utils xterm xwayland"
     missing=
     for p in $build $runtime; do
         pkg_installed "$p" || missing="$missing $p"
@@ -154,14 +157,16 @@ install_files() {
     libexec=${DESTDIR}${LIBEXECDIR}
     data=${DESTDIR}${DATADIR}
     xsess=${DESTDIR}${XSESSIONDIR}
+    wlsess=${DESTDIR}${WLSESSIONDIR}
     apps=${DESTDIR}${PREFIX}/share/applications
 
     echo "installing to ${DESTDIR:-}$PREFIX"
-    run_install mkdir -p "$libexec" "$bindir" "$data/wallpapers" "$xsess" "$apps"
+    run_install mkdir -p "$libexec" "$bindir" "$data/wallpapers" "$xsess" "$wlsess" "$apps"
     run_install install -m 755 "$ROOT/chime" "$ROOT/cabinet" "$ROOT/volicon" "$ROOT/editor" "$libexec/"
 
     sess=$ROOT/build/chime-session
     desk=$ROOT/build/chime.desktop
+    wldesk=$ROOT/build/chime-wayland.desktop
     mkdir -p "$ROOT/build"
     sed -e "s|@LIBEXECDIR@|$LIBEXECDIR|g" -e "s|@DATADIR@|$DATADIR|g" \
         "$ROOT/scripts/chime-session.in" > "$sess"
@@ -169,6 +174,9 @@ install_files() {
     sed -e "s|@BINDIR@|$BINDIR|g" \
         "$ROOT/share/xsessions/chime.desktop.in" > "$desk"
     chmod 644 "$desk"
+    sed -e "s|@BINDIR@|$BINDIR|g" \
+        "$ROOT/share/wayland-sessions/chime.desktop.in" > "$wldesk"
+    chmod 644 "$wldesk"
     run_install install -m 755 "$sess" "$bindir/chime-session"
     # Relative so the bin dir can move together.
     run_install ln -sf chime-session "$bindir/chime"
@@ -182,17 +190,24 @@ install_files() {
     fi
 
     run_install install -m 644 "$desk" "$xsess/chime.desktop"
+    run_install install -m 644 "$wldesk" "$wlsess/chime.desktop"
 
     for app in chime-cabinet chime-editor chime-terminal; do
         run_install install -m 644 "$ROOT/share/applications/$app.desktop" "$apps/$app.desktop"
     done
 
-    # GDM/LightDM only scan /usr/share/xsessions. SDDM also looks in
-    # /usr/local/share/xsessions; copy both when they differ.
+    # GDM/LightDM only scan /usr/share/{x,wayland}-sessions. SDDM also looks in
+    # PREFIX/share; copy both when they differ.
     if [ -z "$DESTDIR" ] && [ "$XSESSIONDIR" != "$SYS_XSESSIONDIR" ]; then
         if need_root_for "$SYS_XSESSIONDIR" || [ "$(id -u)" -eq 0 ]; then
             run_install mkdir -p "$SYS_XSESSIONDIR"
             run_install install -m 644 "$desk" "$SYS_XSESSIONDIR/chime.desktop"
+        fi
+    fi
+    if [ -z "$DESTDIR" ] && [ "$WLSESSIONDIR" != "$SYS_WLSESSIONDIR" ]; then
+        if need_root_for "$SYS_WLSESSIONDIR" || [ "$(id -u)" -eq 0 ]; then
+            run_install mkdir -p "$SYS_WLSESSIONDIR"
+            run_install install -m 644 "$wldesk" "$SYS_WLSESSIONDIR/chime.desktop"
         fi
     fi
 }
@@ -207,18 +222,20 @@ uninstall_files() {
         "${DESTDIR}${BINDIR}/chime-session" \
         "${DESTDIR}${BINDIR}/chime" \
         "${DESTDIR}${XSESSIONDIR}/chime.desktop" \
+        "${DESTDIR}${WLSESSIONDIR}/chime.desktop" \
         "${DESTDIR}${DATADIR}/wallpapers/clouds.ppm" \
         "${DESTDIR}${PREFIX}/share/applications/chime-cabinet.desktop" \
         "${DESTDIR}${PREFIX}/share/applications/chime-editor.desktop" \
         "${DESTDIR}${PREFIX}/share/applications/chime-terminal.desktop"
     if [ -z "$DESTDIR" ]; then
-        run_install rm -f "$SYS_XSESSIONDIR/chime.desktop"
+        run_install rm -f "$SYS_XSESSIONDIR/chime.desktop" "$SYS_WLSESSIONDIR/chime.desktop"
     fi
     run_install rmdir "${DESTDIR}${LIBEXECDIR}" 2>/dev/null || true
     run_install rmdir "${DESTDIR}${DATADIR}/wallpapers" 2>/dev/null || true
     run_install rmdir "${DESTDIR}${DATADIR}" 2>/dev/null || true
     run_install rmdir "${DESTDIR}${PREFIX}/share/applications" 2>/dev/null || true
     run_install rmdir "${DESTDIR}${XSESSIONDIR}" 2>/dev/null || true
+    run_install rmdir "${DESTDIR}${WLSESSIONDIR}" 2>/dev/null || true
 }
 
 if [ "$UNINSTALL" = 1 ]; then
@@ -237,9 +254,13 @@ install_files
 
 echo
 echo "Chime is installed. At the login screen, open the session menu and choose Chime."
-echo "  session: ${DESTDIR:-}$XSESSIONDIR/chime.desktop"
+echo "  X11 session: ${DESTDIR:-}$XSESSIONDIR/chime.desktop"
+echo "  Wayland session: ${DESTDIR:-}$WLSESSIONDIR/chime.desktop"
 if [ -z "$DESTDIR" ] && [ -f "$SYS_XSESSIONDIR/chime.desktop" ]; then
-    echo "  session: $SYS_XSESSIONDIR/chime.desktop"
+    echo "  X11 session: $SYS_XSESSIONDIR/chime.desktop"
+fi
+if [ -z "$DESTDIR" ] && [ -f "$SYS_WLSESSIONDIR/chime.desktop" ]; then
+    echo "  Wayland session: $SYS_WLSESSIONDIR/chime.desktop"
 fi
 echo "  binaries: $LIBEXECDIR"
 echo "Log out (do not reboot unless you want to) and select Chime before signing in."

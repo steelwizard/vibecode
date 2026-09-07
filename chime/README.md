@@ -1,19 +1,26 @@
 # Chime
 
-A 1990s-style desktop and window manager for X11: teal wallpaper, beveled frames, Start menu, and a taskbar on **each monitor**.
+A 1990s-style desktop: teal wallpaper, beveled frames, Start menu, and a taskbar on **each monitor**. It runs as an **X11 window manager** or a **Wayland compositor** (wlroots 0.19, with Xwayland for existing X apps).
 
 ## Build
 
 ```bash
 sudo apt install g++ pkg-config libx11-dev libxrandr-dev libxinerama-dev \
-    xorriso cpio gzip squashfs-tools qemu-system-x86 curl
-make            # host binary: ./chime
-./scripts/install.sh   # compile, install, register a login-screen session
-make image      # remaster TinyCorePure64 into chime.iso / chime.img
+    libwayland-dev libxkbcommon-dev wayland-protocols libwlroots-0.19-dev \
+    xwayland xorriso cpio gzip squashfs-tools qemu-system-x86 curl
+make            # host binary: ./chime (X11 + Wayland when wlroots is present)
+CHIME_BACKEND=wayland ./chime   # nest under an existing compositor, or run on a TTY
+CHIME_BACKEND=x11 ./chime       # classic X11 window manager
+./scripts/install.sh   # compile, install, register login-screen sessions
+make image      # remaster TinyCorePure64 into chime.iso / chime.img (X11-only)
 make run        # boot the ISO in QEMU
 ```
 
-`./scripts/install.sh` puts the desktop on this machine and adds a **Chime** entry to the display manager (SDDM, GDM, LightDM). Log out, pick Chime in the session menu, then sign in. `sudo make uninstall` removes it.
+`make` links wlroots when the headers and `libwlroots-0.19` are available (`CHIME_WL=0` forces the X11-only binary). `make image` always rebuilds without Wayland because the TinyCore live image has no compositor stack.
+
+`./scripts/install.sh` puts the desktop on this machine and adds **Chime** entries for both X11 (`xsessions`) and Wayland (`wayland-sessions`). Log out, pick Chime in the session menu, then sign in. `sudo make uninstall` removes it.
+
+`CHIME_BACKEND=wayland` or `chime-session --wayland` starts the compositor. Otherwise: nest if `WAYLAND_DISPLAY` is set, run as an X11 WM if `DISPLAY` is set, or take over a TTY.
 
 `make image` downloads [TinyCorePure64 15.0](http://www.tinycorelinux.net/15.x/x86_64/release/) (32 MB), injects Xfbdev plus `chime` / `cabinet` / `volicon` / `editor`, and boots straight into the desktop.
 
@@ -35,7 +42,7 @@ The WM queries **RandR** (preferred) then **Xinerama**:
 
 Start → Settings → **Settings** arranges the screens: drag the numbered boxes to align them (they snap to edges), pick a resolution per monitor, mark the primary, and **Identify** flashes a number on each head. Apply writes `~/.chime/monitors` and calls RandR so the layout sticks after login.
 
-The live image uses **Xfbdev** (one framebuffer). For real multi-head, run `./chime` as the session WM on Xorg.
+The live image uses **Xfbdev** (one framebuffer). For real multi-head, run `./chime` as the session WM on Xorg, or as a Wayland compositor on the host. Host apps (`cabinet`, `editor`, `volicon`) stay X11 clients and run under Xwayland.
 
 ## Keys
 

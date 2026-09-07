@@ -1,7 +1,7 @@
 #!/bin/sh
-# Chime X11 session. Display managers start Xorg, then exec this; when the
-# window manager exits, the session ends. Helpers live in LIBEXEC so `editor`
-# does not shadow the system editor outside this session.
+# Chime session. Display managers start Xorg or a Wayland seat, then exec
+# this; when the WM/compositor exits, the session ends. Helpers live in
+# LIBEXEC so `editor` does not shadow the system editor outside this session.
 LIBEXEC=@LIBEXECDIR@
 DATA=@DATADIR@
 export PATH="$LIBEXEC:${PATH:-/usr/bin}"
@@ -13,7 +13,17 @@ export XDG_SESSION_DESKTOP=chime
 SHARE=$(dirname "$DATA")
 export XDG_DATA_DIRS="$SHARE:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 
-if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dbus-run-session >/dev/null 2>&1; then
-    exec dbus-run-session -- "$LIBEXEC/chime" "$@"
+WAYLAND=0
+for arg in "$@"; do
+    case "$arg" in
+        --wayland) WAYLAND=1 ;;
+    esac
+done
+if [ "$WAYLAND" = 1 ] || [ "${CHIME_BACKEND:-}" = wayland ] || [ "${XDG_SESSION_TYPE:-}" = wayland ]; then
+    export CHIME_BACKEND=wayland
 fi
-exec "$LIBEXEC/chime" "$@"
+
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dbus-run-session >/dev/null 2>&1; then
+    exec dbus-run-session -- "$LIBEXEC/chime"
+fi
+exec "$LIBEXEC/chime"

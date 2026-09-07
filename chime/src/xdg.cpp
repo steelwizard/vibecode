@@ -17,8 +17,8 @@
 
 namespace {
 
-const char *kTermCmd = "aterm || xterm || x-terminal-emulator || true";
-const char *kEditorCmd = "editor || aterm -e vi || xterm -e vi || true";
+const char *kTermCmd = "foot || kitty || weston-terminal || aterm || xterm || x-terminal-emulator || true";
+const char *kEditorCmd = "editor || aterm -e vi || xterm -e vi || foot -e vi || kitty -e vi || true";
 
 std::string home_dir()
 {
@@ -323,7 +323,8 @@ int icon_kind(const std::string &name, const std::string &exec, const std::strin
 std::string wrap_term(const std::string &cmd)
 {
     std::string q = quote(cmd);
-    return std::string("aterm -e sh -c ") + q + " || xterm -e sh -c " + q + " || x-terminal-emulator -e sh -c " + q;
+    return std::string("foot -e sh -c ") + q + " || kitty -e sh -c " + q + " || aterm -e sh -c " + q +
+           " || xterm -e sh -c " + q + " || x-terminal-emulator -e sh -c " + q;
 }
 
 bool is_shell_script(const std::string &path)

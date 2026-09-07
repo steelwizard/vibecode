@@ -207,6 +207,13 @@ struct VideoMode {
 // Drawing lives in draw.cpp; event handling, clients, tray, and monitors here.
 struct WM {
     Display *dpy = nullptr;
+    bool wayland = false; // true: wlroots compositor; false: X11 WM
+    void *wl = nullptr;   // WlServer in plat_wl.cpp
+    char key_text[32]{};  // UTF-8 from the Wayland seat for the current key event
+    int key_text_n = 0;
+    int clip_x = 0, clip_y = 0, clip_w = 0, clip_h = 0;
+    bool clip_on = false;
+    Window kbd_grab_w = 0;
     int screen = 0;
     Window root = 0;
     Visual *vis = nullptr;
@@ -350,11 +357,51 @@ struct WM {
     int cascade[16] = {}; // Per-monitor stagger for newly mapped windows
 
     bool init();
+    bool init_x11();
+    bool init_wayland();
     void run();
     void finish();
 
     unsigned long alloc_rgb(w95::Rgb c);
-    Window mkwin(int x, int y, int w, int h, unsigned long bg, long mask, bool override);
+    Window mkwin(int x, int y, int w, int h, unsigned long bg, long mask, bool override, int layer = -1);
+    void win_map(Window w);
+    void win_unmap(Window w);
+    void win_destroy(Window w);
+    void win_raise(Window w);
+    void win_lower(Window w);
+    void win_mapraised(Window w);
+    void win_move_resize(Window w, int x, int y, int wd, int ht);
+    void win_resize(Window w, int wd, int ht);
+    void win_reparent(Window child, Window parent, int x, int y);
+    void win_set_bg(Window w, unsigned long pix);
+    void win_cursor(Window w, Cursor c);
+    bool ptr_xy(int *x, int *y);
+    void ptr_grab(Window w, unsigned mask, Cursor c);
+    void ptr_ungrab();
+    void ptr_grab_change(unsigned mask, Cursor c);
+    void kbd_focus(Window w);
+    void kbd_ungrab();
+    void copy_area(Drawable dst, Drawable src, int sx, int sy, int w, int h, int dx, int dy);
+    Pixmap pix_create(int w, int h);
+    void pix_free(Pixmap p);
+    void stroke(Drawable d, int x0, int y0, int x1, int y1, unsigned long p);
+    void stroke_rect(Drawable d, int x, int y, int w, int h, unsigned long p);
+    void plot(Drawable d, int x, int y, unsigned long p);
+    void fill_tri(Drawable d, int x0, int y0, int x1, int y1, int x2, int y2, unsigned long p);
+    void fill_oval(Drawable d, int x, int y, int s, unsigned long p);
+    void stroke_oval(Drawable d, int x, int y, int s, unsigned long p);
+    void clip_set(int x, int y, int w, int h);
+    void clip_clear();
+    bool win_geom(Window w, int *wd, int *ht, bool *mapped);
+    bool win_root_xy(Window w, int *x, int *y);
+    void allow_replay();
+    void backend_flush();
+    int backend_fd();
+    void backend_drain();
+    unsigned long rgb_pack(std::uint8_t r, std::uint8_t g, std::uint8_t b);
+    void soft_fill(Drawable d, int x, int y, int w, int h, unsigned long p);
+    int soft_text_w(const char *s, bool bold);
+    void soft_text(Drawable d, int x, int y, int box_h, const char *s, unsigned long p, bool bold);
     void intern_atoms();
     void ewmh_init();
     void ewmh_update();
