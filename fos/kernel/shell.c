@@ -440,6 +440,7 @@ static void cmd_help(void) {
     console_write_line("  grep [-inv] PAT [file]  Find lines (fixed string)");
     console_write_line("  bench / test          Test bench (primes, soak, mem, gfx, audio, hw)");
     console_write_line("  tetris                Tetromino game (arrows, z/x, space, c hold)");
+    console_write_line("  nova / breakout       Space breakout (arrows, space launch, q quit)");
     console_write_line("  shell / exit          Nested shell; exit returns");
     console_write_line("  cmd1 | cmd2          Pipe stdout to stdin");
     console_write_line("  cmd > file           Redirect stdout to file");
@@ -574,6 +575,10 @@ static const char *which_alias_com(const char *name) {
     }
     if (strcasecmp(name, "tetris") == 0) {
         return "TETRIS";
+    }
+    if (strcasecmp(name, "nova") == 0 || strcasecmp(name, "breakout") == 0 ||
+        strcasecmp(name, "arkanoid") == 0) {
+        return "NOVA";
     }
     return 0;
 }
@@ -1116,6 +1121,11 @@ static void cmd_tetris(const char *args) {
                    "TETRIS failed (missing or corrupt TETRIS.COM — run: make clean && make)");
 }
 
+static void cmd_nova(const char *args) {
+    run_direct_com("NOVA", args,
+                   "NOVA failed (missing or corrupt NOVA.COM — run: make clean && make)");
+}
+
 static int copy_ident(const char *p, char *name, size_t name_sz, const char **rest) {
     size_t n = 0;
 
@@ -1323,6 +1333,9 @@ static int run_builtin(char *line) {
         cmd_bench(cmd_arg(line));
     } else if (match_cmd(line, "TETRIS")) {
         cmd_tetris(cmd_arg(line));
+    } else if (match_cmd(line, "NOVA") || match_cmd(line, "BREAKOUT") ||
+               match_cmd(line, "ARKANOID")) {
+        cmd_nova(cmd_arg(line));
     } else if (match_cmd(line, "SHELL") || match_cmd(line, "COMMAND")) {
         cmd_shell();
     } else if (match_cmd(line, "EXIT")) {

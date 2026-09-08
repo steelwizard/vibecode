@@ -68,6 +68,7 @@ Audio backend defaults to **PipeWire** when that session socket exists, otherwis
 | `\FOS\GREP.COM` | Fixed-string search (`grep [-inv] PATTERN [FILE …]`) |
 | `\FOS\BENCH.COM` | Test bench TUI — primes, 60 s soak, RAM, graphics, audio, hardware monitor (`bench`, `test`) |
 | `\GAMES\TETRIS.COM` | Tetris — 7-bag, ghost, hold, levels (`tetris`; q quits) |
+| `\GAMES\NOVA.COM` | Space breakout — lasers, capsules, hall of fame (`nova` / `breakout`; q quits) |
 | `README.TXT` | Full project README (copy of `README.md` from the repo) |
 
 Programs under `\FOS` and `\GAMES` are found via `$PATH` (seeded from `[shell] path=` in `SYSTEM.INI`).
@@ -102,6 +103,7 @@ A `.COM` can be 32 MiB of code+data+BSS at `0x300000`, with an 8 MiB stack. Larg
 | `grep [-inv] PAT [file]` | Find lines (`grep Flash README.TXT`; `-i` case, `-n` numbers, `-v` invert) |
 | `bench` / `test` | Test bench TUI (`bench primes` / `bench mem` headless; `bench burn` = 60 s; `bench hw` = live meters) |
 | `tetris` | Tetromino game (arrows / WASD, `z`/`y` rotate, space drop, `c` hold, `p` pause, `q` quit) |
+| `nova` / `breakout` | Space breakout (arrows / A D paddle, space launch or fire, mouse steers, `p` pause, `q` quit) |
 | `shell` / `shell.com` | Nested shell (`exit` returns; on-disk `SHELL.COM` is not a FOSCOM) |
 | `echo …` / `*.com` | Run a FOSCOM program |
 | `demo` / `*.bat` | Run a `.BAT` script (`call name` also works) |
@@ -122,7 +124,7 @@ Prompt shows the current path, e.g. `0:\>` or `0:\docs>`. It is green after a su
 
 ### Mouse
 
-A yellow arrow follows the host mouse in QEMU (no grab — `make run` adds `-device vmmouse`). Left-drag selects text; right-click copies the selection, or pastes if nothing is selected. Left-click activates `[ OK ]` / Y/N buttons, moves the caret in the shell and editor, opens FM entries on double-click, and pages `less` (upper/lower half). In `edit`, the gutter shows line numbers; left-click moves the caret, left-drag or Shift+arrows select (without copying the gutter), Ctrl+K cuts, and right-click / Ctrl+C / Ctrl+V use the same clipboard as the shell. Quit prompts to save when the volume is writable (FAT32, not exFAT). Click the bottom row in `play` to quit. In `paint`, left-drag draws, right-drag erases, `B` or **Fill** flood-fills, and the bottom swatches pick a colour. In `bench`, click a menu row to select and click again to run; in the hardware monitor, click the load bar to set synthetic CPU load. In `tetris`, click the well to rotate, the sides to nudge, or the bottom bar.
+A yellow arrow follows the host mouse in QEMU (no grab — `make run` adds `-device vmmouse`). Left-drag selects text; right-click copies the selection, or pastes if nothing is selected. Left-click activates `[ OK ]` / Y/N buttons, moves the caret in the shell and editor, opens FM entries on double-click, and pages `less` (upper/lower half). In `edit`, the gutter shows line numbers; left-click moves the caret, left-drag or Shift+arrows select (without copying the gutter), Ctrl+K cuts, and right-click / Ctrl+C / Ctrl+V use the same clipboard as the shell. Quit prompts to save when the volume is writable (FAT32, not exFAT). Click the bottom row in `play` to quit. In `paint`, left-drag draws, right-drag erases, `B` or **Fill** flood-fills, and the bottom swatches pick a colour. In `bench`, click a menu row to select and click again to run; in the hardware monitor, click the load bar to set synthetic CPU load. In `tetris`, click the well to rotate, the sides to nudge, or the bottom bar. In `nova`, move the mouse to steer the paddle and click to launch (or fire lasers).
 
 ### Scripts (`if` / `for` / `while` / `.BAT`)
 
@@ -291,7 +293,8 @@ fos/
 │   ├── bench/  bench.com (TUI: primes, soak, RAM, graphics, audio, hardware monitor)
 │   └── fm/     fm.com
 ├── games/
-│   └── tetris/ tetris.com (7-bag, ghost, hold, levels)
+│   ├── tetris/ tetris.com (7-bag, ghost, hold, levels)
+│   └── nova/   nova.com (space breakout, capsules, high scores)
 ├── scripts/                   # mkdisk.sh, foscom_pack.py, …
 ├── system.ini                 # Template → 0:\SYSTEM.INI
 └── Makefile

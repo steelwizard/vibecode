@@ -21,6 +21,7 @@ PAINT=${16:-}
 GREP=${17:-}
 BENCH=${18:-}
 TETRIS=${19:-}
+NOVA=${20:-}
 
 TOTAL_SECTORS=131072
 PART_SECTORS=$((TOTAL_SECTORS - PART_START))
@@ -135,6 +136,9 @@ if [ -n "$BENCH" ] && [ -f "$BENCH" ]; then
 fi
 if [ -n "$TETRIS" ] && [ -f "$TETRIS" ]; then
     add_one GAMES/TETRIS.COM "$TETRIS"
+fi
+if [ -n "$NOVA" ] && [ -f "$NOVA" ]; then
+    add_one GAMES/NOVA.COM "$NOVA"
 fi
 if [ -f "$SCRIPT_DIR/../demo.bat" ]; then
     add_one FOS/DEMO.BAT "$SCRIPT_DIR/../demo.bat"

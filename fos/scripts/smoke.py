@@ -111,7 +111,9 @@ CASES = [
     ("dir FOS", 10, None, None, "BENCH.COM"),  # shell alive after bench
     ("which tetris", 10, None, None, "0:\\GAMES\\TETRIS.COM"),
     ("tetris", 20, 2.0, "q", None),
-    ("dir GAMES", 10, None, None, "TETRIS.COM"),
+    ("which nova", 10, None, None, "0:\\GAMES\\NOVA.COM"),
+    ("nova", 20, 2.0, "q", None),
+    ("dir GAMES", 10, None, None, "NOVA.COM"),
 ]
 
 

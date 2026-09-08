@@ -29,6 +29,8 @@ BENCH_BIN   = apps/bench/bench.bin
 BENCH_COM   = apps/bench/bench.com
 TETRIS_BIN  = games/tetris/tetris.bin
 TETRIS_COM  = games/tetris/tetris.com
+NOVA_BIN    = games/nova/nova.bin
+NOVA_COM    = games/nova/nova.com
 EFI_EFI     = efi/BOOTX64.EFI
 DATA_IMG    = data.img
 
@@ -131,6 +133,11 @@ TETRIS_ASM  = games/tetris/entry.asm
 TETRIS_C    = games/tetris/tetris.c
 TETRIS_OBJ  = $(TETRIS_ASM:.asm=.o) $(TETRIS_C:.c=.o)
 TETRIS_ELF  = games/tetris/tetris.elf
+
+NOVA_ASM    = games/nova/entry.asm
+NOVA_C      = games/nova/nova.c
+NOVA_OBJ    = $(NOVA_ASM:.asm=.o) $(NOVA_C:.c=.o)
+NOVA_ELF    = games/nova/nova.elf
 
 KERNEL_OBJ = $(KERNEL_ASM:.asm=.o) $(KERNEL_C:.c=.o)
 
@@ -250,6 +257,12 @@ games/tetris/%.o: games/tetris/%.asm
 	$(NASM) -f elf64 $< -o $@
 
 games/tetris/%.o: games/tetris/%.c $(KERNEL_HDRS)
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+games/nova/%.o: games/nova/%.asm
+	$(NASM) -f elf64 $< -o $@
+
+games/nova/%.o: games/nova/%.c $(KERNEL_HDRS)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(KERNEL_ELF): $(KERNEL_OBJ) kernel/linker.ld
@@ -440,6 +453,19 @@ $(TETRIS_COM): $(TETRIS_BIN) $(TETRIS_ELF) scripts/foscom_pack.py
 		--mem-size 0x$$(nm -n $(TETRIS_ELF) | awk '$$3=="_end"{print $$1; exit}') \
 		--stack $(COM_STACK) --name TETRIS
 
+$(NOVA_ELF): $(NOVA_OBJ) games/nova/linker.ld
+	$(LD) -m elf_x86_64 -T games/nova/linker.ld -nostdlib -o $@ $(NOVA_OBJ)
+
+$(NOVA_BIN): $(NOVA_ELF)
+	$(OBJCOPY) -O binary $< $@
+
+$(NOVA_COM): $(NOVA_BIN) $(NOVA_ELF) scripts/foscom_pack.py
+	$(PYTHON) scripts/foscom_pack.py $(NOVA_BIN) $@ \
+		--load $(COM_LOAD) \
+		--entry 0x$$(nm -n $(NOVA_ELF) | awk '$$3=="_start"{print $$1; exit}') \
+		--mem-size 0x$$(nm -n $(NOVA_ELF) | awk '$$3=="_end"{print $$1; exit}') \
+		--stack $(COM_STACK) --name NOVA
+
 EFI_CFLAGS = -m64 -mabi=ms -fshort-wchar -ffreestanding -fno-stack-protector \
              -fno-builtin -fpie -mno-red-zone -fno-ident \
              -fno-asynchronous-unwind-tables -Wall -Wextra -O2 -I efi
@@ -463,8 +489,8 @@ $(EFI_EFI): efi/efi_main.o efi/efi.ld
 	      --image-base 0x140000000 --disable-auto-import \
 	      -o $@ efi/efi_main.o
 
-$(IMG): $(BOOT_BIN) $(KERNEL_BIN) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(BEEP_COM) $(PLAY_COM) $(PAINT_COM) $(GREP_COM) $(BENCH_COM) $(TETRIS_COM) $(EFI_EFI) system.ini demo.bat scripts/mkdisk.sh scripts/fat32_add.py
-	scripts/mkdisk.sh $(IMG) $(BOOT_BIN) $(KERNEL_BIN) $(KERNEL_LBA) $(PART_START) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(EFI_EFI) $(BEEP_COM) $(PLAY_COM) $(PAINT_COM) $(GREP_COM) $(BENCH_COM) $(TETRIS_COM)
+$(IMG): $(BOOT_BIN) $(KERNEL_BIN) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(BEEP_COM) $(PLAY_COM) $(PAINT_COM) $(GREP_COM) $(BENCH_COM) $(TETRIS_COM) $(NOVA_COM) $(EFI_EFI) system.ini demo.bat scripts/mkdisk.sh scripts/fat32_add.py
+	scripts/mkdisk.sh $(IMG) $(BOOT_BIN) $(KERNEL_BIN) $(KERNEL_LBA) $(PART_START) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(EFI_EFI) $(BEEP_COM) $(PLAY_COM) $(PAINT_COM) $(GREP_COM) $(BENCH_COM) $(TETRIS_COM) $(NOVA_COM)
 
 $(DATA_IMG): scripts/mkdata.sh scripts/exfat_add.py data/LOREM.TXT data/IPSUM.TXT data/CICERO.TXT
 	scripts/mkdata.sh $(DATA_IMG)
@@ -532,6 +558,7 @@ clean:
 	      $(GREP_BIN) $(GREP_COM) $(GREP_ELF) \
 	      $(BENCH_BIN) $(BENCH_COM) $(BENCH_ELF) \
 	      $(TETRIS_BIN) $(TETRIS_COM) $(TETRIS_ELF) \
+	      $(NOVA_BIN) $(NOVA_COM) $(NOVA_ELF) \
 	      $(EFI_EFI) efi/efi_main.o efi/enter_kernel.bin efi/enter_kernel_bin.h \
 	      $(KERNEL_ELF) shell/shell.elf $(ECHO_ELF) \
-	      $(IMG) $(DATA_IMG) fos-sb16.wav $(KERNEL_OBJ) $(SHELL_OBJ) $(ECHO_OBJ) $(EDIT_OBJ) $(FM_OBJ) $(LESS_OBJ) $(DATE_OBJ) $(MEM_OBJ) $(BEEP_OBJ) $(PLAY_OBJ) $(PAINT_OBJ) $(GREP_OBJ) $(BENCH_OBJ) $(TETRIS_OBJ)
+	      $(IMG) $(DATA_IMG) fos-sb16.wav $(KERNEL_OBJ) $(SHELL_OBJ) $(ECHO_OBJ) $(EDIT_OBJ) $(FM_OBJ) $(LESS_OBJ) $(DATE_OBJ) $(MEM_OBJ) $(BEEP_OBJ) $(PLAY_OBJ) $(PAINT_OBJ) $(GREP_OBJ) $(BENCH_OBJ) $(TETRIS_OBJ) $(NOVA_OBJ)
