@@ -37,11 +37,13 @@ WL_PROTO =
 ifeq ($(CHIME_WL),1)
 SRCS += src/plat_wl.cpp
 CXXFLAGS += -DCHIME_WAYLAND -DWLR_USE_UNSTABLE
+# System wlroots headers are C-only (`float [static 4]`, `char *class`). Use
+# the C++-safe copies in deps/ and only take libs from pkg-config.
+CXXFLAGS += -Ideps/wlroots-0.19 -Ideps/xcb
+CXXFLAGS += $(shell pkg-config --cflags pixman-1 libdrm wayland-server xkbcommon 2>/dev/null)
 ifneq ($(WL_PC),)
-CXXFLAGS += $(shell pkg-config --cflags $(WL_PC))
 LIBS += $(shell pkg-config --libs $(WL_PC))
 else
-CXXFLAGS += -Ideps/wlroots-0.19 -Ideps/xcb $(shell pkg-config --cflags pixman-1 libdrm wayland-server xkbcommon 2>/dev/null)
 LIBS += -lwlroots-0.19
 endif
 CXXFLAGS += -Ibuild
@@ -54,17 +56,22 @@ endif
 PREFIX ?= /usr/local
 DESTDIR ?=
 
-.PHONY: all wm image run run-dual install uninstall clean
+.PHONY: all wm image run run-dual install uninstall wayland-session clean
 
 all: chime cabinet volicon editor
 
 wm: chime
 
+# Rebuild if Wayland linkage flips (an X11-only ./chime looks up-to-date after
+# installing libwlroots, which is how the login session used to dump to a TTY).
+WL_STAMP := build/chime-wl
+$(shell mkdir -p build && printf '%s\n' '$(CHIME_WL)' > $(WL_STAMP).tmp && { cmp -s $(WL_STAMP) $(WL_STAMP).tmp || mv $(WL_STAMP).tmp $(WL_STAMP); } ; rm -f $(WL_STAMP).tmp)
+
 build/xdg-shell-protocol.h:
 	mkdir -p build
 	wayland-scanner server-header "$(XDG_XML)" $@
 
-chime: $(SRCS) $(HDRS) $(WL_PROTO)
+chime: $(SRCS) $(HDRS) $(WL_PROTO) $(WL_STAMP)
 	$(CXX) $(CXXFLAGS) -o $@ $(SRCS) $(LIBS)
 
 # File manager, tray icon, and notepad only need libX11 (no RandR).
@@ -96,6 +103,11 @@ install: all
 
 uninstall:
 	PREFIX="$(PREFIX)" DESTDIR="$(DESTDIR)" ./scripts/install.sh --uninstall
+
+# Register this tree's ./chime as "Chime (Wayland)" on the login screen.
+wayland-session:
+	$(MAKE) CHIME_WL=1 chime cabinet volicon editor
+	./scripts/install.sh --local-wayland --skip-build --skip-deps
 
 clean:
 	rm -f chime cabinet volicon editor win95wm

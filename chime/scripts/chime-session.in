@@ -21,6 +21,27 @@ for arg in "$@"; do
 done
 if [ "$WAYLAND" = 1 ] || [ "${CHIME_BACKEND:-}" = wayland ] || [ "${XDG_SESSION_TYPE:-}" = wayland ]; then
     export CHIME_BACKEND=wayland
+    export XDG_SESSION_TYPE=wayland
+    # Full seat compositor: do not nest under a leftover greeter display.
+    unset WAYLAND_DISPLAY
+    unset DISPLAY
+    if [ -n "${HOME:-}" ]; then
+        mkdir -p "$HOME/.chime" 2>/dev/null || true
+        if [ -d "$HOME/.chime" ]; then
+            exec >>"$HOME/.chime/wayland-session.log" 2>&1
+        fi
+    fi
+    echo "---- $(date -Iseconds 2>/dev/null || date) pid=$$ ----"
+    if ! ldd "$LIBEXEC/chime" 2>/dev/null | grep -q wlroots; then
+        echo "chime: $LIBEXEC/chime is not linked to wlroots (rebuild with: make CHIME_WL=1)" >&2
+        exit 1
+    fi
+    if [ -d /sys/module/nvidia_drm ]; then
+        export WLR_NO_HARDWARE_CURSORS="${WLR_NO_HARDWARE_CURSORS:-1}"
+        export GBM_BACKEND="${GBM_BACKEND:-nvidia-drm}"
+        export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-nvidia}"
+    fi
+    export XKB_DEFAULT_LAYOUT="${XKB_DEFAULT_LAYOUT:-us}"
 fi
 
 if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dbus-run-session >/dev/null 2>&1; then

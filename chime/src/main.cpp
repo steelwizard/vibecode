@@ -29,8 +29,10 @@ int main()
     wm.wayland = want_wayland();
 #ifndef CHIME_WAYLAND
     if (wm.wayland) {
-        std::fprintf(stderr, "chime: not built with Wayland; using X11\n");
-        wm.wayland = false;
+        // Login sessions unset DISPLAY. Falling back to X11 here exits
+        // immediately and the display manager drops to a TTY.
+        std::fprintf(stderr, "chime: not built with Wayland support (rebuild with make CHIME_WL=1)\n");
+        return 1;
     }
 #endif
     if (!wm.init())

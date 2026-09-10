@@ -480,7 +480,10 @@ static void new_output(wl_listener *listener, void *data)
 {
     WlServer *s = from_l(WlServer, listener, new_output);
     auto *output = (wlr_output *)data;
-    wlr_output_init_render(output, s->allocator, s->renderer);
+    if (!wlr_output_init_render(output, s->allocator, s->renderer)) {
+        std::fprintf(stderr, "chime: output %s: no renderer\n", output->name ? output->name : "?");
+        return;
+    }
 
     wlr_output_state st;
     wlr_output_state_init(&st);
@@ -589,9 +592,21 @@ static void new_input(wl_listener *listener, void *data)
         k->wm = s->wm;
         k->kbd = wlr_keyboard_from_input_device(dev);
         xkb_context *ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-        xkb_keymap *keymap = xkb_keymap_new_from_names(ctx, nullptr, XKB_KEYMAP_COMPILE_NO_FLAGS);
-        wlr_keyboard_set_keymap(k->kbd, keymap);
-        xkb_keymap_unref(keymap);
+        xkb_rule_names names{};
+        names.layout = getenv("XKB_DEFAULT_LAYOUT");
+        if (!names.layout || !names.layout[0])
+            names.layout = "us";
+        names.model = getenv("XKB_DEFAULT_MODEL");
+        names.variant = getenv("XKB_DEFAULT_VARIANT");
+        names.options = getenv("XKB_DEFAULT_OPTIONS");
+        xkb_keymap *keymap = xkb_keymap_new_from_names(ctx, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
+        if (!keymap)
+            keymap = xkb_keymap_new_from_names(ctx, nullptr, XKB_KEYMAP_COMPILE_NO_FLAGS);
+        if (keymap) {
+            wlr_keyboard_set_keymap(k->kbd, keymap);
+            xkb_keymap_unref(keymap);
+        } else
+            std::fprintf(stderr, "chime: could not compile keymap\n");
         xkb_context_unref(ctx);
         wlr_keyboard_set_repeat_info(k->kbd, 25, 600);
         k->modifiers.notify = kbd_modifiers;
@@ -1061,27 +1076,39 @@ static void new_decoration(wl_listener *listener, void *data)
 
 bool wl_backend_init(WM *wm)
 {
-    wlr_log_init(WLR_ERROR, nullptr);
+    wlr_log_init(WLR_INFO, nullptr);
     auto s = std::make_unique<WlServer>();
     s->wm = wm;
     s->display = wl_display_create();
-    if (!s->display)
+    if (!s->display) {
+        std::fprintf(stderr, "chime: could not create Wayland display\n");
         return false;
+    }
     wl_event_loop *loop = wl_display_get_event_loop(s->display);
     s->backend = wlr_backend_autocreate(loop, &s->session);
     if (!s->backend) {
-        std::fprintf(stderr, "chime: no Wayland backend (need a TTY, or nest under another compositor)\n");
+        std::fprintf(stderr, "chime: no Wayland backend (need a TTY/logind seat, or nest under another compositor)\n");
         return false;
     }
     s->renderer = wlr_renderer_autocreate(s->backend);
-    if (!s->renderer || !wlr_renderer_init_wl_display(s->renderer, s->display))
+    if (!s->renderer) {
+        std::fprintf(stderr, "chime: no Wayland renderer\n");
         return false;
+    }
+    if (!wlr_renderer_init_wl_display(s->renderer, s->display)) {
+        std::fprintf(stderr, "chime: renderer failed to advertise shm/dmabuf\n");
+        return false;
+    }
     s->allocator = wlr_allocator_autocreate(s->backend, s->renderer);
-    if (!s->allocator)
+    if (!s->allocator) {
+        std::fprintf(stderr, "chime: no Wayland allocator\n");
         return false;
+    }
     s->compositor = wlr_compositor_create(s->display, 5, s->renderer);
-    if (!s->compositor)
+    if (!s->compositor) {
+        std::fprintf(stderr, "chime: could not create compositor\n");
         return false;
+    }
     wlr_subcompositor_create(s->display);
     wlr_data_device_manager_create(s->display);
 

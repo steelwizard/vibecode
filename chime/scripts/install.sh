@@ -15,6 +15,7 @@ FROM_MAKE=0
 UNINSTALL=0
 SKIP_DEPS=0
 SKIP_BUILD=0
+LOCAL_WAYLAND=0
 
 usage() {
     cat <<EOF
@@ -26,6 +27,7 @@ Build Chime and install login-screen sessions (xsessions + wayland-sessions).
   --destdir DIR    staged-install root (packaging; skips apt)
   --skip-deps      do not apt-install build/runtime packages
   --skip-build     install previously built binaries only
+  --local-wayland  register a login session that runs this tree's ./chime
   --uninstall      remove files this script installed
   --from-make      invoked by make install (skip build)
   -h, --help       show this help
@@ -41,6 +43,7 @@ while [ "$#" -gt 0 ]; do
         --skip-deps) SKIP_DEPS=1; shift ;;
         --skip-build) SKIP_BUILD=1; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
+        --local-wayland) LOCAL_WAYLAND=1; SKIP_DEPS=1; shift ;;
         --from-make) FROM_MAKE=1; SKIP_BUILD=1; SKIP_DEPS=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -174,7 +177,7 @@ install_files() {
     sed -e "s|@BINDIR@|$BINDIR|g" \
         "$ROOT/share/xsessions/chime.desktop.in" > "$desk"
     chmod 644 "$desk"
-    sed -e "s|@BINDIR@|$BINDIR|g" \
+    sed -e "s|@SESSION@|$BINDIR/chime-session --wayland|g" -e "s|@TRYEXEC@|$BINDIR/chime-session|g" \
         "$ROOT/share/wayland-sessions/chime.desktop.in" > "$wldesk"
     chmod 644 "$wldesk"
     run_install install -m 755 "$sess" "$bindir/chime-session"
@@ -238,9 +241,50 @@ uninstall_files() {
     run_install rmdir "${DESTDIR}${WLSESSIONDIR}" 2>/dev/null || true
 }
 
+install_local_wayland() {
+    if [ ! -x "$ROOT/chime" ]; then
+        echo "build ./chime first (make)" >&2
+        exit 1
+    fi
+    if ! ldd "$ROOT/chime" 2>/dev/null | grep -q wlroots; then
+        echo "$ROOT/chime is not linked to wlroots; the login session would exit and drop to a TTY." >&2
+        echo "rebuild with: make CHIME_WL=1" >&2
+        exit 1
+    fi
+    mkdir -p "$ROOT/build"
+    sess=$ROOT/build/chime-wayland-session
+    wldesk=$ROOT/build/chime-wayland.desktop
+    sed -e "s|@ROOT@|$ROOT|g" "$ROOT/scripts/chime-wayland-session.in" > "$sess"
+    chmod 755 "$sess"
+    sed -e "s|@SESSION@|$sess|g" -e "s|@TRYEXEC@|$ROOT/chime|g" \
+        "$ROOT/share/wayland-sessions/chime.desktop.in" > "$wldesk"
+    chmod 644 "$wldesk"
+
+    echo "registering Wayland login session (local $ROOT/chime)"
+    run_install mkdir -p "$SYS_WLSESSIONDIR"
+    run_install install -m 644 "$wldesk" "$SYS_WLSESSIONDIR/chime.desktop"
+    if [ "$WLSESSIONDIR" != "$SYS_WLSESSIONDIR" ]; then
+        run_install mkdir -p "${DESTDIR}${WLSESSIONDIR}"
+        run_install install -m 644 "$wldesk" "${DESTDIR}${WLSESSIONDIR}/chime.desktop"
+    fi
+    echo
+    echo "Chime (Wayland) is in the login session menu."
+    echo "  $SYS_WLSESSIONDIR/chime.desktop"
+    echo "  exec: $sess"
+    echo "Log out, open the session list, pick Chime (Wayland), then sign in."
+}
+
 if [ "$UNINSTALL" = 1 ]; then
     uninstall_files
     echo "removed Chime session. Pick another session at the login screen."
+    exit 0
+fi
+
+if [ "$LOCAL_WAYLAND" = 1 ]; then
+    if [ "$SKIP_BUILD" != 1 ]; then
+        make -C "$ROOT" -j"$(nproc 2>/dev/null || echo 1)" chime cabinet volicon editor
+    fi
+    install_local_wayland
     exit 0
 fi
 

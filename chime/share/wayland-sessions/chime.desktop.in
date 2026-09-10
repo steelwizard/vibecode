@@ -1,8 +1,8 @@
 [Desktop Entry]
-Name=Chime
+Name=Chime (Wayland)
 Comment=1990s-style desktop and compositor
-Exec=@BINDIR@/chime-session --wayland
-TryExec=@BINDIR@/chime-session
+Exec=@SESSION@
+TryExec=@TRYEXEC@
 Type=Application
 DesktopNames=Chime
 Keywords=wm;compositor;wayland;desktop;

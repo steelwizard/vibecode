@@ -18,6 +18,8 @@ make run        # boot the ISO in QEMU
 
 `make` links wlroots when the headers and `libwlroots-0.19` are available (`CHIME_WL=0` forces the X11-only binary). `make image` always rebuilds without Wayland because the TinyCore live image has no compositor stack.
 
+`make wayland-session` registers **Chime (Wayland)** in the display manager using this tree's `./chime` (no copy into `/usr/local`). Log out, pick it in the session menu, then sign in.
+
 `./scripts/install.sh` puts the desktop on this machine and adds **Chime** entries for both X11 (`xsessions`) and Wayland (`wayland-sessions`). Log out, pick Chime in the session menu, then sign in. `sudo make uninstall` removes it.
 
 `CHIME_BACKEND=wayland` or `chime-session --wayland` starts the compositor. Otherwise: nest if `WAYLAND_DISPLAY` is set, run as an X11 WM if `DISPLAY` is set, or take over a TTY.
