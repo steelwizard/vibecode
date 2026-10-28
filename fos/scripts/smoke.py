@@ -114,6 +114,10 @@ CASES = [
     ("which nova", 10, None, None, "0:\\GAMES\\NOVA.COM"),
     ("nova", 20, 2.0, "q", None),
     ("dir GAMES", 10, None, None, "NOVA.COM"),
+    ("which tcc", 10, None, None, "TCC.COM"),
+    ("tcc \\FOS\\TCC\\HELLO.C -o HELLO.COM", 90, None, None, None),
+    ("HELLO", 15, None, None, "hello from tcc 5050 1000000000"),
+    ("type TCC.OUT", 10, None, None, "sum 5050"),
 ]
 
 

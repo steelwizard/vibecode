@@ -66,6 +66,7 @@ Audio backend defaults to **PipeWire** when that session socket exists, otherwis
 | `\FOS\PLAY.COM` | WAV/MP3/MIDI player TUI (`play DEMO.MID`, q stops) |
 | `\FOS\PAINT.COM` | Mouse paint (`paint [file.pnt]`; B fill, S save, O open, Q quit) |
 | `\FOS\GREP.COM` | Fixed-string search (`grep [-inv] PATTERN [FILE …]`) |
+| `\FOS\TCC.COM` | TinyCC (`tcc file.c -o OUT.COM`; headers and libs in `\FOS\TCC`) |
 | `\FOS\BENCH.COM` | Test bench TUI — primes, 60 s soak, RAM, graphics, audio, hardware monitor (`bench`, `test`) |
 | `\GAMES\TETRIS.COM` | Tetris — 7-bag, ghost, hold, levels (`tetris`; q quits) |
 | `\GAMES\NOVA.COM` | Space breakout — lasers, capsules, hall of fame (`nova` / `breakout`; q quits) |
@@ -101,6 +102,7 @@ A `.COM` can be 32 MiB of code+data+BSS at `0x300000`, with an 8 MiB stack. Larg
 | `play <file>` | WAV/MP3/MIDI player (`play DEMO.MID`; q quits) |
 | `paint [file]` | Cell paint (`paint SKETCH.PNT`; left draw, right erase, `b` fill) |
 | `grep [-inv] PAT [file]` | Find lines (`grep Flash README.TXT`; `-i` case, `-n` numbers, `-v` invert) |
+| `tcc file.c -o out.com` | Compile C with TinyCC (`tcc \FOS\TCC\HELLO.C -o HELLO.COM`). Output names are 8.3. `-run` is not available |
 | `bench` / `test` | Test bench TUI (`bench primes` / `bench mem` headless; `bench burn` = 60 s; `bench hw` = live meters) |
 | `tetris` | Tetromino game (arrows / WASD, `z`/`y` rotate, space drop, `c` hold, `p` pause, `q` quit) |
 | `nova` / `breakout` | Space breakout (arrows / A D paddle, space launch or fire, mouse steers, `p` pause, `q` quit) |
@@ -252,7 +254,8 @@ boot.img (drive 0, 64 MiB)
   LBA 9+      kernel.bin (BIOS load; UEFI reads KERNEL.BIN from FAT)
   LBA 2048+   FAT32 ESP (type 0xEF, ≥65525 clusters so OVMF accepts it):
               KERNEL.BIN, \EFI\BOOT\BOOTX64.EFI, SHELL.COM,
-              \FOS\*.COM (ECHO, EDIT, LESS, FM, DATE, MEM, BEEP, PLAY, PAINT, GREP, BENCH),
+              \FOS\*.COM (ECHO, EDIT, LESS, FM, DATE, MEM, BEEP, PLAY, PAINT, GREP, BENCH, TCC),
+              \FOS\TCC\ (TinyCC include/, lib/crt1.o libc.a libtcc1.a, HELLO.C),
               \FOS\GM.SF2, DEMO.WAV, DEMO.MID, DEMO.MP3 (if ffmpeg at build),
               \MIDI\*.MID (Bach),
               README.TXT, SYSTEM.INI, …
@@ -291,7 +294,10 @@ fos/
 │   ├── play/   play.com (WAV/MP3/MIDI TUI, minimp3 + TinySoundFont)
 │   ├── grep/   grep.com
 │   ├── bench/  bench.com (TUI: primes, soak, RAM, graphics, audio, hardware monitor)
+│   ├── tcc/    tcc.com (TinyCC + FOS libc; runtime in dist/ copied to \FOS\TCC)
 │   └── fm/     fm.com
+├── third_party/
+│   └── tinycc/ upstream TinyCC (LGPL), built as TCC.COM
 ├── games/
 │   ├── tetris/ tetris.com (7-bag, ghost, hold, levels)
 │   └── nova/   nova.com (space breakout, capsules, high scores)

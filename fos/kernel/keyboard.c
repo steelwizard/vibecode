@@ -35,6 +35,7 @@
 #define CP_sz   '\xE1'
 #define CP_sup2 '\xFD'
 #define CP_sup3 '\xFC'
+#define CP_deg  '\xF8'
 
 typedef struct {
     const char *name;
@@ -171,7 +172,7 @@ static void init_layout_de(void) {
     layout_set(&layout_de, 0x0A, '9', ')', ']');
     layout_set(&layout_de, 0x0B, '0', '=', '}');
     layout_set(&layout_de, 0x0C, CP_sz, '?', '\\');
-    layout_set(&layout_de, 0x0D, '^', '`', 0);
+    layout_set(&layout_de, 0x0D, '\'', '`', 0); /* key right of ß: ´ ` */
 
     layout_set(&layout_de, 0x0E, '\b', 0, 0);
     layout_set(&layout_de, 0x0F, '\t', 0, 0);
@@ -201,10 +202,10 @@ static void init_layout_de(void) {
     layout_set(&layout_de, 0x26, 'l', 0, 0);
     layout_set(&layout_de, 0x27, CP_oe, CP_Oe, 0);
     layout_set(&layout_de, 0x28, CP_ae, CP_Ae, 0);
-    layout_set(&layout_de, 0x29, '#', '\'', 0);
+    layout_set(&layout_de, 0x29, '^', CP_deg, 0); /* key left of 1 */
 
-    layout_set(&layout_de, 0x2B, '<', '>', '|');
-    /* German/ISO: key between Left Shift and Y (E0 56), same symbols */
+    /* # sits next to Enter (set-1 0x2B). 0x56 is the ISO key left of Y. */
+    layout_set(&layout_de, 0x2B, '#', '\'', 0);
     layout_set(&layout_de, 0x56, '<', '>', '|');
     layout_set(&layout_de, 0x2C, 'y', 0, 0);
     layout_set(&layout_de, 0x2D, 'x', 0, 0);

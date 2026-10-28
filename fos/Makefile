@@ -139,6 +139,21 @@ NOVA_C      = games/nova/nova.c
 NOVA_OBJ    = $(NOVA_ASM:.asm=.o) $(NOVA_C:.c=.o)
 NOVA_ELF    = games/nova/nova.elf
 
+TCC_SRC     = third_party/tinycc
+TCC_HOST    = apps/tcc/host-tcc
+TCC_DIST    = apps/tcc/dist
+TCC_ELF     = apps/tcc/tcc.elf
+TCC_BIN     = apps/tcc/tcc.bin
+TCC_COM     = apps/tcc/tcc.com
+
+# Freestanding build of upstream tcc. -I apps/tcc supplies config.h once the
+# host configure's config.h has been removed (see $(TCC_HOST)).
+TCC_CFLAGS  = -m64 -std=gnu11 -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
+              -fno-builtin -mno-red-zone -Os -fno-asynchronous-unwind-tables \
+              -fno-unwind-tables -ffunction-sections -fdata-sections \
+              -I apps/tcc -I apps/tcc/include -I $(TCC_SRC) -nostdinc
+TCC_UP_CFLAGS = $(TCC_CFLAGS) -w
+
 KERNEL_OBJ = $(KERNEL_ASM:.asm=.o) $(KERNEL_C:.c=.o)
 
 # bochs-display VRAM. 32 MiB covers every mode up to 2560x1440 at 32bpp.
@@ -466,6 +481,73 @@ $(NOVA_COM): $(NOVA_BIN) $(NOVA_ELF) scripts/foscom_pack.py
 		--mem-size 0x$$(nm -n $(NOVA_ELF) | awk '$$3=="_end"{print $$1; exit}') \
 		--stack $(COM_STACK) --name NOVA
 
+# Host tcc (Linux ELF) compiles libtcc1 and the user libc into objects the
+# on-FOS compiler can link. Delete the generated config.h so the FOS build
+# picks up apps/tcc/config.h instead of a native one.
+$(TCC_HOST): $(TCC_SRC)/tcc.c $(TCC_SRC)/libtcc.c $(TCC_SRC)/tcc.h
+	cd $(TCC_SRC) && ./configure --extra-cflags="-w -O2"
+	$(MAKE) -C $(TCC_SRC) tcc
+	cp $(TCC_SRC)/tcc $@
+	rm -f $(TCC_SRC)/config.h
+
+apps/tcc/setjmp.o: apps/tcc/setjmp.asm
+	$(NASM) -f elf64 $< -o $@
+
+apps/tcc/entry.o: apps/tcc/entry.asm
+	$(NASM) -f elf64 $< -o $@
+
+apps/tcc/tcc.o: $(TCC_SRC)/tcc.c $(TCC_HOST) apps/tcc/config.h $(wildcard apps/tcc/include/*.h)
+	$(CC) $(TCC_UP_CFLAGS) -c $(TCC_SRC)/tcc.c -o $@
+
+apps/tcc/fosmain.o: apps/tcc/fosmain.c apps/tcc/include/setjmp.h
+	$(CC) $(TCC_CFLAGS) -I kernel/include -c $< -o $@
+
+apps/tcc/foslibc.host.o: apps/tcc/foslibc.c $(wildcard apps/tcc/include/*.h) $(KERNEL_HDRS)
+	$(CC) $(TCC_CFLAGS) -I kernel/include -c $< -o $@
+
+$(TCC_ELF): apps/tcc/entry.o apps/tcc/tcc.o apps/tcc/fosmain.o apps/tcc/foslibc.host.o apps/tcc/setjmp.o apps/tcc/linker.ld
+	$(LD) -m elf_x86_64 -T apps/tcc/linker.ld -nostdlib --gc-sections -o $@ \
+		apps/tcc/entry.o apps/tcc/tcc.o apps/tcc/fosmain.o apps/tcc/foslibc.host.o apps/tcc/setjmp.o
+
+$(TCC_BIN): $(TCC_ELF)
+	$(OBJCOPY) -O binary $< $@
+
+$(TCC_COM): $(TCC_BIN) $(TCC_ELF) scripts/foscom_pack.py
+	$(PYTHON) scripts/foscom_pack.py $(TCC_BIN) $@ \
+		--load $(COM_LOAD) \
+		--entry 0x$$(nm -n $(TCC_ELF) | awk '$$3=="_start"{print $$1; exit}') \
+		--mem-size 0x$$(nm -n $(TCC_ELF) | awk '$$3=="_end"{print $$1; exit}') \
+		--stack $(COM_STACK) --name TCC
+
+$(TCC_DIST)/include/.stamp: apps/tcc/hello.c $(wildcard apps/tcc/include/*.h) $(wildcard apps/tcc/include/sys/*.h) \
+		$(TCC_SRC)/include/stdarg.h $(TCC_SRC)/include/tccdefs.h
+	rm -rf $(TCC_DIST)/include
+	mkdir -p $(TCC_DIST)/include/sys $(TCC_DIST)/lib
+	cp apps/tcc/include/*.h $(TCC_DIST)/include/
+	cp apps/tcc/include/sys/*.h $(TCC_DIST)/include/sys/
+	cp $(TCC_SRC)/include/stdarg.h $(TCC_SRC)/include/stdbool.h $(TCC_SRC)/include/float.h \
+	   $(TCC_SRC)/include/stdalign.h $(TCC_SRC)/include/varargs.h $(TCC_SRC)/include/tccdefs.h \
+	   $(TCC_DIST)/include/
+	cp apps/tcc/hello.c $(TCC_DIST)/hello.c
+	touch $@
+
+$(TCC_DIST)/lib/libtcc1.a: $(TCC_HOST) $(TCC_SRC)/lib/libtcc1.c $(TCC_SRC)/lib/va_list.c \
+		$(TCC_SRC)/lib/alloca.S $(TCC_SRC)/lib/builtin.c $(TCC_DIST)/include/.stamp
+	$(TCC_HOST) -c $(TCC_SRC)/lib/libtcc1.c -o apps/tcc/libtcc1.o
+	$(TCC_HOST) -c $(TCC_SRC)/lib/va_list.c -o apps/tcc/va_list.o
+	$(TCC_HOST) -c $(TCC_SRC)/lib/alloca.S -o apps/tcc/alloca.o
+	$(TCC_HOST) -c $(TCC_SRC)/lib/builtin.c -o apps/tcc/builtin.o
+	mkdir -p $(TCC_DIST)/lib
+	ar rcs $@ apps/tcc/libtcc1.o apps/tcc/va_list.o apps/tcc/alloca.o apps/tcc/builtin.o
+
+$(TCC_DIST)/lib/crt1.o: $(TCC_HOST) apps/tcc/crt1.c $(TCC_DIST)/include/.stamp $(KERNEL_HDRS)
+	$(TCC_HOST) -nostdinc -I apps/tcc/include -I kernel/include -c apps/tcc/crt1.c -o $@
+
+$(TCC_DIST)/lib/libc.a: $(TCC_HOST) apps/tcc/foslibc.c apps/tcc/setjmp.o $(TCC_DIST)/include/.stamp $(KERNEL_HDRS)
+	$(TCC_HOST) -nostdinc -I apps/tcc/include -I kernel/include -c apps/tcc/foslibc.c -o apps/tcc/libfos.o
+	mkdir -p $(TCC_DIST)/lib
+	ar rcs $@ apps/tcc/libfos.o apps/tcc/setjmp.o
+
 EFI_CFLAGS = -m64 -mabi=ms -fshort-wchar -ffreestanding -fno-stack-protector \
              -fno-builtin -fpie -mno-red-zone -fno-ident \
              -fno-asynchronous-unwind-tables -Wall -Wextra -O2 -I efi
@@ -489,8 +571,8 @@ $(EFI_EFI): efi/efi_main.o efi/efi.ld
 	      --image-base 0x140000000 --disable-auto-import \
 	      -o $@ efi/efi_main.o
 
-$(IMG): $(BOOT_BIN) $(KERNEL_BIN) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(BEEP_COM) $(PLAY_COM) $(PAINT_COM) $(GREP_COM) $(BENCH_COM) $(TETRIS_COM) $(NOVA_COM) $(EFI_EFI) system.ini demo.bat scripts/mkdisk.sh scripts/fat32_add.py
-	scripts/mkdisk.sh $(IMG) $(BOOT_BIN) $(KERNEL_BIN) $(KERNEL_LBA) $(PART_START) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(EFI_EFI) $(BEEP_COM) $(PLAY_COM) $(PAINT_COM) $(GREP_COM) $(BENCH_COM) $(TETRIS_COM) $(NOVA_COM)
+$(IMG): $(BOOT_BIN) $(KERNEL_BIN) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(BEEP_COM) $(PLAY_COM) $(PAINT_COM) $(GREP_COM) $(BENCH_COM) $(TETRIS_COM) $(NOVA_COM) $(TCC_COM) $(TCC_DIST)/lib/libc.a $(TCC_DIST)/lib/libtcc1.a $(TCC_DIST)/lib/crt1.o $(TCC_DIST)/include/.stamp $(EFI_EFI) system.ini demo.bat scripts/mkdisk.sh scripts/fat32_add.py
+	scripts/mkdisk.sh $(IMG) $(BOOT_BIN) $(KERNEL_BIN) $(KERNEL_LBA) $(PART_START) $(SHELL_BIN) $(ECHO_COM) $(EDIT_COM) $(FM_COM) $(LESS_COM) $(DATE_COM) $(MEM_COM) $(EFI_EFI) $(BEEP_COM) $(PLAY_COM) $(PAINT_COM) $(GREP_COM) $(BENCH_COM) $(TETRIS_COM) $(NOVA_COM) $(TCC_COM)
 
 $(DATA_IMG): scripts/mkdata.sh scripts/exfat_add.py data/LOREM.TXT data/IPSUM.TXT data/CICERO.TXT
 	scripts/mkdata.sh $(DATA_IMG)
@@ -559,6 +641,12 @@ clean:
 	      $(BENCH_BIN) $(BENCH_COM) $(BENCH_ELF) \
 	      $(TETRIS_BIN) $(TETRIS_COM) $(TETRIS_ELF) \
 	      $(NOVA_BIN) $(NOVA_COM) $(NOVA_ELF) \
+	      $(TCC_BIN) $(TCC_COM) $(TCC_ELF) $(TCC_HOST) \
+	      apps/tcc/tcc.o apps/tcc/fosmain.o apps/tcc/foslibc.host.o \
+	      apps/tcc/libfos.o apps/tcc/libtcc1.o apps/tcc/va_list.o \
+	      apps/tcc/alloca.o apps/tcc/builtin.o apps/tcc/setjmp.o apps/tcc/entry.o \
+	      $(TCC_SRC)/config.h $(TCC_SRC)/config.mak \
 	      $(EFI_EFI) efi/efi_main.o efi/enter_kernel.bin efi/enter_kernel_bin.h \
 	      $(KERNEL_ELF) shell/shell.elf $(ECHO_ELF) \
 	      $(IMG) $(DATA_IMG) fos-sb16.wav $(KERNEL_OBJ) $(SHELL_OBJ) $(ECHO_OBJ) $(EDIT_OBJ) $(FM_OBJ) $(LESS_OBJ) $(DATE_OBJ) $(MEM_OBJ) $(BEEP_OBJ) $(PLAY_OBJ) $(PAINT_OBJ) $(GREP_OBJ) $(BENCH_OBJ) $(TETRIS_OBJ) $(NOVA_OBJ)
+	rm -rf apps/tcc/dist

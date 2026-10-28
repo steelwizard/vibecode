@@ -22,6 +22,7 @@ GREP=${17:-}
 BENCH=${18:-}
 TETRIS=${19:-}
 NOVA=${20:-}
+TCC=${21:-}
 
 TOTAL_SECTORS=131072
 PART_SECTORS=$((TOTAL_SECTORS - PART_START))
@@ -139,6 +140,16 @@ if [ -n "$TETRIS" ] && [ -f "$TETRIS" ]; then
 fi
 if [ -n "$NOVA" ] && [ -f "$NOVA" ]; then
     add_one GAMES/NOVA.COM "$NOVA"
+fi
+if [ -n "$TCC" ] && [ -f "$TCC" ]; then
+    add_one FOS/TCC.COM "$TCC"
+fi
+TCC_DIST="$SCRIPT_DIR/../apps/tcc/dist"
+if [ -d "$TCC_DIST" ]; then
+    for f in $(find "$TCC_DIST" -type f ! -name '.*'); do
+        rel=${f#"$TCC_DIST/"}
+        add_one "FOS/TCC/$rel" "$f"
+    done
 fi
 if [ -f "$SCRIPT_DIR/../demo.bat" ]; then
     add_one FOS/DEMO.BAT "$SCRIPT_DIR/../demo.bat"

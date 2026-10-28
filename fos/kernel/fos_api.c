@@ -159,7 +159,7 @@ static int api_write_file(const char *path, const char *buf, size_t len) {
     return vfs_close(&f);
 }
 
-#define FOS_FD_MAX 16
+#define FOS_FD_MAX 40
 
 static vfs_file_t api_files[FOS_FD_MAX];
 static uint16_t api_fd_owner[FOS_FD_MAX];

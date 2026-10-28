@@ -438,6 +438,7 @@ static void cmd_help(void) {
     console_write_line("  play <file>          WAV/MP3/MIDI (play MIDI\\PREL1.MID)");
     console_write_line("  paint [file]         Mouse paint (s save, o open, q quit)");
     console_write_line("  grep [-inv] PAT [file]  Find lines (fixed string)");
+    console_write_line("  tcc --help             Compile C (tcc file.c -o OUT.COM)");
     console_write_line("  bench / test          Test bench (primes, soak, mem, gfx, audio, hw)");
     console_write_line("  tetris                Tetromino game (arrows, z/x, space, c hold)");
     console_write_line("  nova / breakout       Space breakout (arrows, space launch, q quit)");

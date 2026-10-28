@@ -7,3 +7,8 @@
 *.mp3
 boot
 __pycache__/
+apps/tcc/host-tcc
+apps/tcc/dist/
+third_party/tinycc/tcc
+third_party/tinycc/config.h
+third_party/tinycc/config.mak
