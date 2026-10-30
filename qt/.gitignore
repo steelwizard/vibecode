@@ -1,0 +1,9 @@
+# Out-of-source builds, including Qt Creator shadow builds
+build/
+build-*/
+
+# CMake output if someone configures in the source tree
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CMakeLists.txt.user*
